@@ -2,7 +2,7 @@
 //! theirs. Needs `source .tools/env`. Trader and dealers run in-process
 //! through the same entry points `main.rs` calls.
 use std::{
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,7 +18,10 @@ use keeler::{
     dealer,
     trader::{self, fair_amount, Outcome},
 };
-use keeler_core::price::apply_spread;
+use keeler_core::{
+    price::apply_spread,
+    rfq::{serve, Quote},
+};
 use solana_address::Address;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -312,22 +315,30 @@ fn unsettled_order_is_refunded_once() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let net = start(6);
     let chain = net.chain();
-    // The margin leaves under a second after quoting, less than a lock
-    // takes: it quotes and never settles.
-    let lazy = spawn_dealer(
-        &net,
-        6,
-        1,
-        Terms {
-            quote_ttl_secs: 20,
-            settle_margin_secs: 19,
-            ..HONEST
-        },
-    );
-    let cfg = trader_cfg(&net, &[&lazy]);
+    // A dealer that quotes and never settles: only the quote server, no
+    // settle loop, so the outcome does not depend on timing.
+    let amount = 400_000_000;
+    chain
+        .register(&shielded(&fixture::actor(1)).unwrap())
+        .unwrap();
+    let quote = Quote {
+        buy_amount: expected_quote(&net, &chain, amount, HONEST.spread_bps),
+        expiry: chain.now().unwrap() + 20,
+    };
+    let listener = TcpListener::bind(dealer_addr(6, 1)).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let server = thread::spawn(move || serve(listener, &flag, |_| Ok(quote)));
+    let cfg = TraderConfig {
+        dealers: vec![DealerRef {
+            address: dealer_addr(6, 1),
+            pubkey: fixture::actor(1).pubkey().to_string(),
+        }],
+        ..trader_cfg(&net, &[])
+    };
     let before = net.balances(&chain, 0);
 
-    let outcome = trader::swap(&cfg, net.spl, SOL_MINT, 400_000_000).unwrap();
+    let outcome = trader::swap(&cfg, net.spl, SOL_MINT, amount).unwrap();
     assert_eq!(outcome, Outcome::Refunded);
     assert_eq!(net.balances(&chain, 0), before);
     assert_eq!(net.balances(&chain, 1), (0, DEALER_SOL));
@@ -335,7 +346,8 @@ fn unsettled_order_is_refunded_once() {
         trader::refund(&cfg.common).unwrap().acted.is_empty(),
         "second refund must be a no-op"
     );
-    lazy.stop();
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap().unwrap();
 }
 
 #[test]
