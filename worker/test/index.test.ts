@@ -3,7 +3,6 @@ import worker, { type Env } from "../src/index";
 
 const KEY = "HELIUSSECRET123";
 const DKEY = "DEALERSECRET456";
-const PKEY = "PYTHSECRET789";
 const SIG = "ab".repeat(64);
 const MINT_A = "So11111111111111111111111111111111111111112";
 const MINT_B = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -57,7 +56,6 @@ async function call(r: Request, e = env()) {
   const text = await res.text();
   expect(text).not.toContain(KEY);
   expect(text).not.toContain(DKEY);
-  expect(text).not.toContain(PKEY);
   expect(text).not.toContain("helius-rpc.com");
   for (const [, v] of res.headers) expect(v).not.toContain(KEY);
   return { res, text, body: text ? JSON.parse(text) : null };
@@ -387,83 +385,106 @@ describe("round 2", () => {
 describe("/api/prices", () => {
   const FEED_A = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
   const FEED_B = "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a";
-  let n = 0;
+  const ACC_A = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
+  const ACC_B = "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX";
+  const OWNER = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
   const NOW = 1_800_000_000;
-  // A fresh PYTH_URL per test keeps the module's 5 s cache from leaking between tests.
+  const TWO = JSON.stringify([{ mint: MINT_A, symbol: "SOL", decimals: 9 }, { mint: MINT_B, symbol: "USDC", decimals: 6 }]);
+  let n = 0;
+  // A fresh UPSTREAM_RPC per test keeps the module's 5 s cache from leaking between tests.
   const pythEnv = (over: Partial<Env> = {}) => env({
-    PYTH_API_KEY: PKEY, PYTH_URL: `https://hermes${++n}.example/`,
-    PYTH_FEEDS: JSON.stringify({ [MINT_A]: "0x" + FEED_A.toUpperCase(), [MINT_B]: FEED_B }),
+    UPSTREAM_RPC: `https://rpc${++n}.example/`, ASSETS: TWO,
+    PYTH_ACCOUNTS: JSON.stringify({ [MINT_A]: { account: ACC_A, feedId: "0x" + FEED_A.toUpperCase() }, [MINT_B]: { account: ACC_B, feedId: FEED_B } }),
     PYTH_MAX_AGE_SECS: "60", PYTH_MAX_CONF_BPS: "100", ...over,
   });
-  const feed = (id: string, price: Record<string, unknown> = {}) =>
-    ({ id, price: { price: "15000000000", conf: "1000000", expo: -8, publish_time: NOW - 5, ...price } });
-  const hermes = (...parsed: unknown[]) => () => Response.json({ parsed });
+
+  // A 134-byte PriceUpdateV2 account, Full verification.
+  type Fields = { feed?: string; level?: number; price?: bigint; conf?: bigint; expo?: number; published?: bigint; owner?: string };
+  function account(f: Fields = {}) {
+    const data = new Uint8Array(134);
+    const v = new DataView(data.buffer);
+    data[40] = f.level ?? 1;
+    const feed = f.feed ?? FEED_A;
+    for (let i = 0; i < 32; i++) data[41 + i] = parseInt(feed.slice(2 * i, 2 * i + 2), 16);
+    v.setBigInt64(73, f.price ?? 15_000_000_000n, true);
+    v.setBigUint64(81, f.conf ?? 1_000_000n, true);
+    v.setInt32(89, f.expo ?? -8, true);
+    v.setBigInt64(93, f.published ?? BigInt(NOW - 25), true);
+    return { owner: f.owner ?? OWNER, lamports: 1, executable: false, data: [btoa(String.fromCharCode(...data)), "base64"] };
+  }
+  const rpcReply = (...value: unknown[]) => () => Response.json({ jsonrpc: "2.0", id: 1, result: { context: { slot: 1 }, value } });
+  const goodB = (f: Fields = {}) => account({ feed: FEED_B, price: 100_000_000n, conf: 10_000n, ...f });
   const at = (secs: number) => vi.spyOn(Date, "now").mockReturnValue(secs * 1000);
 
-  it("returns REFERENCE values stamped now when no feeds are set", async () => {
+  it("returns REFERENCE values stamped now when no accounts are set", async () => {
     at(NOW);
     const { body } = await call(req("/api/prices"));
     expect(body).toEqual({ [MINT_A]: { price: "150", expo: -2, publishTime: NOW } });
   });
 
-  it("refuses mainnet without a feed for every asset", async () => {
+  it("refuses mainnet without an account for every asset", async () => {
     at(NOW);
     const a = await call(req("/api/prices"), env({ NETWORK: "mainnet" }));
     expect(a.res.status).toBe(500);
     expect(a.body.error).toContain(MINT_A);
-    const assets = JSON.stringify([{ mint: MINT_A, symbol: "tSOL", decimals: 9 }, { mint: TRADER, symbol: "X", decimals: 6 }]);
-    expect((await call(req("/api/prices"), pythEnv({ NETWORK: "mainnet", ASSETS: assets }))).res.status).toBe(500);
+    const three = JSON.stringify([...JSON.parse(TWO), { mint: TRADER, symbol: "X", decimals: 6 }]);
+    expect((await call(req("/api/prices"), pythEnv({ NETWORK: "mainnet", ASSETS: three }))).res.status).toBe(500);
   });
 
-  it("reads Hermes with the bearer key and checks every feed", async () => {
+  it("reads all accounts in one getMultipleAccounts call", async () => {
     at(NOW);
-    mockFetch(hermes(feed("0x" + FEED_A), feed(FEED_B, { price: "100000000", conf: "10000" })));
+    mockFetch(rpcReply(account(), goodB()));
     const { res, body } = await call(req("/api/prices"), pythEnv());
     expect(res.status).toBe(200);
     expect(body).toEqual({
-      [MINT_A]: { price: "15000000000", expo: -8, publishTime: NOW - 5 },
-      [MINT_B]: { price: "100000000", expo: -8, publishTime: NOW - 5 },
+      [MINT_A]: { price: "15000000000", expo: -8, publishTime: NOW - 25 },
+      [MINT_B]: { price: "100000000", expo: -8, publishTime: NOW - 25 },
     });
-    expect(calls[0]!.url).toBe(`https://hermes${n}.example/v2/updates/price/latest?ids[]=${FEED_A}&ids[]=${FEED_B}&parsed=true`);
-    expect((calls[0]!.init.headers as Record<string, string>).authorization).toBe(`Bearer ${PKEY}`);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe(`https://rpc${n}.example/?api-key=${KEY}`);
+    expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+      jsonrpc: "2.0", id: 1, method: "getMultipleAccounts", params: [[ACC_A, ACC_B], { encoding: "base64", commitment: "confirmed" }],
+    });
   });
 
-  it("is a 503 for each failed check, never a fixed fallback", async () => {
+  it("is a 503 naming the asset for each failed check, never a fixed fallback", async () => {
     at(NOW);
-    const cases: (() => Response)[] = [
-      () => new Response("down", { status: 500 }),
-      () => { throw new Error(`fetch failed ${PKEY}`); },
-      () => new Response("not json"),
-      () => Response.json({}),
-      hermes(feed(FEED_A)), // FEED_B missing
-      hermes(feed(FEED_A), feed(FEED_B, { publish_time: NOW - 61 })), // stale
-      hermes(feed(FEED_A), feed(FEED_B, { publish_time: NOW + 61 })), // future
-      hermes(feed(FEED_A), feed(FEED_B, { price: "0" })),
-      hermes(feed(FEED_A), feed(FEED_B, { price: "-5" })),
-      hermes(feed(FEED_A), feed(FEED_B, { conf: "150000001" })), // over 100 bps of 150e8
-      hermes(feed(FEED_A), feed(FEED_B, { price: 15 })),
-      hermes(feed(FEED_A), feed(FEED_B), feed("ff".repeat(32), { publish_time: NOW - 999 })), // any bad feed fails all
+    const cases: [string, () => Response][] = [
+      ["USDC", rpcReply(account(), null)], // missing account
+      ["USDC", rpcReply(account(), goodB({ owner: "11111111111111111111111111111111" }))],
+      ["USDC", rpcReply(account(), goodB({ level: 0 }))], // Partial
+      ["USDC", rpcReply(account(), goodB({ feed: FEED_A }))],
+      ["USDC", rpcReply(account(), goodB({ published: BigInt(NOW - 61) }))],
+      ["USDC", rpcReply(account(), goodB({ published: BigInt(NOW + 61) }))],
+      ["USDC", rpcReply(account(), goodB({ conf: 1_000_001n }))], // over 100 bps of 1e8
+      ["SOL", rpcReply(account({ price: 0n }), goodB())],
+      ["SOL", rpcReply(account({ price: -5n }), goodB())],
+      ["SOL", rpcReply({ ...account(), data: ["AAAA", "base64"] }, goodB())], // too short
+      ["", rpcReply(account())], // fewer accounts than asked
+      ["", () => new Response("down", { status: 500 })],
+      ["", () => { throw new Error(`fetch failed ${KEY}`); }],
     ];
-    for (const [i, c] of cases.entries()) {
+    for (const [i, [name, c]] of cases.entries()) {
       mockFetch(c);
       const { res, body } = await call(req("/api/prices"), pythEnv());
       expect(res.status, `case ${i}`).toBe(503);
-      expect(body.error).toBeTypeOf("string");
+      expect(body.error).toContain(name);
       expect(body[MINT_A]).toBeUndefined();
     }
-    mockFetch(hermes(feed(FEED_A), feed(FEED_B, { conf: "150000000", publish_time: NOW + 60 }))); // edges pass
+    mockFetch(rpcReply(account(), goodB({ conf: 1_000_000n, published: BigInt(NOW + 60) }))); // edges pass
     expect((await call(req("/api/prices"), pythEnv())).res.status).toBe(200);
   });
 
   it("caches for 5 s and re-checks age on every read", async () => {
     const e = pythEnv();
     const clock = at(NOW);
-    mockFetch(hermes(feed(FEED_A, { publish_time: NOW - 58 }), feed(FEED_B, { publish_time: NOW - 58 })));
-    await call(req("/api/prices"), e);
+    const old = BigInt(NOW - 58);
+    mockFetch(rpcReply(account({ published: old }), goodB({ published: old })));
+    expect((await call(req("/api/prices"), e)).res.status).toBe(200);
     clock.mockReturnValue((NOW + 1) * 1000);
     await call(req("/api/prices"), e);
     expect(calls).toHaveLength(1);
-    clock.mockReturnValue((NOW + 3) * 1000); // still inside 5 s but now 61 s old: fetched again
+    clock.mockReturnValue((NOW + 3) * 1000); // still inside 5 s but now 61 s old: read again
     await call(req("/api/prices"), e);
     expect(calls).toHaveLength(2);
   });
