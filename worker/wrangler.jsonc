@@ -2,6 +2,14 @@
   "name": "keeler",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
-  "assets": { "directory": "../web/dist", "binding": "ASSETS", "not_found_handling": "single-page-application", "run_worker_first": ["/api/*", "/v1/spr/*"] },
+  // The Worker runs first for every path so HTML gets the CSP and hashed files a long cache.
+  // The binding is STATIC because the ASSETS var holds the token list.
+  "assets": { "directory": "../web/dist", "binding": "STATIC", "not_found_handling": "single-page-application", "run_worker_first": true },
+  // Per client IP. period must be 10 or 60 seconds.
+  "ratelimits": [
+    { "name": "RPC_LIMIT", "namespace_id": "4101", "simple": { "limit": 600, "period": 60 } },
+    { "name": "QUOTE_LIMIT", "namespace_id": "4102", "simple": { "limit": 30, "period": 60 } },
+    { "name": "FAUCET_LIMIT", "namespace_id": "4103", "simple": { "limit": 3, "period": 60 } }
+  ],
   "vars": { "NETWORK": "local" }
 }
