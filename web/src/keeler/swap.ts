@@ -14,7 +14,16 @@ import { LocalKeys, SHIELDED_POOL_PROGRAM_ID, SOL_MINT, ShieldedAddress, type Wa
 import { NullifierKeyProofAuthority, atSlot, type SprClient } from "@heliuslabs/spr/client";
 import { bytes32, poseidon, solanaOwnerIdentity, transactOutputBlinding, outputBlindingSeed } from "@heliuslabs/spr/keypair";
 import { ProgramOwner, decodeProgramTransaction, toProgramWalletUtxo } from "@heliuslabs/spr/program";
-import { createProofOutput, createExternalData, SppProofInputs, Mint } from "@heliuslabs/spr/transaction";
+import {
+  createProofOutput,
+  createExternalData,
+  decodeConfidential,
+  decodeOutputData,
+  EncryptedScheme,
+  SppProofInputs,
+  Mint,
+} from "@heliuslabs/spr/transaction";
+import { X25519PublicKey } from "@heliuslabs/spr/keypair";
 import { compileUnsignedTransaction, encodeTransactInstructionData, nullifierPdaAccounts } from "@heliuslabs/spr/internal";
 import { resolveRegisteredAddress } from "@heliuslabs/spr/wallet";
 import { callWorker, type Circuit, type RawOutput, type RawProgramTransaction } from "./swap-wasm";
@@ -42,6 +51,7 @@ export type SwapContext = {
   /** The maker's Solana address: fee payer, signer and owner. */
   payer: Address;
   programId: Address;
+  network: string;
 };
 
 /** What a browser must keep to find and cancel its order. */
@@ -115,11 +125,12 @@ export function markerData(orderHash: Uint8Array, maker: Address): Uint8Array {
   return Uint8Array.of(...orderHash, ...addressBytes(maker));
 }
 
-async function prove(circuit: Circuit, raw: RawProgramTransaction): Promise<Uint8Array> {
+async function prove(ctx: SwapContext, circuit: Circuit, raw: RawProgramTransaction): Promise<Uint8Array> {
   if (BigInt(`0x${toHex(raw.publicHash)}`) >= BN254_ORDER) throw new Error("public hash is not a field element");
   const { proof, ms } = await callWorker<{ proof: Uint8Array; ms: number }>({
     op: "prove",
     circuit,
+    network: ctx.network,
     proofInputs: raw.proofInputs,
     publicHash: raw.publicHash,
   });
@@ -231,7 +242,7 @@ export async function buildMake(ctx: SwapContext, p: MakeParams, onProving: () =
     { viewTag: taker.address.signingPublicKey.confidentialViewTag(), data: markerData(orderHash, ctx.payer) },
   ]);
   const transact = await proveSpp(ctx, tx, spp, ctx.keys);
-  const proof = await prove("make", raw);
+  const proof = await prove(ctx, "make", raw);
   const pdas = (await nullifierPdaAccounts(ctx.client.tree, transact.inputs.map((i) => i.nullifierHash))).map((m) => m.address);
   const ix: Instruction = {
     programAddress: ctx.programId,
@@ -275,7 +286,7 @@ export async function leafIndex(ctx: SwapContext, o: OrderOpening): Promise<bigi
   }
 }
 
-type OrderTerms = {
+export type OrderTerms = {
   destinationMint: unknown;
   destinationAmount: bigint;
   maker: unknown;
@@ -288,7 +299,7 @@ export async function buildCancel(ctx: SwapContext, o: OrderOpening, onProving: 
   const leaf = await leafIndex(ctx, o);
   if (leaf === undefined) throw new Error("the order is not indexed yet");
   const orderUtxo = await orderInput(ctx, o, leaf);
-  const { data: terms } = await callWorker<{ data: OrderTerms }>({ op: "orderTerms", utxo: orderUtxo });
+  const { data: terms } = await callWorker<TermsUtxo>({ op: "orderTerms", utxo: orderUtxo });
   const authority = await orderAuthority(ctx.payer, ctx.programId);
   const destination = mintOf(ctx, terms.destinationMint);
   const inputs = {
@@ -319,7 +330,7 @@ export async function buildCancel(ctx: SwapContext, o: OrderOpening, onProving: 
   const spp = await sppInputs(ctx, tx, []);
   const nk = ProgramOwner.nullifierKey();
   const transact = await proveSpp(ctx, tx, spp, new NullifierKeyProofAuthority(nk, ctx.client.proofService));
-  const proof = await prove("cancel", raw);
+  const proof = await prove(ctx, "cancel", raw);
   const pdas = (await nullifierPdaAccounts(ctx.client.tree, transact.inputs.map((i) => i.nullifierHash))).map((m) => m.address);
   const ix: Instruction = {
     programAddress: ctx.programId,
@@ -330,7 +341,7 @@ export async function buildCancel(ctx: SwapContext, o: OrderOpening, onProving: 
 }
 
 /** The terms' destination asset: all zeros is SOL, any other is the mint's address bytes. */
-function mintOf(ctx: SwapContext, asset: unknown): Address {
+export function mintOf(ctx: SwapContext, asset: unknown): Address {
   const bytes = Array.isArray(asset) ? Uint8Array.from(asset as number[]) : asset;
   if (!(bytes instanceof Uint8Array) || bytes.length !== 32) throw new Error("unreadable destination mint in the order terms");
   const mint = bytes.every((b) => b === 0) ? SOL_MINT : getAddressDecoder().decode(bytes);
@@ -367,4 +378,121 @@ export function derivedPayoutHash(ctx: SwapContext, o: OrderOpening, nullifier: 
     blinding,
     ownerAddress: ShieldedAddress.fromBytes(ctx.keys.address().toBytes()),
   } as never).hash(TREE_ID);
+}
+
+/** What the WASM `orderTermsDataUtxo` returns: `DataUtxo::try_from`, which decodes the terms and checks that they and the opening reproduce `utxoHash`. */
+type TermsUtxo = { utxo: { dataHash?: Uint8Array }; data: OrderTerms };
+
+export type FoundOrder = {
+  opening: OrderOpening;
+  terms: OrderTerms;
+  sellMint: Address;
+  buyMint: Address;
+  /** The dealer's viewing key, as the order slot embeds it. */
+  takerViewingKey: Uint8Array;
+};
+
+type Indexed = Awaited<ReturnType<SprClient["getShieldedTransactionsByTags"]>>["data"][number]["events"][number];
+
+/**
+ * The maker's orders rebuilt from the chain: a port of `sdk/src/index/maker.rs`
+ * (`index_maker`, `scan_maker`). A transaction viewing key re-derived from the
+ * maker's viewing key and an input nullifier proves the maker wrote the
+ * transaction; it decrypts each confidential slot from the sender side, and an
+ * opening counts only if the WASM decodes it as order terms whose commitment is
+ * the slot's leaf under the maker's order authority.
+ */
+export async function scanMaker(ctx: SwapContext): Promise<FoundOrder[]> {
+  const { owner } = await orderAuthority(ctx.payer, ctx.programId);
+  const tag = owner.publicKey().confidentialViewTag();
+  const found: FoundOrder[] = [];
+  let paginationToken: Parameters<SprClient["getShieldedTransactionsByTags"]>[0]["paginationToken"];
+  do {
+    const page = await ctx.client.getShieldedTransactionsByTags({ tags: [tag], ...(paginationToken ? { paginationToken } : {}) });
+    for (const tx of page.data.flatMap((g) => g.events)) {
+      const order = await scanOne(ctx, tx, owner);
+      if (order) found.push(order);
+    }
+    paginationToken = page.paginationToken ?? undefined;
+  } while (paginationToken);
+  return found;
+}
+
+async function scanOne(ctx: SwapContext, tx: Indexed, owner: ProgramOwner): Promise<FoundOrder | undefined> {
+  const { txViewingPublicKey, salt } = tx;
+  if (!txViewingPublicKey || !salt) return undefined;
+  const viewingPublicKey = ctx.keys.address().viewingPublicKey;
+  const candidates = tx.nullifiers.length
+    ? await ctx.keys.transactionKeys(tx.nullifiers.map((firstNullifier) => ({ viewingPublicKey, firstNullifier })))
+    : [];
+  const txKey = candidates.find((k) => equal(k.publicKey().toBytes(), txViewingPublicKey.toBytes()));
+  for (const k of candidates) if (k !== txKey) k.destroy();
+  if (!txKey) return undefined;
+  try {
+    // Ciphertext slot indexes count data-bearing slots only, as `unified_slots` does.
+    let slotIndex = -1;
+    for (const slot of tx.outputSlots) {
+      let frame: ReturnType<typeof decodeOutputData>;
+      try {
+        frame = decodeOutputData(slot.payload);
+      } catch {
+        continue;
+      }
+      slotIndex++;
+      if (frame.encoding !== "encrypted" || frame.scheme !== EncryptedScheme.confidential || frame.body.length < 33) continue;
+      const found = await openSlot(ctx, owner, slot, frame.body, txKey, salt, slotIndex).catch(() => undefined);
+      if (found) return found;
+    }
+    return undefined;
+  } finally {
+    txKey.destroy();
+  }
+}
+
+async function openSlot(
+  ctx: SwapContext,
+  owner: ProgramOwner,
+  slot: Indexed["outputSlots"][number],
+  body: Uint8Array,
+  txKey: Awaited<ReturnType<LocalKeys["transactionKeys"]>>[number],
+  salt: NonNullable<Indexed["salt"]>,
+  slotIndex: number,
+): Promise<FoundOrder | undefined> {
+  const takerViewingKey = body.slice(0, 33);
+  const plain = decodeConfidential(txKey.decryptSlotEphemeral(X25519PublicKey.fromBytes(takerViewingKey), body.slice(33), salt, slotIndex));
+  const sellMint = ctx.wallet.registry.resolve(plain.assetId);
+  const asset = { asset: sellMint, assetId: plain.assetId };
+  const data = { records: plain.data.records().map((r) => ({ kind: r.kind, bytes: new Uint8Array(r.bytes) })) };
+  // Throws unless the opening, owned by this maker's order authority, reproduces the slot's leaf.
+  const decoded = await callWorker<TermsUtxo>({
+    op: "orderTerms",
+    utxo: {
+      utxo: { owner: owner.publicKey().toBytes(), asset, amount: plain.amount, blinding: plain.blinding, data },
+      nullifierPubkey: ProgramOwner.nullifierPublicKey(),
+      utxoHash: slot.outputContext.hash,
+      nullifier: new Uint8Array(32),
+      treeId: slot.outputContext.treeId ?? TREE_ID,
+      leafIndex: slot.outputContext.leafIndex,
+    },
+  });
+  // `from_data_utxo` also requires the terms to name this maker: its Solana key and nullifier key.
+  const maker = decoded.data.maker as { key?: { bytes?: Record<string, number> }; nullifierPk?: string };
+  const makerKey = Uint8Array.from({ length: 32 }, (_, i) => maker.key?.bytes?.[i] ?? -1);
+  if (!equal(makerKey, addressBytes(ctx.payer)) || maker.nullifierPk !== decimal(ctx.keys.address().nullifierPublicKey)) {
+    return undefined;
+  }
+  const output: RawOutput = {
+    asset,
+    amount: plain.amount,
+    blinding: new Uint8Array(plain.blinding),
+    data,
+    ...(decoded.utxo.dataHash ? { dataHash: new Uint8Array(decoded.utxo.dataHash) } : {}),
+  };
+  return {
+    opening: { orderHash: new Uint8Array(slot.outputContext.hash), output },
+    terms: decoded.data,
+    sellMint,
+    buyMint: mintOf(ctx, decoded.data.destinationMint),
+    takerViewingKey,
+  };
 }

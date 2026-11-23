@@ -4,8 +4,12 @@ import type { Asset, OrderStatus } from "./index";
 import type { OrderOpening } from "./swap";
 
 export type OrderRecord = {
+  /** The order hash in hex, so a record found again on chain merges with the local one. */
   id: string;
+  /** The dealer's address; empty for an order found on chain from a dealer this service no longer lists. */
   dealer: string;
+  /** The dealer's quote signature (128 hex) over these terms; absent for an order found on chain. */
+  signature?: string;
   sell: Asset;
   buy: Asset;
   sellAmount: bigint;

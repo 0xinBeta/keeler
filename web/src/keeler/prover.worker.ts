@@ -1,7 +1,7 @@
 // The swap WASM runs here, single-threaded, so proving never blocks the page.
 // Files come from /swap/ (see swap-wasm.ts); the proving-key digests are pinned
 // in the bundle, never read from the server that serves the keys.
-import { PINNED_KEYS, type Circuit, type WorkerRequest, type WorkerReply } from "./swap-wasm";
+import { checkPinForNetwork, pinnedKey, type Circuit, type WorkerRequest, type WorkerReply } from "./swap-wasm";
 
 type Wasm = {
   default: (opts: { module_or_path: string }) => Promise<unknown>;
@@ -34,11 +34,13 @@ async function bytes(path: string): Promise<Uint8Array> {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-function circuitFiles(m: Wasm, c: Circuit) {
+function circuitFiles(m: Wasm, c: Circuit, network: string) {
+  const pin = pinnedKey(c);
+  checkPinForNetwork(c, pin, network);
   let got = artifacts.get(c);
   if (!got) {
     got = Promise.all([bytes(`${c}/circuit.xbc`), bytes(`${c}/pk.bin`)]).then(([xbc, pk]) => {
-      m.checkProvingKey(pk, PINNED_KEYS[c].sha256);
+      m.checkProvingKey(pk, pin.sha256);
       return { xbc, pk };
     });
     got.catch(() => artifacts.delete(c));
@@ -57,7 +59,7 @@ async function handle(req: WorkerRequest): Promise<unknown> {
     case "orderTerms":
       return m.orderTermsDataUtxo(req.utxo);
     case "prove": {
-      const { xbc, pk } = await circuitFiles(m, req.circuit);
+      const { xbc, pk } = await circuitFiles(m, req.circuit, req.network);
       const started = performance.now();
       const bundle = m.prove(xbc, pk, req.proofInputs);
       try {

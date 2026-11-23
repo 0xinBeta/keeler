@@ -2,20 +2,32 @@
 // scripts/setup.sh, git-ignored):
 //   swap_program.js, swap_program_bg.wasm      the swap program's WASM package
 //   make/{circuit.xbc,pk.bin}, cancel/{circuit.xbc,pk.bin}
+//   proving-keys.json                          also bundled: the pins below
 export type Circuit = "make" | "cancel";
 
-const hex = (s: string) => Uint8Array.from(s.match(/../g)!, (b) => parseInt(b, 16));
+// Bundled at build time from the same setup that produced the keys, so a key
+// swapped on the server later fails `checkProvingKey`.
+import provingKeys from "../../public/swap/proving-keys.json";
 
-/** SHA-256 of each proving key, as `swap-keys.CHECKSUM` pins them. */
-export const PINNED_KEYS: Record<Circuit, { sha256: Uint8Array; insecureTestSetup: boolean }> = {
-  make: { sha256: hex("f8c9feb479316980af604735f98df4ec89ce421d75c95fa4b4862dd957d6492e"), insecureTestSetup: true },
-  cancel: { sha256: hex("866146bc05017f3c8adf3ea3923e4b9dcf20a5003b8bc4d6383020c8d18181f2"), insecureTestSetup: true },
-};
+type Pin = { sha256: Uint8Array; insecureTestSetup: boolean };
+
+export function pinnedKey(c: Circuit, keys: Record<string, { provingKeySha256: number[]; insecureTestSetup: boolean }> = provingKeys): Pin {
+  const k = keys[c];
+  if (!k || k.provingKeySha256.length !== 32) throw new Error(`the build has no proving-key pin for ${c}`);
+  return { sha256: Uint8Array.from(k.provingKeySha256), insecureTestSetup: k.insecureTestSetup };
+}
+
+/** On mainnet only a key from a real setup ceremony may prove. */
+export function checkPinForNetwork(c: Circuit, pin: Pin, network: string) {
+  if (network === "mainnet" && pin.insecureTestSetup) {
+    throw new Error(`the ${c} proving key comes from an insecure test setup; it may not be used on mainnet`);
+  }
+}
 
 export type WorkerRequest =
   | { op: "make" | "cancel"; inputs: unknown; sender: Uint8Array; payer: string }
   | { op: "orderTerms"; utxo: unknown }
-  | { op: "prove"; circuit: Circuit; proofInputs: unknown; publicHash: Uint8Array };
+  | { op: "prove"; circuit: Circuit; network: string; proofInputs: unknown; publicHash: Uint8Array };
 
 export type WorkerReply = { id: number; ok: true; value: unknown } | { id: number; ok: false; error: string };
 

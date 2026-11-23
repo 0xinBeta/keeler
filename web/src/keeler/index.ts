@@ -2,7 +2,7 @@
 // Amounts are bigint in base units; times are chain time in unix seconds.
 import type { Wallet } from "@wallet-standard/base";
 
-export type Asset = { mint: string; symbol: string; decimals: number };
+export type Asset = { mint: string; symbol: string; decimals: number; maxSell?: bigint };
 
 export type Config = {
   network: "local" | "devnet" | "mainnet";
@@ -13,6 +13,7 @@ export type Config = {
   minTtlSecs: number;
   maxTtlSecs: number;
   faucet: boolean;
+  paused: boolean;
 };
 
 export type Quote = {
@@ -57,9 +58,10 @@ export interface Keeler {
   deposit(asset: Asset, amount: bigint): Promise<void>;
   withdraw(asset: Asset, amount: bigint): Promise<void>;
   /** `quotes` is best first; out-of-band quotes are included with `inBand: false`. */
-  quotes(sell: Asset, buy: Asset, sellAmount: bigint): Promise<{ fair: bigint; quotes: Quote[] }>;
+  quotes(sell: Asset, buy: Asset, sellAmount: bigint): Promise<{ fair: bigint; priceTime: number; quotes: Quote[] }>;
   swap(quote: Quote, on: (step: SwapStep) => void): Promise<Order>;
   orders(): Promise<Order[]>;
+  rescanOrders(): Promise<Order[]>;
   refund(orderId: string): Promise<void>;
   faucet(): Promise<void>;
   chainNow(): Promise<number>;
@@ -82,7 +84,8 @@ export class KeelerError extends Error {
       | "busy"
       | "network"
       | "proof"
-      | "rate-limited",
+      | "rate-limited"
+      | "paused",
     message: string,
   ) {
     super(message);

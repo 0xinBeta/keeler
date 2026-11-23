@@ -114,8 +114,9 @@ fn main() {
         "splMint": spl.to_string(),
         "prices": { spl.to_string(): SPL_PRICE, SOL_MINT.to_string(): SOL_PRICE },
         "payerSecret": payer.to_bytes().to_vec(),
-        "dealer": { "pubkey": dealer_kp.pubkey().to_string(), "listen": DEALER_LISTEN },
-        "idleDealer": { "pubkey": idle.pubkey().to_string() },
+        // Fixture keys of a throwaway local network: the stand-in signs quotes with them.
+        "dealer": { "pubkey": dealer_kp.pubkey().to_string(), "listen": DEALER_LISTEN, "secret": dealer_kp.to_bytes().to_vec() },
+        "idleDealer": { "pubkey": idle.pubkey().to_string(), "secret": idle.to_bytes().to_vec() },
     });
     std::fs::write(out.join("localnet.json"), info.to_string()).unwrap();
     println!("ready");
