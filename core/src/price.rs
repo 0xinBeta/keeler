@@ -1,5 +1,4 @@
-use anyhow::{anyhow, bail, Context};
-use serde::Deserialize;
+use anyhow::{bail, ensure};
 
 /// A USD price: `price * 10^expo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,64 +50,51 @@ pub fn apply_spread(fair: u64, spread_bps: u16) -> Option<u64> {
     Some((fair as u128 * (10_000 - spread_bps as u128) / 10_000) as u64)
 }
 
-#[derive(Deserialize)]
-struct HermesReply {
-    parsed: Vec<HermesFeed>,
-}
+/// Pyth's receiver program, `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`,
+/// which owns the price feed accounts.
+pub const PYTH_RECEIVER: [u8; 32] = [
+    12, 183, 250, 187, 82, 247, 166, 72, 187, 91, 49, 125, 154, 1, 139, 144, 87, 203, 2, 71, 116,
+    250, 254, 1, 230, 196, 223, 152, 204, 56, 88, 129,
+];
+/// Anchor's discriminator of `PriceUpdateV2`: sha256("account:PriceUpdateV2")[..8].
+const PRICE_UPDATE_V2: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+/// Verification level `Full`; `Partial` (0) is rejected.
+const FULL: u8 = 1;
 
-#[derive(Deserialize)]
-struct HermesFeed {
-    id: String,
-    price: HermesPrice,
-}
-
-#[derive(Deserialize)]
-struct HermesPrice {
-    price: String,
-    conf: String,
-    expo: i32,
-    publish_time: i64,
-}
-
-/// Parses a Hermes `/v2/updates/price/latest?...&parsed=true` reply into
-/// `(feed id as lowercase hex without 0x, price)`. Any stale, non-positive or
-/// too-uncertain feed fails the whole call.
-pub fn parse_hermes(
-    json: &str,
-    now: i64,
-    max_age_secs: i64,
-    max_conf_bps: u16,
-) -> anyhow::Result<Vec<(String, Price)>> {
-    let reply: HermesReply = serde_json::from_str(json).context("bad Hermes reply")?;
-    reply
-        .parsed
-        .into_iter()
-        .map(|feed| {
-            let id = feed.id.trim_start_matches("0x").to_ascii_lowercase();
-            check_feed(&feed.price, now, max_age_secs, max_conf_bps)
-                .map(|price| (id.clone(), price))
-                .with_context(|| format!("Pyth feed {id}"))
-        })
-        .collect()
-}
-
-fn check_feed(
-    p: &HermesPrice,
+/// Reads a Pyth `PriceUpdateV2` account (owner and data) for `feed_id`. Any
+/// wrong owner or type, partial verification, other feed, age beyond
+/// `max_age_secs` either way from `now` (chain time), non-positive price or
+/// confidence wider than `max_conf_bps` is an error.
+pub fn parse_pyth_account(
+    owner: &[u8; 32],
+    data: &[u8],
+    feed_id: &[u8; 32],
     now: i64,
     max_age_secs: i64,
     max_conf_bps: u16,
 ) -> anyhow::Result<Price> {
-    let price: i64 = p
-        .price
-        .parse()
-        .map_err(|_| anyhow!("bad price {:?}", p.price))?;
-    let conf: u64 = p
-        .conf
-        .parse()
-        .map_err(|_| anyhow!("bad conf {:?}", p.conf))?;
-    let age = now.saturating_sub(p.publish_time);
+    ensure!(*owner == PYTH_RECEIVER, "not owned by the Pyth receiver");
+    // Little-endian: discriminator, write authority, verification level, then
+    // with Full: feed id, price, conf, exponent, publish time.
+    ensure!(data.len() >= 101, "too short for a price update");
+    ensure!(data[..8] == PRICE_UPDATE_V2, "not a price update account");
+    ensure!(
+        data[40] == FULL,
+        "verification level {} is not Full",
+        data[40]
+    );
+    ensure!(data[41..73] == feed_id[..], "another feed's account");
+    let int = |at: usize| <[u8; 8]>::try_from(&data[at..at + 8]).expect("8 bytes");
+    let price = i64::from_le_bytes(int(73));
+    let conf = u64::from_le_bytes(int(81));
+    let expo = i32::from_le_bytes(data[89..93].try_into().expect("4 bytes"));
+    let published = i64::from_le_bytes(int(93));
+    let age = now.saturating_sub(published);
     if age > max_age_secs {
         bail!("stale: published {age} s ago, max {max_age_secs} s");
+    }
+    if -age > max_age_secs {
+        bail!("published {} s in the future", -age);
     }
     if price <= 0 {
         bail!("non-positive price {price}");
@@ -116,10 +102,7 @@ fn check_feed(
     if conf as u128 * 10_000 > price as u128 * max_conf_bps as u128 {
         bail!("confidence {conf} wider than {max_conf_bps} bps of {price}");
     }
-    Ok(Price {
-        price,
-        expo: p.expo,
-    })
+    Ok(Price { price, expo })
 }
 
 #[cfg(test)]
@@ -265,89 +248,77 @@ mod tests {
         assert_eq!(apply_spread(10, 10_000), Some(0));
     }
 
-    // Shape of a real Hermes `parsed=true` reply (binary data shortened).
-    const HERMES: &str = r#"{
-      "binary": {"encoding": "hex", "data": ["504e41550100000003b801000000040d00"]},
-      "parsed": [
-        {
-          "id": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-          "price": {"price": "14237512345", "conf": "7012345", "expo": -8, "publish_time": 1763900000},
-          "ema_price": {"price": "14250011223", "conf": "7543210", "expo": -8, "publish_time": 1763900000},
-          "metadata": {"slot": 230000000, "proof_available_time": 1763900001, "prev_publish_time": 1763899999}
-        },
-        {
-          "id": "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
-          "price": {"price": "99985000", "conf": "71213", "expo": -8, "publish_time": 1763899998},
-          "ema_price": {"price": "99987500", "conf": "75000", "expo": -8, "publish_time": 1763899998},
-          "metadata": {"slot": 230000000, "proof_available_time": 1763900001, "prev_publish_time": 1763899997}
-        }
-      ]
-    }"#;
-    const SOL_ID: &str = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-    const USDC_ID: &str = "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a";
+    const FEED: [u8; 32] = [0xef; 32];
 
-    #[test]
-    fn hermes_good() {
-        let got = parse_hermes(HERMES, 1_763_900_010, 60, 100).unwrap();
-        assert_eq!(
-            got,
-            vec![
-                (
-                    SOL_ID.to_string(),
-                    Price {
-                        price: 14_237_512_345,
-                        expo: -8
-                    }
-                ),
-                (
-                    USDC_ID.to_string(),
-                    Price {
-                        price: 99_985_000,
-                        expo: -8
-                    }
-                ),
-            ]
-        );
+    /// A Full `PriceUpdateV2` account of 134 bytes, as on mainnet.
+    fn account(price: i64, conf: u64, published: i64) -> Vec<u8> {
+        let mut d = PRICE_UPDATE_V2.to_vec();
+        d.extend([7; 32]); // write authority
+        d.push(FULL);
+        d.extend(FEED);
+        d.extend(price.to_le_bytes());
+        d.extend(conf.to_le_bytes());
+        d.extend((-8i32).to_le_bytes());
+        d.extend(published.to_le_bytes());
+        d.extend([0; 32]); // previous publish time, EMA price and conf, posted slot
+        d.push(0); // spare byte the account is sized with
+        d
+    }
+
+    const NOW: i64 = 1_763_900_000;
+
+    fn parse(data: &[u8], max_conf_bps: u16) -> anyhow::Result<Price> {
+        parse_pyth_account(&PYTH_RECEIVER, data, &FEED, NOW, 60, max_conf_bps)
     }
 
     #[test]
-    fn hermes_stale() {
-        // USDC published at ...998: 60 s old is fine, 61 s is not
-        assert!(parse_hermes(HERMES, 1_763_900_058, 60, 100).is_ok());
-        let err = parse_hermes(HERMES, 1_763_900_059, 60, 100).unwrap_err();
-        assert!(format!("{err:#}").contains(USDC_ID), "{err:#}");
-        assert!(format!("{err:#}").contains("stale"), "{err:#}");
+    fn pyth_account_good() {
+        let data = account(15_000_000_000, 1_000_000, NOW - 30);
+        assert_eq!(data.len(), 134);
+        assert_eq!(parse(&data, 100).unwrap(), SOL);
     }
 
     #[test]
-    fn hermes_wide_confidence() {
-        // SOL conf is ~4.93 bps of price, USDC ~7.12 bps
-        let err = parse_hermes(HERMES, 1_763_900_000, 60, 5).unwrap_err();
-        assert!(format!("{err:#}").contains(USDC_ID), "{err:#}");
-        assert!(parse_hermes(HERMES, 1_763_900_000, 60, 8).is_ok());
+    fn pyth_account_rejects_wrong_owner_level_type_and_feed() {
+        let data = account(15_000_000_000, 0, NOW);
+        assert!(parse_pyth_account(&[0; 32], &data, &FEED, NOW, 60, 100).is_err());
+        let mut partial = data.clone();
+        partial[40] = 0;
+        assert!(parse(&partial, 100)
+            .unwrap_err()
+            .to_string()
+            .contains("not Full"));
+        let mut other = data.clone();
+        other[0] ^= 1;
+        assert!(parse(&other, 100).is_err(), "discriminator");
+        assert!(parse_pyth_account(&PYTH_RECEIVER, &data, &[1; 32], NOW, 60, 100).is_err());
+        assert!(parse(&data[..100], 100).is_err(), "short");
     }
 
     #[test]
-    fn hermes_non_positive_price() {
-        let json = HERMES.replace("\"99985000\"", "\"0\"");
-        let err = parse_hermes(&json, 1_763_900_000, 60, 100).unwrap_err();
-        assert!(format!("{err:#}").contains("non-positive"), "{err:#}");
-        let json = HERMES.replace("\"99985000\"", "\"-5\"");
-        assert!(parse_hermes(&json, 1_763_900_000, 60, 100).is_err());
+    fn pyth_account_age_both_ways() {
+        assert!(parse(&account(1, 0, NOW - 60), 100).is_ok());
+        assert!(parse(&account(1, 0, NOW - 61), 100)
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        assert!(parse(&account(1, 0, NOW + 60), 100).is_ok());
+        assert!(parse(&account(1, 0, NOW + 61), 100)
+            .unwrap_err()
+            .to_string()
+            .contains("future"));
     }
 
     #[test]
-    fn hermes_missing_and_extra_feed() {
-        // The caller matches ids: a feed missing from the reply is simply absent.
-        let feed = r#"{"id":"0xABCD","price":{"price":"5","conf":"0","expo":0,"publish_time":10}}"#;
-        let got = parse_hermes(&format!(r#"{{"parsed":[{feed}]}}"#), 10, 60, 100).unwrap();
-        assert_eq!(got, vec![("abcd".to_string(), Price { price: 5, expo: 0 })]);
-        // An extra (here stale) feed is returned too, and checked like the rest.
-        let three = HERMES.replacen("\"parsed\": [", &format!("\"parsed\": [{feed},"), 1);
-        let err = parse_hermes(&three, 1_763_900_000, 60, 100).unwrap_err();
-        assert!(format!("{err:#}").contains("abcd"), "{err:#}");
-        // No parsed section at all.
-        assert!(parse_hermes(r#"{"binary":{"encoding":"hex","data":[]}}"#, 10, 60, 100).is_err());
-        assert!(parse_hermes("garbage", 10, 60, 100).is_err());
+    fn pyth_account_confidence_and_price() {
+        // conf 8 bps of price.
+        let data = account(15_000_000_000, 12_000_000, NOW);
+        assert!(parse(&data, 8).is_ok());
+        assert!(parse(&data, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("confidence"));
+        assert!(parse(&account(0, 0, NOW), 100).is_err());
+        assert!(parse(&account(-1, 0, NOW), 100).is_err());
     }
 }

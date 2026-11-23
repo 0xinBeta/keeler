@@ -336,7 +336,10 @@ mod tests {
         assert_eq!(parse(&"0F".repeat(64)).unwrap().signature, [0x0f; 64]);
         // Owned input too, as from a serde_json::Value.
         let v = serde_json::json!({"buy_amount": 1, "expiry": 2, "signature": "ab".repeat(64)});
-        assert_eq!(serde_json::from_value::<Quote>(v).unwrap().signature, [0xab; 64]);
+        assert_eq!(
+            serde_json::from_value::<Quote>(v).unwrap().signature,
+            [0xab; 64]
+        );
         assert!(parse(&"0f".repeat(63)).is_err());
         assert!(parse(&"0g".repeat(64)).is_err());
         assert!(serde_json::from_str::<Quote>(r#"{"buy_amount":1,"expiry":2}"#).is_err());

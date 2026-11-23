@@ -2,11 +2,12 @@
 //! is ever printed.
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, process::Command, str::FromStr};
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use keeler_core::price::{parse_hermes, Price};
+use anyhow::{anyhow, ensure, Context, Result};
+use keeler_core::price::{parse_pyth_account, Price};
 use serde::Deserialize;
 use solana_address::Address;
 use solana_keypair::Keypair;
+use spr_client::Rpc;
 
 /// Where a secret comes from. `file` is for local test keys only.
 #[derive(Clone, Deserialize)]
@@ -138,17 +139,19 @@ pub fn log(msg: std::fmt::Arguments) {
     eprintln!("{}", redact(&msg.to_string()));
 }
 
-/// The Hermes API key, read from the Keychain item `keychain`.
-#[derive(Clone, Deserialize)]
-pub struct ApiKey {
-    pub keychain: String,
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PriceSource {
     Fixed { price: i64, expo: i32 },
-    Pyth { pyth: String },
+    Pyth { pyth: PythFeed },
+}
+
+/// A Pyth price feed account on chain and the feed it must carry.
+#[derive(Clone, Deserialize)]
+pub struct PythFeed {
+    pub account: String,
+    /// 64 hex characters, with or without `0x`.
+    pub feed_id: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -157,10 +160,9 @@ pub struct Asset {
     pub price: PriceSource,
 }
 
+/// Freshness and confidence limits for every Pyth price.
 #[derive(Clone, Deserialize)]
 pub struct Pyth {
-    pub url: String,
-    pub api_key: ApiKey,
     pub max_age_secs: i64,
     pub max_conf_bps: u16,
 }
@@ -349,15 +351,15 @@ impl Common {
     fn check(&self) -> Result<()> {
         for asset in &self.assets {
             parse_address(&asset.mint)?;
-            if matches!(asset.price, PriceSource::Pyth { .. }) && self.pyth.is_none() {
-                bail!(
+            if let PriceSource::Pyth { pyth } = &asset.price {
+                ensure!(
+                    self.pyth.is_some(),
                     "asset {} uses a Pyth price but no pyth section is set",
                     asset.mint
                 );
+                parse_address(&pyth.account)?;
+                feed_id(&pyth.feed_id)?;
             }
-        }
-        if let Some(pyth) = &self.pyth {
-            ensure!(pyth.url.starts_with("https://"), "pyth.url must be https");
         }
         self.network.check()
     }
@@ -379,7 +381,6 @@ impl Common {
         Ok(())
     }
 
-    /// The price source, with the Hermes key and HTTP client set up once.
     pub fn pricer(&self) -> Result<Pricer> {
         let mut fixed = HashMap::new();
         let mut feeds = HashMap::new();
@@ -396,81 +397,74 @@ impl Common {
                     );
                 }
                 PriceSource::Pyth { pyth } => {
-                    feeds.insert(mint, feed_id(pyth));
+                    feeds.insert(
+                        mint,
+                        (parse_address(&pyth.account)?, feed_id(&pyth.feed_id)?),
+                    );
                 }
             }
         }
-        let hermes = match (&self.pyth, feeds.is_empty()) {
-            (Some(pyth), false) => Some(Hermes {
-                pyth: pyth.clone(),
-                key: keychain_secret(&pyth.api_key.keychain)?,
-                http: reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .build()?,
-            }),
-            _ => None,
-        };
         Ok(Pricer {
             fixed,
             feeds,
-            hermes,
+            pyth: self.pyth.clone(),
         })
     }
-}
-
-struct Hermes {
-    pyth: Pyth,
-    key: String,
-    http: reqwest::blocking::Client,
 }
 
 /// USD prices of the configured assets.
 pub struct Pricer {
     fixed: HashMap<Address, Price>,
-    feeds: HashMap<Address, String>,
-    hermes: Option<Hermes>,
+    /// Mint to (Pyth price account, feed id).
+    feeds: HashMap<Address, (Address, [u8; 32])>,
+    pyth: Option<Pyth>,
 }
 
 impl Pricer {
     /// The prices of `mints`, each of which must be configured; that is
-    /// checked before any network call. Pyth prices are checked against wall
-    /// time, as Hermes publishes in wall time.
-    pub fn prices(&self, mints: &[Address]) -> Result<Vec<Price>> {
+    /// checked before any network call. Pyth prices come from their accounts
+    /// and the Clock sysvar in one `getMultipleAccounts`, checked against
+    /// chain time.
+    pub fn prices(&self, rpc: &impl Rpc, mints: &[Address]) -> Result<Vec<Price>> {
         let mut wanted = Vec::new();
         for m in mints {
             if !self.fixed.contains_key(m) {
-                let id = self
+                let feed = self
                     .feeds
                     .get(m)
                     .ok_or_else(|| anyhow!("no price configured for {m}"))?;
-                wanted.push((*m, id.clone()));
+                wanted.push((*m, *feed));
             }
         }
         let mut pyth = HashMap::new();
         if !wanted.is_empty() {
-            let h = self
-                .hermes
+            let limits = self
+                .pyth
                 .as_ref()
                 .ok_or_else(|| anyhow!("no pyth section"))?;
-            let ids: Vec<String> = wanted.iter().map(|(_, id)| id.clone()).collect();
-            let json = h
-                .http
-                .get(hermes_url(&h.pyth.url, &ids))
-                .bearer_auth(&h.key)
-                .send()
-                .and_then(|r| r.error_for_status())
-                .and_then(|r| r.text())
-                .context("Hermes request")?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs() as i64;
-            pyth.extend(hermes_prices(
-                &json,
-                &wanted,
-                now,
-                h.pyth.max_age_secs,
-                h.pyth.max_conf_bps,
-            )?);
+            let mut addrs = vec![parse_address(crate::chain::CLOCK_SYSVAR)?];
+            addrs.extend(wanted.iter().map(|(_, (account, _))| *account));
+            let accounts = rpc.get_multiple_accounts(addrs)?;
+            ensure!(accounts.len() == wanted.len() + 1, "short account reply");
+            let clock = accounts[0]
+                .as_ref()
+                .ok_or_else(|| anyhow!("no Clock sysvar"))?;
+            let now = crate::chain::clock_time(&clock.data)?;
+            for ((mint, (account, feed)), got) in wanted.iter().zip(&accounts[1..]) {
+                let a = got
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Pyth account {account} not found"))?;
+                let price = parse_pyth_account(
+                    a.owner.as_array(),
+                    &a.data,
+                    feed,
+                    now,
+                    limits.max_age_secs,
+                    limits.max_conf_bps,
+                )
+                .with_context(|| format!("Pyth account {account}"))?;
+                pyth.insert(*mint, price);
+            }
         }
         mints
             .iter()
@@ -484,50 +478,17 @@ pub fn parse_address(s: &str) -> Result<Address> {
     Address::from_str(s).map_err(|_| anyhow!("{s} is not a base58 address"))
 }
 
-fn feed_id(id: &str) -> String {
-    id.trim_start_matches("0x").to_ascii_lowercase()
-}
-
-fn hermes_url(base: &str, ids: &[String]) -> String {
-    let query: Vec<String> = ids.iter().map(|id| format!("ids[]={id}")).collect();
-    format!(
-        "{}/v2/updates/price/latest?{}&parsed=true",
-        base.trim_end_matches('/'),
-        query.join("&")
-    )
-}
-
-/// Maps a Hermes reply to `feeds`. Every requested feed must be present, and
-/// no feed may be published more than `max_age_secs` in the future, which
-/// `parse_hermes` treats as fresh.
-fn hermes_prices(
-    json: &str,
-    feeds: &[(Address, String)],
-    now: i64,
-    max_age_secs: i64,
-    max_conf_bps: u16,
-) -> Result<Vec<(Address, Price)>> {
-    let reply: serde_json::Value = serde_json::from_str(json).context("bad Hermes reply")?;
-    for feed in reply["parsed"].as_array().into_iter().flatten() {
-        let published = feed["price"]["publish_time"].as_i64().unwrap_or(i64::MIN);
-        ensure!(
-            published <= now.saturating_add(max_age_secs),
-            "Pyth feed {} published in the future",
-            feed["id"]
-        );
+fn feed_id(id: &str) -> Result<[u8; 32]> {
+    let hex = id.strip_prefix("0x").unwrap_or(id);
+    ensure!(
+        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Pyth feed_id {id} is not 64 hex characters"
+    );
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)?;
     }
-    let parsed: HashMap<String, Price> = parse_hermes(json, now, max_age_secs, max_conf_bps)?
-        .into_iter()
-        .collect();
-    feeds
-        .iter()
-        .map(|(mint, id)| {
-            parsed
-                .get(id)
-                .map(|p| (*mint, *p))
-                .ok_or_else(|| anyhow!("Pyth feed {id} missing from the Hermes reply"))
-        })
-        .collect()
+    Ok(out)
 }
 
 /// Reads a secret from the macOS Keychain. The name is passed as an argument,
@@ -547,28 +508,9 @@ pub fn keychain_secret(name: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    const A: &str = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
+    /// Mainnet SOL/USD.
+    const PYTH_SOL_ACCOUNT: &str = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
     const B: &str = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-
-    fn reply(feeds: &[(&str, i64)]) -> String {
-        let parsed: Vec<_> = feeds
-            .iter()
-            .map(|(id, t)| {
-                serde_json::json!({"id": id, "price": {"price": "100", "conf": "1", "expo": 0, "publish_time": t}})
-            })
-            .collect();
-        serde_json::json!({ "parsed": parsed }).to_string()
-    }
-
-    fn feeds() -> Vec<(Address, String)> {
-        vec![
-            (
-                Address::new_from_array([1; 32]),
-                feed_id(&format!("0x{}", A.to_uppercase())),
-            ),
-            (Address::new_from_array([2; 32]), feed_id(B)),
-        ]
-    }
 
     fn dealer_json(extra: &str) -> String {
         format!(
@@ -578,11 +520,11 @@ mod tests {
         )
     }
 
-    fn trader_json(band: u16, pyth_url: &str) -> String {
+    fn trader_json(band: u16, feed_id: &str) -> String {
         format!(
             r#"{{"network":{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784","prover":"local"}},
-            "key":{{"file":"k.json"}},"assets":[{{"mint":"11111111111111111111111111111111","price":{{"pyth":"aa"}}}}],
-            "pyth":{{"url":"{pyth_url}","api_key":{{"keychain":"x"}},"max_age_secs":60,"max_conf_bps":100}},
+            "key":{{"file":"k.json"}},"assets":[{{"mint":"11111111111111111111111111111111","price":{{"pyth":{{"account":"{PYTH_SOL_ACCOUNT}","feed_id":"{feed_id}"}}}}}}],
+            "pyth":{{"max_age_secs":60,"max_conf_bps":100}},
             "dealers":[{{"address":"127.0.0.1:47001","pubkey":"11111111111111111111111111111111"}}],
             "band_bps":{band},"min_ttl_secs":5,"max_ttl_secs":60}}"#
         )
@@ -605,13 +547,8 @@ mod tests {
 
     #[test]
     fn band_must_be_below_10000() {
-        assert!(TraderConfig::from_json(&trader_json(9_999, "https://h.example")).is_ok());
-        assert!(TraderConfig::from_json(&trader_json(10_000, "https://h.example")).is_err());
-    }
-
-    #[test]
-    fn pyth_url_must_be_https() {
-        assert!(TraderConfig::from_json(&trader_json(50, "http://h.example")).is_err());
+        assert!(TraderConfig::from_json(&trader_json(9_999, B)).is_ok());
+        assert!(TraderConfig::from_json(&trader_json(10_000, B)).is_err());
     }
 
     #[test]
@@ -681,30 +618,72 @@ mod tests {
     }
 
     #[test]
-    fn url_lists_every_feed() {
-        let ids = vec!["aa".to_string(), "bb".to_string()];
+    fn pyth_feed_must_be_an_account_and_64_hex() {
         assert_eq!(
-            hermes_url("https://hermes.example/", &ids),
-            "https://hermes.example/v2/updates/price/latest?ids[]=aa&ids[]=bb&parsed=true"
+            feed_id(&format!("0x{}", B.to_uppercase())).unwrap()[0],
+            0xef
+        );
+        assert!(feed_id(&B[1..]).is_err());
+        let bad_account = trader_json(50, B).replace(PYTH_SOL_ACCOUNT, "not-base58");
+        assert!(TraderConfig::from_json(&bad_account).is_err());
+        assert!(TraderConfig::from_json(&trader_json(50, &B[..62])).is_err());
+        let no_section =
+            trader_json(50, B).replace(r#""pyth":{"max_age_secs":60,"max_conf_bps":100},"#, "");
+        assert!(TraderConfig::from_json(&no_section).is_err());
+    }
+
+    #[test]
+    fn receiver_program_constant_matches_its_address() {
+        assert_eq!(
+            parse_address("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ")
+                .unwrap()
+                .as_array(),
+            &keeler_core::price::PYTH_RECEIVER
         );
     }
 
+    /// Reads mainnet's SOL/USD account through Helius (key from the
+    /// Keychain, never printed). Run by hand:
+    /// `cargo test -p keeler --lib -- --ignored mainnet_pyth`.
     #[test]
-    fn every_feed_present_maps_to_its_mint() {
-        let got = hermes_prices(&reply(&[(A, 1000), (B, 1000)]), &feeds(), 1000, 60, 100).unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0, Address::new_from_array([1; 32]));
-    }
-
-    #[test]
-    fn missing_feed_is_an_error() {
-        let err = hermes_prices(&reply(&[(A, 1000)]), &feeds(), 1000, 60, 100).unwrap_err();
-        assert!(err.to_string().contains(B), "{err}");
-    }
-
-    #[test]
-    fn future_publish_time_beyond_max_age_is_an_error() {
-        assert!(hermes_prices(&reply(&[(A, 1060), (B, 1000)]), &feeds(), 1000, 60, 100).is_ok());
-        assert!(hermes_prices(&reply(&[(A, 1061), (B, 1000)]), &feeds(), 1000, 60, 100).is_err());
+    #[ignore]
+    fn mainnet_pyth_sol_usd() {
+        let net = Network {
+            rpc_url: "https://mainnet.helius-rpc.com".into(),
+            indexer_url: "https://mainnet.helius-rpc.com/v1/spr".into(),
+            prover: Prover::Helius {
+                keychain: "keeler-helius-api-key".into(),
+            },
+        };
+        let (rpc_url, _) = net.urls().unwrap();
+        let common = Common {
+            network: net,
+            key: KeySource::File("unused.json".into()),
+            assets: vec![Asset {
+                mint: "11111111111111111111111111111111".into(),
+                price: PriceSource::Pyth {
+                    pyth: PythFeed {
+                        account: PYTH_SOL_ACCOUNT.into(),
+                        feed_id: B.into(),
+                    },
+                },
+            }],
+            pyth: Some(Pyth {
+                max_age_secs: 120,
+                max_conf_bps: 100,
+            }),
+        };
+        let prices = common
+            .pricer()
+            .unwrap()
+            .prices(
+                &spr_client::SolanaRpc::new(rpc_url),
+                &[parse_address("11111111111111111111111111111111").unwrap()],
+            )
+            .map_err(|e| redact(&format!("{e:#}")))
+            .unwrap();
+        let usd = prices[0].price as f64 * 10f64.powi(prices[0].expo);
+        eprintln!("SOL/USD {usd}");
+        assert!(usd > 1.0 && usd < 100_000.0);
     }
 }

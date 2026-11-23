@@ -36,7 +36,7 @@ use crate::config::{Network, Prover};
 
 /// A swap or a split carries a proof and an SPP transact: the whole budget.
 const COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
-const CLOCK_SYSVAR: &str = "SysvarC1ock11111111111111111111111111111111";
+pub const CLOCK_SYSVAR: &str = "SysvarC1ock11111111111111111111111111111111";
 /// The SDK hashes discovered orders under tree id 0 only.
 const TREE_ID: u16 = 0;
 
@@ -44,6 +44,14 @@ pub struct Chain {
     pub client: SprClient<SolanaRpc>,
     pub tree: Address,
     pub registry: AssetRegistry,
+}
+
+/// Unix time from the Clock sysvar's data.
+pub fn clock_time(data: &[u8]) -> Result<i64> {
+    let ts = data
+        .get(32..40)
+        .ok_or_else(|| anyhow!("short Clock sysvar"))?;
+    Ok(i64::from_le_bytes(ts.try_into()?))
 }
 
 /// Where an order stands, read from its nullifier.
@@ -120,10 +128,7 @@ impl Chain {
             .get_account(clock)?
             .ok_or_else(|| anyhow!("no Clock sysvar"))?
             .data;
-        let ts = data
-            .get(32..40)
-            .ok_or_else(|| anyhow!("short Clock sysvar"))?;
-        Ok(u64::try_from(i64::from_le_bytes(ts.try_into()?))?)
+        Ok(u64::try_from(clock_time(&data)?)?)
     }
 
     pub fn mint_decimals(&self, mint: Address) -> Result<u8> {

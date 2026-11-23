@@ -150,8 +150,14 @@ the dealer).
 `key` is `{"file": "<keypair.json>"}` for local test keys or
 `{"keychain": "<name>"}`, read with `security find-generic-password -s <name>
 -w`; the secret is a Solana keypair JSON array. A price is fixed
-(`{"price": 15, "expo": -2}` is 0.15 USD) or `{"pyth": "<feed id>"}`, which
-needs a `pyth` section; the Hermes API key is sent as a bearer token. Every
+(`{"price": 15, "expo": -2}` is 0.15 USD) or `{"pyth": {"account": "<price
+feed account>", "feed_id": "<64 hex>"}}`, which needs a `pyth` section
+(`max_age_secs`, `max_conf_bps`). Pyth prices are read on chain, all in one
+`getMultipleAccounts` with the Clock: the account must be owned by Pyth's
+receiver `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, fully verified, carry
+that feed id, be at most `max_age_secs` from chain time either way, and have a
+positive price with confidence within `max_conf_bps`; otherwise there is no
+price, so no quote and no settlement. Every
 mint you trade needs a price.
 
 Trader:
@@ -162,14 +168,12 @@ Trader:
   "key": {"keychain": "keeler-trader"},
   "assets": [
     {"mint": "<spl mint>", "price": {"price": 2, "expo": 0}},
-    {"mint": "11111111111111111111111111111111", "price": {"pyth": "<SOL/USD feed id>"}}
+    {"mint": "11111111111111111111111111111111", "price": {"pyth": {
+      "account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+      "feed_id": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
+    }}}
   ],
-  "pyth": {
-    "url": "https://hermes.example",
-    "api_key": {"keychain": "keeler-hermes"},
-    "max_age_secs": 60,
-    "max_conf_bps": 100
-  },
+  "pyth": {"max_age_secs": 60, "max_conf_bps": 100},
   "dealers": [
     {"address": "127.0.0.1:47001", "pubkey": "<dealer Solana public key>"}
   ],
@@ -219,6 +223,9 @@ example's tests do, and fund one trader and three dealers.
   locked until expiry, then `refund` returns them. Short TTLs limit this.
 - Quotes reserve nothing: a dealer can quote more than it can settle across
   concurrent requests.
-- The Pyth Hermes call is only tested through recorded replies, not live.
+- Pyth accounts are parsed from hand-built buffers in tests; one ignored test
+  (`cargo test -p keeler --lib -- --ignored mainnet_pyth`) reads mainnet
+  SOL/USD through Helius. The mainnet account above is a mainnet price: the
+  local network and devnet use fixed prices.
 - Dealer discovery rescans the whole order history on every poll.
 - Each worktree needs its own `.tools/` and `target/`, several GB each.

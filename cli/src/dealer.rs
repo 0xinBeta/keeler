@@ -520,7 +520,7 @@ fn poll(
     }
     // Once per poll; a failed fetch settles nothing this pass.
     let prices = cfg.common.mints().and_then(|mints| {
-        let p = pricer.prices(&mints)?;
+        let p = pricer.prices(chain.client.rpc(), &mints)?;
         Ok(mints.into_iter().zip(p).collect::<HashMap<_, _>>())
     });
     let prices = match prices {

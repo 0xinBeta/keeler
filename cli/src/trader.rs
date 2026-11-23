@@ -42,7 +42,7 @@ pub fn fair_amount(
     buy: Address,
     amount: u64,
 ) -> Result<u64> {
-    let p = pricer.prices(&[sell, buy])?;
+    let p = pricer.prices(chain.client.rpc(), &[sell, buy])?;
     fair_at(p[0], p[1], chain, sell, buy, amount)
 }
 
