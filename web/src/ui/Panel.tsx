@@ -256,7 +256,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
     return (
       <div className="stack">
         <p className="muted">
-          Selling <Amount value={view.quotes[0]?.sellAmount ?? 0n} asset={sellAsset} />. Reference price:{" "}
+          For <Amount value={view.quotes[0]?.sellAmount ?? 0n} asset={sellAsset} />, the reference price gives{" "}
           <Amount value={view.fair} asset={buyAsset} />.
         </p>
         <fieldset className="quotes">
@@ -433,7 +433,8 @@ function Progress(
   if (view.failed) line = "The swap stopped.";
   else if (status === "settled") line = `Settled. You received ${formatUnits(q.buyAmount, q.buy.decimals)} ${q.buy.symbol} privately.`;
   else if (status === "refunded") line = `Done. Your ${formatUnits(q.sellAmount, q.sell.decimals)} ${q.sell.symbol} is back in your private balance.`;
-  else if (status === "refundable") line = "The dealer did not settle before the quote expired. Your funds are still yours.";
+  else if (status === "refundable")
+    line = `The dealer did not settle before the quote expired. Your ${formatUnits(q.sellAmount, q.sell.decimals)} ${q.sell.symbol} is still yours: take it back.`;
   else if (status === "failed") line = order?.error ?? "The order failed.";
   else if (order) line = "Locked. Waiting for the dealer to settle.";
   else line = STEPS[Math.max(at, 0)]!.label + "…";
@@ -454,7 +455,7 @@ function Progress(
               <span>
                 {refundable ? "Dealer did not settle" : s.label}
                 {s.key === "proving" && state === "now" && <span className="muted step-sub">Keep this tab open.</span>}
-                {s.key === "locked" && state === "now" && left !== null && (
+                {s.key === "locked" && state === "now" && status === "locked" && left !== null && (
                   <span className="muted step-sub num">
                     {left > 0 ? `Dealer has ${countdown(left)} to settle` : "Quote expired, checking…"}
                   </span>

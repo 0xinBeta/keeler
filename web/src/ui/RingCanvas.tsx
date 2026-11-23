@@ -42,11 +42,12 @@ export function RingCanvas({ input, anchor, hero }: Props) {
           // Anchored to the panel's top, not its height, so the ring does not jump as the panel changes.
           cy: a.top - h.top + 290,
           radius: Math.max(a.width * 1.3, h.width * 0.4),
+          lights: 3.35, // near arc, left of the panel
         };
       } else {
         const top = a ? a.top - h.top : 0;
         // One column: the ring sits above the panel, its near arc passing behind the panel's top.
-        layout = { cx: h.width * 0.56, cy: top - 20, radius: h.width * 0.86 };
+        layout = { cx: a ? a.left - h.left + a.width * 0.55 : h.width / 2, cy: top - 24, radius: Math.min(h.width * 0.95, 440), lights: 1.2 }; // far arc, above the panel
       }
       r.resize(h.width, h.height, layout);
     };

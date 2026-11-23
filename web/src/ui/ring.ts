@@ -4,17 +4,18 @@
 
 export type DealerLight = "waiting" | "answered" | "silent";
 export type RingInput = { dealers: DealerLight[] | null; proving: boolean; settled: number };
-export type RingLayout = { cx: number; cy: number; radius: number };
+/** Centre and outer radius in CSS px; `lights` is the ring angle where dealer lights start, on an arc left visible. */
+export type RingLayout = { cx: number; cy: number; radius: number; lights: number };
 
 const GAP_R = 0.95;
-const GAP_HALF = 0.016;
+const GAP_HALF = 0.02;
 const R_IN = 0.5;
 const R_OUT = 1.2;
 const DIST = 3.4;
 const OMEGA = 0.075; // rad/s at r = 1
 const TILT = 0.4;
 const ROLL = -0.22;
-const MOON0 = 2.15; // moon angle at t = 0: on the near side, lower right
+const MOON0 = 1.16; // so the moon crosses the near arc, below the panel, in the first seconds
 
 const gauss = (x: number, m: number, s: number) => Math.exp(-((x - m) ** 2) / (2 * s * s));
 const smooth = (a: number, b: number, x: number) => {
@@ -57,8 +58,10 @@ void main() {
   float edge = max(abs(s) - ${GAP_HALF.toFixed(3)}, 0.0);
   float down = s > 0.0 ? step(d, 0.0) : step(0.0, d);
   float x = abs(d);
-  float env = exp(-x * 1.4) * smoothstep(0.0, 0.1, x) * exp(-edge / 0.03) * down;
-  float wave = sin(x * 34.0 - 0.6) * env;
+  // While proving the wake reaches further round the ring, so the change shows wherever the moon is.
+  float prove = clamp((uWave - 0.005) / 0.012, 0.0, 1.0);
+  float env = exp(-x * mix(0.8, 0.3, prove)) * smoothstep(0.0, 0.08, x) * exp(-edge / 0.028) * down;
+  float wave = sin(x * 22.0 - 0.6) * env;
   r += uWave * wave;
   float h = aA.z + uWave * 0.7 * wave * (1.0 - step(0.0, -s) * 2.0);
   vec3 p = vec3(r * cos(ang), h, r * sin(ang));
@@ -68,20 +71,23 @@ void main() {
   vec2 dir = proj(v + t * 0.01) - px;
   vDir = length(dir) > 0.0 ? normalize(dir) : vec2(1.0, 0.0);
   float persp = ${DIST.toFixed(2)} / (${DIST.toFixed(2)} + v.z);
-  float size = aB.y * uFocal * 0.00125 * persp;
+  float size = aB.y * uFocal * 0.0015 * persp;
   float streak = aB.z * pow(r, -1.5) * (1.0 - uHaze);
   vStretch = 1.0 + streak;
   // Light: denser bands run hotter, the near side scatters a little more, sparkles twinkle.
   float dens = aB.x;
-  vec3 gold = vec3(0.914, 0.722, 0.447);
-  vec3 ember = vec3(1.0, 0.416, 0.239);
-  vec3 ice = vec3(0.957, 0.922, 0.839);
-  vec3 col = mix(gold, ember, smoothstep(0.62, 1.0, dens));
-  float inten = (0.1 + 0.2 * dens) * (1.0 - 0.35 * v.z) / sqrt(vStretch);
-  inten *= 1.0 + 1.6 * abs(wave) * min(uWave * 60.0, 1.0);
+  // Linear light, more saturated than the palette: under the tone curve they settle on gold #E9B872 and
+  // ember #FF6A3D at the intensities the ring reaches, and only the densest overlaps run white-hot.
+  vec3 gold = vec3(1.0, 0.56, 0.24);
+  vec3 ember = vec3(1.0, 0.27, 0.1);
+  vec3 ice = vec3(1.0, 0.95, 0.86);
+  vec3 col = mix(gold, ember, smoothstep(0.5, 0.95, dens));
+  float inten = (0.16 + 0.5 * dens * dens) * (1.0 - 0.4 * v.z) / sqrt(vStretch);
+  inten *= 1.0 + 1.6 * abs(wave) * min(uWave * 60.0, 1.0) + prove * 1.2 * exp(-edge / 0.02);
+  col = mix(col, ember, prove * 0.5 * exp(-edge / 0.02));
   if (aB.w > 0.5) {
     col = ice;
-    inten = 0.25 + 0.75 * pow(0.5 + 0.5 * sin(uTime * (1.1 + seed * 2.7) + seed * 61.0), 8.0);
+    inten = 0.3 + 1.6 * pow(0.5 + 0.5 * sin(uTime * (1.1 + seed * 2.7) + seed * 61.0), 8.0);
   }
   // Settled: one bright front runs once round the ring, with a fading tail.
   float f = mod(ang - uSettle + PI, 2.0 * PI) - PI;
@@ -89,8 +95,8 @@ void main() {
   inten *= 1.0 + uSettleOn * 5.0 * front;
   col = mix(col, ice, uSettleOn * 0.6 * front);
   if (uHaze > 0.5) {
-    size *= 9.0;
-    inten *= 0.022;
+    size *= 7.0;
+    inten *= 0.03;
     col = mix(col, ember, 0.4);
   }
   vCol = col;
@@ -134,7 +140,39 @@ out vec4 o;
 void main() {
   float d = length(gl_PointCoord * 2.0 - 1.0);
   if (d > 1.0) discard;
-  o = vec4(vCol * (exp(-d * d * 18.0) * 1.4 + exp(-d * 4.5) * 0.35) * (1.0 - d), 1.0);
+  o = vec4(vCol * (exp(-d * d * 70.0) * 4.0 + exp(-d * 7.0) * 0.45) * (1.0 - d), 1.0);
+}`;
+
+// Post: the particles add up in a float buffer; a blurred copy is the glow; a tone curve keeps it light, not clipped.
+const QVS = `#version 300 es
+out vec2 vUv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const BLUR = `#version 300 es
+precision mediump float;
+uniform sampler2D uTex;
+uniform vec2 uStep;
+uniform float uLod;
+in vec2 vUv;
+out vec4 o;
+vec3 at(vec2 d) { return textureLod(uTex, vUv + d, uLod).rgb; }
+void main() {
+  vec3 c = at(vec2(0.0)) * 0.227;
+  c += (at(uStep * 1.385) + at(-uStep * 1.385)) * 0.316;
+  c += (at(uStep * 3.231) + at(-uStep * 3.231)) * 0.07;
+  o = vec4(c, 1.0);
+}`;
+const COMPOSE = `#version 300 es
+precision mediump float;
+uniform sampler2D uScene, uGlow;
+in vec2 vUv;
+out vec4 o;
+void main() {
+  vec3 c = texture(uScene, vUv).rgb + texture(uGlow, vUv).rgb * 1.6;
+  o = vec4(1.0 - exp(-c * 1.15), 1.0);
 }`;
 
 function compile(gl: WebGL2RenderingContext, vs: string, fs: string): WebGLProgram {
@@ -166,7 +204,7 @@ function particles(n: number): Float32Array {
     data[k + 3] = Math.random();
     data[k + 4] = Math.min(dens / 1.15, 1);
     data[k + 5] = sparkle ? 2.6 : 0.9 + Math.random() ** 3 * 1.6;
-    data[k + 6] = Math.random() < 0.22 ? 2 + Math.random() * 5 : 0;
+    data[k + 6] = Math.random() < 0.3 ? 2 + Math.random() * 8 : 0;
     data[k + 7] = sparkle ? 1 : 0;
     i++;
   }
@@ -188,11 +226,16 @@ function rotate(p: [number, number, number]): [number, number, number] {
   ];
 }
 
-const DEALER_R = 1.13;
-const DEALER_ANGLES = [1.25, 1.75, 2.6, 3.1, 0.75];
+const DEALER_R = 0.88;
+
+type Target = { tex: WebGLTexture; fb: WebGLFramebuffer; w: number; h: number };
 
 export class Ring {
   private gl: WebGL2RenderingContext;
+  private blur: WebGLProgram;
+  private compose: WebGLProgram;
+  private hdr: boolean;
+  private targets: { scene: Target; a: Target; b: Target } | null = null;
   private prog: WebGLProgram;
   private sprog: WebGLProgram;
   private vao: WebGLVertexArrayObject;
@@ -201,7 +244,7 @@ export class Ring {
   private count: number;
   private loc: Record<string, WebGLUniformLocation | null> = {};
   private sres: WebGLUniformLocation | null;
-  private layoutPx: RingLayout = { cx: 0, cy: 0, radius: 1 };
+  private layoutPx: RingLayout = { cx: 0, cy: 0, radius: 1, lights: 0 };
   private dpr = 1;
   private time = 40; // start mid-orbit so the first frame already shows the moon's wake
   private last = 0;
@@ -227,6 +270,13 @@ export class Ring {
     for (const u of ["uTime", "uFocal", "uDpr", "uMoon", "uWave", "uSettle", "uSettleOn", "uHaze", "uRes", "uCenter", "uRot"])
       this.loc[u] = gl.getUniformLocation(this.prog, u);
     this.sres = gl.getUniformLocation(this.sprog, "uRes");
+    this.blur = compile(gl, QVS, BLUR);
+    this.compose = compile(gl, QVS, COMPOSE);
+    gl.useProgram(this.compose);
+    gl.uniform1i(gl.getUniformLocation(this.compose, "uScene"), 0);
+    gl.uniform1i(gl.getUniformLocation(this.compose, "uGlow"), 1);
+    // Without float render targets the light clips sooner, but the ring still draws.
+    this.hdr = !!gl.getExtension("EXT_color_buffer_float");
 
     const small = Math.min(innerWidth, innerHeight) < 700 || (navigator.hardwareConcurrency ?? 8) <= 4;
     this.count = small ? 38_000 : 72_000;
@@ -269,8 +319,33 @@ export class Ring {
     this.canvas.width = Math.round(width * this.dpr);
     this.canvas.height = Math.round(height * this.dpr);
     this.layoutPx = layout;
-    this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    this.allocate();
     this.frame(0);
+  }
+
+  private allocate() {
+    const gl = this.gl;
+    if (this.targets) for (const t of Object.values(this.targets)) {
+      gl.deleteTexture(t.tex);
+      gl.deleteFramebuffer(t.fb);
+    }
+    const make = (w: number, h: number, mips: boolean): Target => {
+      const tex = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      const levels = mips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : 1;
+      gl.texStorage2D(gl.TEXTURE_2D, levels, this.hdr ? gl.RGBA16F : gl.RGBA8, w, h);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const fb = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      return { tex, fb, w, h };
+    };
+    const W = Math.max(this.canvas.width, 4), H = Math.max(this.canvas.height, 4);
+    this.targets = { scene: make(W, H, true), a: make(W >> 2, H >> 2, false), b: make(W >> 2, H >> 2, false) };
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   set(input: RingInput) {
@@ -325,11 +400,12 @@ export class Ring {
 
   private frame(dt: number) {
     const gl = this.gl;
+    if (!this.targets) return;
     this.time += dt;
     const ease = (k: number) => 1 - Math.exp(-dt * k);
     const still = this.still;
     // Smooth inputs; the still frame jumps straight to the target.
-    const waveTarget = this.input.proving ? 0.03 : 0.006;
+    const waveTarget = this.input.proving ? 0.017 : 0.005;
     this.wave = still ? waveTarget : this.wave + (waveTarget - this.wave) * ease(2.2);
     let settleOn = 0;
     let settleAng = 0;
@@ -347,6 +423,10 @@ export class Ring {
     const focal = ((radius * d) / R_OUT) * DIST;
     const moon = MOON0 + OMEGA * GAP_R ** -1.5 * this.time;
 
+    const t = this.targets!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.scene.fb);
+    gl.viewport(0, 0, t.scene.w, t.scene.h);
+    gl.enable(gl.BLEND);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.prog);
     gl.uniform1f(this.loc.uTime!, this.time);
@@ -374,15 +454,15 @@ export class Ring {
     const sprites: number[] = [];
     const m = project(GAP_R, moon);
     const ms = (radius * d) / 140;
-    sprites.push(m[0], m[1], 0.96, 0.92, 0.84, Math.max(14, 26 * ms) * m[2]);
+    sprites.push(m[0], m[1], 1.0, 0.95, 0.86, Math.max(12, 16 * ms) * m[2]);
     const pulse = 0.5 + 0.5 * Math.sin(this.time * 4.2);
     this.lights.forEach((l, i) => {
       const target = this.input.dealers && l.state !== "silent" ? 1 : 0;
       l.on = still ? target : l.on + (target - l.on) * ease(5);
       l.flash = still ? 0 : l.flash * (1 - ease(2.5));
       if (l.on < 0.01) return;
-      const k = l.on * (l.state === "waiting" ? 0.45 + 0.4 * pulse : 0.7) + l.flash * 1.3;
-      const a = DEALER_ANGLES[i % DEALER_ANGLES.length]! + OMEGA * DEALER_R ** -1.5 * this.time * 0.25;
+      const k = 1.6 * (l.on * (l.state === "waiting" ? 0.45 + 0.4 * pulse : 0.8) + l.flash * 1.3);
+      const a = this.layoutPx.lights + i * 0.24 + OMEGA * DEALER_R ** -1.5 * this.time * 0.1;
       const p = project(DEALER_R, a);
       const size = Math.max(16, 30 * ms) * p[2] * (1 + l.flash * 0.8);
       sprites.push(p[0], p[1], 1.0 * k, 0.55 * k, 0.32 * k, size);
@@ -394,5 +474,34 @@ export class Ring {
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sprites), gl.DYNAMIC_DRAW);
     gl.drawArrays(gl.POINTS, 0, sprites.length / 6);
     gl.bindVertexArray(null);
+
+    // Glow: blur a quarter-size copy twice, then add it back under a soft tone curve.
+    gl.disable(gl.BLEND);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, t.scene.tex);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.useProgram(this.blur);
+    const step = gl.getUniformLocation(this.blur, "uStep");
+    const lod = gl.getUniformLocation(this.blur, "uLod");
+    const pass = (from: WebGLTexture, to: Target, dx: number, dy: number, l: number) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, to.fb);
+      gl.viewport(0, 0, to.w, to.h);
+      gl.bindTexture(gl.TEXTURE_2D, from);
+      gl.uniform2f(step, dx / to.w, dy / to.h);
+      gl.uniform1f(lod, l);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    };
+    pass(t.scene.tex, t.a, 1, 0, 2);
+    pass(t.a.tex, t.b, 0, 1, 0);
+    pass(t.b.tex, t.a, 2.5, 0, 0);
+    pass(t.a.tex, t.b, 0, 2.5, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(this.compose);
+    gl.bindTexture(gl.TEXTURE_2D, t.scene.tex);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, t.b.tex);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.activeTexture(gl.TEXTURE0);
   }
 }
