@@ -7,13 +7,16 @@
 //! of each, and writes the dealer's keys and config plus `keeler-web.json`
 //! into `dir`. `localnet stop <offset> <dir>` stops the validator and Photon.
 //! All keys are the fixture's public test keys: local network only.
-use std::{path::PathBuf, str::FromStr};
+use std::path::PathBuf;
 
 use anyhow::{bail, ensure, Context, Result};
-use keeler::{chain::shielded, faucet};
+use keeler::{
+    chain::shielded,
+    deploy::{create_mint, MINT_LEN},
+    faucet,
+};
 use serde_json::json;
-use solana_address::Address;
-use solana_instruction::{AccountMeta, Instruction};
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use spr_client::{ComputeBudgetConfig, Rpc};
@@ -27,7 +30,6 @@ use spr_program_test::{
 
 /// Known on purpose: the local Worker and the tests send it.
 const HTTP_KEY: &str = "keeler-localnet-dealer-key";
-const MINT_LEN: usize = 82;
 /// (symbol, decimals, seed, dealer inventory, faucet amount, USD price)
 type Token = (&'static str, u8, [u8; 32], u64, u64, i64);
 const TOKENS: [Token; 2] = [
@@ -79,40 +81,6 @@ fn send(
         )
         .map_err(|e| anyhow::anyhow!("send: {e:?}"))?;
     Ok(())
-}
-
-/// A system `CreateAccount` and an SPL `InitializeMint2` with no freeze
-/// authority, by their fixed layouts.
-fn create_mint(
-    payer: &Address,
-    mint: &Address,
-    authority: &Address,
-    decimals: u8,
-    rent: u64,
-) -> [Instruction; 2] {
-    let mut create = vec![0, 0, 0, 0];
-    create.extend_from_slice(&rent.to_le_bytes());
-    create.extend_from_slice(&(MINT_LEN as u64).to_le_bytes());
-    create.extend_from_slice(pda::spl_token_program_id().as_ref());
-    let mut init = vec![20, decimals];
-    init.extend_from_slice(authority.as_ref());
-    init.push(0);
-    [
-        Instruction {
-            program_id: Address::from_str("11111111111111111111111111111111")
-                .expect("valid address"),
-            accounts: vec![
-                AccountMeta::new(*payer, true),
-                AccountMeta::new(*mint, true),
-            ],
-            data: create,
-        },
-        Instruction {
-            program_id: pda::spl_token_program_id(),
-            accounts: vec![AccountMeta::new(*mint, false)],
-            data: init,
-        },
-    ]
 }
 
 fn start(offset: u16, dir: PathBuf) -> Result<()> {
@@ -244,6 +212,8 @@ fn start(offset: u16, dir: PathBuf) -> Result<()> {
             "daily_cap": 1000,
         },
         "state_file": dir.join("dealer-state.json"),
+        "program_id": swap_program::ID.to_string(),
+        "pubkey": dealer.pubkey().to_string(),
         "pause_file": dir.join("PAUSE"),
     });
     std::fs::write(
