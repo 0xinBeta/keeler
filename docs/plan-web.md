@@ -304,3 +304,67 @@ mainnet.
    check at settlement, an npm SDK release that matches the deployed programs,
    a custom domain, an always-on dealer host with real inventory.
 
+
+## Round 2: product gaps (added 2026-11-23, built in the same pass)
+
+Each item goes to the piece that owns the files.
+
+### G1. Signed quotes (A, B, D)
+
+- The dealer signs every quote with its Solana Ed25519 key over a fixed
+  167-byte message: `"keeler-quote-v1"` ‖ program ID (32) ‖ sell mint (32) ‖ buy
+  mint (32) ‖ trader (32) ‖ sell amount (u64 LE) ‖ buy amount (u64 LE) ‖ expiry
+  (u64 LE).
+- `Quote` gains `signature` (hex, 64 bytes) in `core/src/rfq.rs`, on TCP and
+  HTTP. The Worker passes it through untouched.
+- The CLI trader and the browser verify it against the dealer's public key
+  and drop a quote that fails. The browser keeps the signed quote in the order
+  record as evidence.
+- Dealer public keys are compiled into the site at build time
+  (`VITE_DEALERS`), so the Worker cannot swap them; `/api/config` dealers must
+  match or the page refuses to quote.
+
+### G2. Prices (A, D, B)
+
+- Dealer: before settling, recompute the fair amount from its own price source
+  and refuse to settle an order whose price has moved outside
+  `settle_band_bps` (new config, default = `spread_bps` × 4). The trader then
+  refunds after expiry.
+- Worker: `GET /api/prices` → `{[mint]: {price, expo, publishTime}}`. With a
+  `PYTH_API_KEY` secret and `PYTH_FEEDS` (mint → feed id) it reads Hermes,
+  applies the same age and confidence limits as `core::price::parse_hermes`,
+  and caches for 5 s. Without them it returns the fixed `REFERENCE` values.
+- Browser: uses `/api/prices` for the band check and shows the price's age.
+
+### G3. Orders found again from the chain (B)
+
+- Port the swap SDK's maker index (`sdk/src/index/`): derive the maker's
+  order-authority PDA, find its order UTXOs, decode them with
+  `orderTermsDataUtxo`, and check the nullifier.
+- `orders()` merges `localStorage` with the chain scan; `refund()` works on an
+  order that exists only on chain.
+- Test: lock an order, clear `localStorage`, reload, the order is listed, and
+  after expiry the refund succeeds.
+
+### G4. Limits and pause (A, D, B, C)
+
+- Dealer config `max_sell_amount` per mint: no quote above it.
+- `/api/config` assets carry `maxSell`; the form's maximum is the smaller of
+  `maxSell` and the largest note.
+- Worker var `PAUSED=1`: `/api/config` says `paused: true`, `/api/quotes` and
+  `/api/faucet` return 503. The page shows "Swaps are paused" and disables
+  quoting. Refunds, balances and withdrawals keep working.
+- On `mainnet` the browser refuses any proving key marked
+  `insecureTestSetup`.
+
+### G5. Deployment (A, scripts only)
+
+- `deploy-devnet.sh` becomes `deploy.sh <devnet|mainnet>`; after deploying it
+  can hand the upgrade authority to an address given with
+  `--upgrade-authority` (a multisig vault). Mainnet refuses to run while the
+  keys are the test setup (`zolana vks check`).
+- `run-dealer.sh` restarts the dealer and the tunnel if either exits.
+
+Not in this round: the always-on dealer host (needs a machine or a paid
+plan; owner's choice), the custom domain, the key ceremony, the npm SDK
+release.
