@@ -16,6 +16,128 @@ pub enum KeySource {
     Keychain(String),
 }
 
+impl KeySource {
+    pub fn secret(&self) -> Result<String> {
+        Ok(match self {
+            KeySource::File(path) => std::fs::read_to_string(path)
+                .with_context(|| format!("read key file {}", path.display()))?
+                .trim()
+                .to_owned(),
+            KeySource::Keychain(name) => keychain_secret(name)?,
+        })
+    }
+
+    /// A Solana keypair JSON array.
+    pub fn keypair(&self) -> Result<Keypair> {
+        let bytes: Vec<u8> = serde_json::from_str(&self.secret()?)
+            .map_err(|_| anyhow!("key is not a keypair JSON array"))?;
+        Keypair::try_from(bytes.as_slice()).map_err(|_| anyhow!("key is not a valid keypair"))
+    }
+}
+
+/// Who proves the pool's transact.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Prover {
+    /// The local prover (`ZOLANA_PROVER_URL`), with proof data from our indexer.
+    Local,
+    /// Helius's attested prover, which serves at the indexer URL. `keychain`
+    /// holds the API key, bare or as a Helius URL with an `api-key` parameter.
+    Helius { keychain: String },
+}
+
+#[derive(Clone, Deserialize)]
+pub struct Network {
+    pub rpc_url: String,
+    pub indexer_url: String,
+    pub prover: Prover,
+}
+
+impl Network {
+    pub fn local(rpc_url: String, indexer_url: String) -> Self {
+        Self {
+            rpc_url,
+            indexer_url,
+            prover: Prover::Local,
+        }
+    }
+
+    /// The RPC and indexer URLs to call, with the Helius key added. They may
+    /// hold the key: never print them unredacted.
+    pub fn urls(&self) -> Result<(String, String)> {
+        match &self.prover {
+            Prover::Local => Ok((self.rpc_url.clone(), self.indexer_url.clone())),
+            Prover::Helius { keychain } => {
+                let key = helius_key(&keychain_secret(keychain)?)?;
+                Ok((
+                    with_api_key(&self.rpc_url, &key)?,
+                    with_api_key(&self.indexer_url, &key)?,
+                ))
+            }
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Prover::Helius { .. } = self.prover {
+            for url in [&self.rpc_url, &self.indexer_url] {
+                ensure!(url.starts_with("https://"), "Helius URLs must be https");
+                ensure!(
+                    !url.contains("api-key"),
+                    "put the Helius key in the Keychain, not the URL"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The key from a Keychain value that is either the key or a Helius URL.
+fn helius_key(secret: &str) -> Result<String> {
+    let key = match reqwest::Url::parse(secret) {
+        Ok(url) => url
+            .query_pairs()
+            .find(|(k, _)| k == "api-key")
+            .map(|(_, v)| v.into_owned())
+            .ok_or_else(|| anyhow!("the Helius Keychain URL has no api-key parameter"))?,
+        Err(_) => secret.to_owned(),
+    };
+    ensure!(
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "the Helius API key has an unexpected form"
+    );
+    Ok(key)
+}
+
+fn with_api_key(url: &str, key: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(url).map_err(|_| anyhow!("invalid network URL"))?;
+    url.query_pairs_mut().append_pair("api-key", key);
+    Ok(url.to_string())
+}
+
+/// `text` with every `api-key=` value replaced, for logs and errors that may
+/// quote a URL.
+pub fn redact(text: &str) -> String {
+    const MARK: &str = "api-key=";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(MARK) {
+        let (head, tail) = rest.split_at(i + MARK.len());
+        out.push_str(head);
+        out.push_str("REDACTED");
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '%'))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Prints a log line with any API key redacted.
+pub fn log(msg: std::fmt::Arguments) {
+    eprintln!("{}", redact(&msg.to_string()));
+}
+
 /// The Hermes API key, read from the Keychain item `keychain`.
 #[derive(Clone, Deserialize)]
 pub struct ApiKey {
@@ -46,8 +168,7 @@ pub struct Pyth {
 /// What both roles need to reach the chain and price assets.
 #[derive(Clone, Deserialize)]
 pub struct Common {
-    pub rpc_url: String,
-    pub indexer_url: String,
+    pub network: Network,
     pub key: KeySource,
     pub assets: Vec<Asset>,
     #[serde(default)]
@@ -80,6 +201,38 @@ pub struct DealerConfig {
     pub spread_bps: u16,
     pub quote_ttl_secs: u64,
     pub settle_margin_secs: u64,
+    /// The HTTP API next to the TCP one.
+    #[serde(default)]
+    pub http: Option<Http>,
+    /// Seconds between settle passes; default 1 with the local prover, else 5.
+    #[serde(default)]
+    pub poll_secs: Option<u64>,
+    #[serde(default)]
+    pub faucet: Option<Faucet>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct Http {
+    pub listen: SocketAddr,
+    /// The shared secret every request carries in `x-keeler-key`.
+    pub key: KeySource,
+}
+
+/// Test tokens and fee SOL for a wallet, paid by `key`, which is the mint
+/// authority of every token and is neither the dealer nor the deploy key.
+#[derive(Clone, Deserialize)]
+pub struct Faucet {
+    pub key: KeySource,
+    pub tokens: Vec<FaucetToken>,
+    pub lamports: u64,
+    pub per_wallet_daily: u32,
+    pub daily_cap: u32,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct FaucetToken {
+    pub mint: String,
+    pub amount: u64,
 }
 
 impl TraderConfig {
@@ -127,6 +280,17 @@ impl DealerConfig {
             self.listen.ip().is_loopback(),
             "listen must be a loopback address"
         );
+        if let Some(http) = &self.http {
+            ensure!(
+                http.listen.ip().is_loopback(),
+                "http.listen must be a loopback address"
+            );
+        }
+        if let Some(f) = &self.faucet {
+            for t in &f.tokens {
+                parse_address(&t.mint)?;
+            }
+        }
         self.common.check()
     }
 }
@@ -162,18 +326,11 @@ impl Common {
         if let Some(pyth) = &self.pyth {
             ensure!(pyth.url.starts_with("https://"), "pyth.url must be https");
         }
-        Ok(())
+        self.network.check()
     }
 
     pub fn keypair(&self) -> Result<Keypair> {
-        let json = match &self.key {
-            KeySource::File(path) => std::fs::read_to_string(path)
-                .with_context(|| format!("read key file {}", path.display()))?,
-            KeySource::Keychain(name) => keychain_secret(name)?,
-        };
-        let bytes: Vec<u8> =
-            serde_json::from_str(&json).map_err(|_| anyhow!("key is not a keypair JSON array"))?;
-        Keypair::try_from(bytes.as_slice()).map_err(|_| anyhow!("key is not a valid keypair"))
+        self.key.keypair()
     }
 
     pub fn mints(&self) -> Result<Vec<Address>> {
@@ -382,7 +539,7 @@ mod tests {
 
     fn dealer_json(extra: &str) -> String {
         format!(
-            r#"{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784",
+            r#"{{"network":{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784","prover":"local"}},
             "key":{{"file":"k.json"}},"assets":[{{"mint":"11111111111111111111111111111111","price":{{"price":1,"expo":0}}}}],
             "listen":"127.0.0.1:47001","spread_bps":10,{extra}}}"#
         )
@@ -390,7 +547,7 @@ mod tests {
 
     fn trader_json(band: u16, pyth_url: &str) -> String {
         format!(
-            r#"{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784",
+            r#"{{"network":{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784","prover":"local"}},
             "key":{{"file":"k.json"}},"assets":[{{"mint":"11111111111111111111111111111111","price":{{"pyth":"aa"}}}}],
             "pyth":{{"url":"{pyth_url}","api_key":{{"keychain":"x"}},"max_age_secs":60,"max_conf_bps":100}},
             "dealers":[{{"address":"127.0.0.1:47001","pubkey":"11111111111111111111111111111111"}}],
@@ -435,6 +592,57 @@ mod tests {
         let cfg = dealer_json(r#""quote_ttl_secs":"SECRET-ttl","settle_margin_secs":5"#);
         let err = format!("{:#}", DealerConfig::from_json(&cfg).err().unwrap());
         assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[test]
+    fn dealer_http_and_faucet_sections_parse() {
+        let cfg = dealer_json(
+            r#""quote_ttl_secs":30,"settle_margin_secs":5,
+            "http":{"listen":"127.0.0.1:47100","key":{"keychain":"k"}},
+            "faucet":{"key":{"file":"f.json"},"tokens":[{"mint":"11111111111111111111111111111111","amount":5}],
+              "lamports":20000000,"per_wallet_daily":1,"daily_cap":100}"#,
+        );
+        let cfg = DealerConfig::from_json(&cfg).unwrap();
+        assert_eq!(cfg.faucet.unwrap().tokens[0].amount, 5);
+        let open = dealer_json(
+            r#""quote_ttl_secs":30,"settle_margin_secs":5,
+            "http":{"listen":"0.0.0.0:47100","key":{"keychain":"k"}}"#,
+        );
+        assert!(DealerConfig::from_json(&open).is_err());
+    }
+
+    #[test]
+    fn helius_network_takes_the_key_from_a_url_or_bare() {
+        assert_eq!(
+            helius_key("https://mainnet.helius-rpc.com/?api-key=ab-12").unwrap(),
+            "ab-12"
+        );
+        assert_eq!(helius_key("ab-12").unwrap(), "ab-12");
+        assert!(helius_key("https://mainnet.helius-rpc.com/").is_err());
+        assert!(helius_key("a b").is_err());
+        assert_eq!(
+            with_api_key("https://devnet.helius-rpc.com/v1/spr", "ab-12").unwrap(),
+            "https://devnet.helius-rpc.com/v1/spr?api-key=ab-12"
+        );
+        let net = |url: &str| Network {
+            rpc_url: url.into(),
+            indexer_url: "https://devnet.helius-rpc.com/v1/spr".into(),
+            prover: Prover::Helius {
+                keychain: "k".into(),
+            },
+        };
+        assert!(net("https://devnet.helius-rpc.com").check().is_ok());
+        assert!(net("http://devnet.helius-rpc.com").check().is_err());
+        assert!(net("https://devnet.helius-rpc.com/?api-key=x").check().is_err());
+    }
+
+    #[test]
+    fn redact_hides_every_api_key() {
+        assert_eq!(
+            redact("GET https://h/?api-key=ab-12&x=1 and https://h/v1/spr?api-key=cd%2D3)"),
+            "GET https://h/?api-key=REDACTED&x=1 and https://h/v1/spr?api-key=REDACTED)"
+        );
+        assert_eq!(redact("no key here"), "no key here");
     }
 
     #[test]

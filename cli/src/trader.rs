@@ -66,7 +66,7 @@ pub fn swap(
     let c = &cfg.common;
     c.require(&[sell_mint, buy_mint])?;
     let pricer = c.pricer()?;
-    let chain = Chain::connect(&c.rpc_url, &c.indexer_url, &c.mints()?)?;
+    let chain = Chain::connect(&c.network, &c.mints()?)?;
     let kp = shielded(&c.keypair()?)?;
     let fair = fair_amount(&pricer, &chain, sell_mint, buy_mint, sell_amount)?;
     // `make` spends one source note, so one note must cover the whole amount.
@@ -110,7 +110,7 @@ pub fn swap(
     let order = chain
         .lock(&kp, terms, sell_amount, source, dealer)
         .map_err(may_be_locked)?;
-    eprintln!(
+    log!(
         "locked {sell_amount} for {} from dealer {best}, chain expiry {}",
         quote.buy_amount, quote.expiry
     );
@@ -125,7 +125,7 @@ pub fn swap(
             Ok((Status::Cancelled, _)) => return Ok(Outcome::Refunded),
             Ok((Status::Open, now)) if now > quote.expiry => break,
             Ok(_) => {}
-            Err(e) => eprintln!("trader: waiting on the order: {e:#}; retrying"),
+            Err(e) => log!("trader: waiting on the order: {e:#}; retrying"),
         }
         sleep(POLL);
     }
@@ -151,7 +151,7 @@ pub struct Refund {
 
 /// Cancels every unspent order of this trader whose expiry has passed.
 pub fn refund(c: &Common) -> Result<Refund> {
-    let chain = Chain::connect(&c.rpc_url, &c.indexer_url, &c.mints()?)?;
+    let chain = Chain::connect(&c.network, &c.mints()?)?;
     refund_with(&chain, &shielded(&c.keypair()?)?)
 }
 
@@ -167,7 +167,7 @@ fn refund_with(chain: &Chain, kp: &ShieldedKeypair) -> Result<Refund> {
             Ok(None) => {}
             Err(e) => {
                 let hash = order.hash(0).map(|h| hex(&h)).unwrap_or_default();
-                eprintln!("refund: order {hash}: {e:#}");
+                log!("refund: order {hash}: {e:#}");
                 failed.push(hash);
             }
         }

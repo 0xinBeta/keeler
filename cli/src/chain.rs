@@ -2,26 +2,37 @@
 //! time from the Clock sysvar.
 use std::{str::FromStr, time::Duration};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_address::Address;
 use solana_instruction::Instruction;
 use solana_signer::Signer;
 use spr_client::{
-    fetch_asset_id, user_registry, ComputeBudgetConfig, HistoryFilters, IndexerRpcConfig,
+    fetch_asset_id,
+    prover::tee::{SignedTeePolicy, TeeNetwork},
+    user_registry, ComputeBudgetConfig, HistoryFilters, IndexerRpcConfig, ProofAuthority,
     ProofDataSource, ProverClient, Rpc, SignedPrivateTransaction, SolanaRpc, SprClient, SprIndexer,
     Submission, UtxoScan,
 };
+use spr_interface::instruction::instruction_data::transact::TransactIxData;
 use spr_keypair::{ShieldedAddress, ShieldedKeypair};
+use spr_program::ProgramOwner;
 use spr_transaction::{
-    instructions::transact::ConfidentialTransaction, AssetRegistry, Mint, WalletUtxo, SOL_MINT,
+    instructions::transact::{ConfidentialTransaction, SppProofInputs},
+    AssetRegistry, Mint, WalletUtxo, SOL_MINT,
 };
 use swap_sdk::{
     index::{index_maker, index_taker, MakerOrder, TakerOrder},
     instructions::{
-        cancel::CancelTransactionParams, make::MakeTransactionParams, take::TakeTransactionParams,
+        cancel::{Cancel, CancelTransactionParams},
+        make::{Make, MakeTransactionParams},
+        take::{Take, TakeTransactionParams},
     },
+    proof::{self, CircuitId},
+    shared::TakeAuthority,
     state::{OrderTerms, OrderUtxo},
 };
+
+use crate::config::{Network, Prover};
 
 /// A swap or a split carries a proof and an SPP transact: the whole budget.
 const COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
@@ -46,15 +57,31 @@ pub enum Status {
 impl Chain {
     /// Connects, checks the default tree is tree id 0, and registers the
     /// pool's asset id of every mint in `mints`.
-    pub fn connect(rpc_url: &str, indexer_url: &str, mints: &[Address]) -> Result<Self> {
-        // The prover is the local one (`ZOLANA_PROVER_URL`); proof data comes
-        // from our own indexer.
-        let client = SprClient::new(
-            SolanaRpc::new(rpc_url),
-            SprIndexer::new(indexer_url),
-            ProverClient::default(),
-        )
-        .with_proof_data_source(ProofDataSource::Client);
+    pub fn connect(network: &Network, mints: &[Address]) -> Result<Self> {
+        let (rpc_url, indexer_url) = network.urls()?;
+        let client = match &network.prover {
+            // The local prover (`ZOLANA_PROVER_URL`); proof data comes from
+            // our own indexer.
+            Prover::Local => SprClient::new(
+                SolanaRpc::new(rpc_url),
+                SprIndexer::new(&indexer_url),
+                ProverClient::default(),
+            )
+            .with_proof_data_source(ProofDataSource::Client),
+            // Helius serves the prover at the indexer URL, attested under the
+            // network's signed TEE policy, and fetches proof data itself.
+            Prover::Helius { .. } => {
+                let tee = match reqwest::Url::parse(&network.rpc_url)?.host_str() {
+                    Some("devnet.helius-rpc.com") => TeeNetwork::Devnet,
+                    Some("mainnet.helius-rpc.com") => TeeNetwork::Mainnet,
+                    _ => bail!("the Helius prover needs a devnet or mainnet Helius rpc_url"),
+                };
+                let prover = ProverClient::new(indexer_url.clone())
+                    .with_signed_tee(SignedTeePolicy::for_network(tee));
+                SprClient::new(SolanaRpc::new(rpc_url), SprIndexer::new(&indexer_url), prover)
+                    .with_proof_data_source(ProofDataSource::Prover)
+            }
+        };
         let tree = spr_interface::pda::tree(TREE_ID);
         let account = client
             .rpc()
@@ -201,9 +228,14 @@ impl Chain {
         }
         .build(kp)?;
         let order = make.order_utxo.clone();
-        let ix = make
-            .prove(self.client.indexer(), self.tree, kp)?
-            .instruction()?;
+        let ix = Make {
+            payer,
+            viewing_pubkey: make.viewing_pubkey,
+            tree: self.tree,
+            spp_proof: self.prove_spp(make.spp_proof_inputs, kp)?,
+            make_proof: proof::prove(CircuitId::Make, &make.proof_inputs)?,
+        }
+        .instruction()?;
         self.send(kp, ix)?;
         Ok(order)
     }
@@ -217,23 +249,61 @@ impl Chain {
             tree_id: TREE_ID,
         }
         .build(kp)?;
-        let ix = take
-            .prove(self.client.indexer(), self.tree, kp)?
-            .instruction()?;
+        let ix = Take {
+            payer: kp.pubkey(),
+            maker: take.maker,
+            tree: self.tree,
+            spp_proof: self.prove_spp(take.spp_proof_inputs, &TakeAuthority(kp))?,
+            take_proof: proof::prove(CircuitId::Take, &take.proof_inputs)?,
+        }
+        .instruction()?;
         self.send(kp, ix)
     }
 
     pub fn cancel(&self, kp: &ShieldedKeypair, order: &OrderUtxo) -> Result<()> {
-        let ix = CancelTransactionParams {
+        let cancel = CancelTransactionParams {
             order_utxo: order.clone(),
             order_leaf_index: self.leaf_index(order)?,
             payer: kp.pubkey(),
             tree_id: TREE_ID,
         }
-        .build(kp)?
-        .prove(self.client.indexer(), self.tree)?
+        .build(kp)?;
+        // `build` checked the terms name this maker.
+        let ix = Cancel {
+            maker: kp.pubkey(),
+            payer: kp.pubkey(),
+            tree: self.tree,
+            order_expiry: order.terms.expiry,
+            spp_proof: self.prove_spp(
+                cancel.spp_proof_inputs,
+                &ProgramOwner::nullifier_key(),
+            )?,
+            cancel_proof: proof::prove(CircuitId::Cancel, &cancel.proof_inputs)?,
+        }
         .instruction()?;
         self.send(kp, ix)
+    }
+
+    /// Proves the SPP transact through this client's prover (the swap SDK's
+    /// own `prove` always uses the local one), and checks the proof covers
+    /// the transaction the swap proof covers.
+    fn prove_spp(
+        &self,
+        inputs: SppProofInputs,
+        authority: &dyn ProofAuthority,
+    ) -> Result<TransactIxData> {
+        let hash = inputs
+            .padding_independent_private_tx_hash()
+            .map_err(|e| anyhow!("private tx hash: {e:?}"))?;
+        let spp = self
+            .client
+            .prove_transact(inputs, None, authority)
+            .map_err(|e| anyhow!("prove transact: {e:?}"))?;
+        ensure!(
+            spp.private_tx_hash == hash,
+            "the SPP proof and the swap proof cover different transactions"
+        );
+        Ok(spp)
     }
 
     /// Sends one instruction as a v1 message and waits until it is indexed.

@@ -15,7 +15,7 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            keeler::config::log(format_args!("error: {e:#}"));
             ExitCode::FAILURE
         }
     }
