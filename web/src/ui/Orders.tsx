@@ -92,8 +92,8 @@ export function Orders({ keeler, orders, chainOffset, refresh, refreshBalances, 
                 </span>
                 {o.status === "locked" && (
                   <span className="order-note muted">
-                    The dealer may decline if the price moves before it settles. Your funds stay locked until the quote
-                    expires, then you can take them back.
+                    If the price moves, a dealer can pass. Nothing is lost: you take your funds back when the quote
+                    expires.
                   </span>
                 )}
                 {o.status === "refundable" && (

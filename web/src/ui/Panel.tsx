@@ -16,6 +16,7 @@ type Props = {
   onReady: () => void;
   refreshBalances: () => Promise<unknown>;
   refreshOrders: () => Promise<unknown>;
+  reloadConfig: () => void;
   setLights: Dispatch<SetStateAction<DealerLight[] | null>>;
   setProving: (p: boolean) => void;
 };
@@ -24,7 +25,7 @@ type Phase = "wallet" | "unlock" | "register" | "ready";
 type View =
   | { kind: "form" }
   | { kind: "quotes"; fair: bigint; priceTime: number; quotes: Quote[]; selected: string | null }
-  | { kind: "progress"; quote: Quote; step: SwapStep | null; orderId: string | null; failed: string | null };
+  | { kind: "progress"; quote: Quote; step: SwapStep | null; order: Order | null; failed: string | null };
 
 /** Runs one action at a time, keeping its label for the busy button and its error for the panel. */
 function useAction() {
@@ -100,7 +101,7 @@ export function Panel(p: Props) {
         <h2 className="panel-title" ref={heading} tabIndex={-1}>
           Choose a wallet
         </h2>
-        <p className="muted">Your wallet signs; your private keys are made in this browser and never leave it.</p>
+        <p className="muted">Your wallet signs; your private keys are created in this browser and Keeler's servers never see them.</p>
         {wallets.length === 0 ? (
           <p className="note">No Solana wallet was found in this browser. Install one, such as Phantom, then reload the page.</p>
         ) : (
@@ -112,6 +113,10 @@ export function Panel(p: Props) {
                   <span>{w.name}</span>
                   <span className="muted">{act.busy === w.name ? "Connecting…" : "Connect"}</span>
                 </button>
+                {/* shortcut: recognised by name; importing the client's constant would pull the client into the first bundle. */}
+                {/browser test wallet|in-page/i.test(w.name) && (
+                  <p className="muted small wallet-note">A test key kept in this browser. Good for trying Keeler; clearing site data removes it.</p>
+                )}
               </li>
             ))}
           </ul>
@@ -249,6 +254,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
         setView({ kind: "quotes", fair: res.fair, priceTime: res.priceTime, quotes: res.quotes, selected: usable?.dealer ?? null });
       } catch (e) {
         p.setLights(null);
+        if (e instanceof KeelerError && e.code === "paused") p.reloadConfig();
         throw e;
       }
     });
@@ -262,16 +268,20 @@ function SwapTab(p: Props & { toBalances: () => void }) {
 
   const swap = async (quote: Quote) => {
     p.setLights(null);
-    setView({ kind: "progress", quote, step: null, orderId: null, failed: null });
+    setView({ kind: "progress", quote, step: null, order: null, failed: null });
     try {
       const order = await keeler.swap(quote, (step) => {
         p.setProving(step === "proving");
         setView((v) => (v.kind === "progress" ? { ...v, step } : v));
       });
-      setView((v) => (v.kind === "progress" ? { ...v, orderId: order.id } : v));
+      // swap() re-quotes at click, so from here on the order, not the clicked quote, is the truth.
+      setView((v) => (v.kind === "progress" ? { ...v, order } : v));
       await Promise.all([p.refreshOrders(), p.refreshBalances()]);
     } catch (e) {
       setView((v) => (v.kind === "progress" ? { ...v, failed: errorText(e) } : v));
+      if (e instanceof KeelerError && e.code === "paused") p.reloadConfig();
+      // A transaction can land after an error: show whatever order it left, with its refund button.
+      await Promise.all([p.refreshOrders(), p.refreshBalances()]).catch(() => {});
     } finally {
       p.setProving(false);
     }
@@ -290,7 +300,12 @@ function SwapTab(p: Props & { toBalances: () => void }) {
         <p className="muted">
           For <Amount value={view.quotes[0]?.sellAmount ?? 0n} asset={sellAsset} />, the reference price gives{" "}
           <Amount value={view.fair} asset={buyAsset} />.
-          {age !== null && <span className="num"> Reference price from {age < 60 ? `${age} s` : `${Math.floor(age / 60)} min ${age % 60} s`} ago.</span>}
+          {/* Fixed reference values carry a fresh time; an age under 2 s says nothing useful. */}
+          <span className="num">
+            {age !== null && age >= 2
+              ? ` Reference price from ${age < 60 ? `${age} s` : `${Math.floor(age / 60)} min ${age % 60} s`} ago.`
+              : " Reference price."}
+          </span>
         </p>
         <fieldset className="quotes">
           <legend className="sr-only">Choose a quote</legend>
@@ -337,10 +352,10 @@ function SwapTab(p: Props & { toBalances: () => void }) {
           })}
         </fieldset>
         {!chosen && <p className="note">No quote can be used right now. Get new quotes to try again.</p>}
-        <p className="muted small">{"The dealer may decline if the price moves before it settles. Your funds stay locked until the quote expires, then you can take them back."}</p>
         <button className="btn btn-primary" disabled={!chosen || paused} onClick={() => chosen && swap(chosen)}>
           Swap privately
         </button>
+        <p className="muted small">If the dealer doesn't settle before the quote expires, you take your funds back in one click.</p>
         <div className="row">
           <button className="btn btn-ghost" onClick={getQuotes} disabled={!!act.busy || paused}>
             {act.busy ? "Getting quotes…" : "Get new quotes"}
@@ -459,8 +474,9 @@ function Progress(
   p: Props & { view: Extract<View, { kind: "progress" }>; now: number | null; onDone: () => void; onRetry: () => void },
 ) {
   const { view, now } = p;
-  const q = view.quote;
-  const order = p.orders.find((o) => o.id === view.orderId);
+  // Amounts and expiry come from the order swap() returned (it re-quotes at click), refreshed from the list.
+  const order = view.order ? (p.orders.find((o) => o.id === view.order!.id) ?? view.order) : null;
+  const q = order ?? view.quote;
   const act = useAction();
   const status = order?.status;
   const at = status === "settled" ? 4 : order ? 3 : STEPS.findIndex((s) => s.key === view.step);
@@ -479,7 +495,15 @@ function Progress(
   return (
     <div className="stack">
       <p className="muted">
-        <Amount value={q.sellAmount} asset={q.sell} /> for <Amount value={q.buyAmount} asset={q.buy} />
+        {order ? (
+          <>
+            <Amount value={q.sellAmount} asset={q.sell} /> for <Amount value={q.buyAmount} asset={q.buy} />
+          </>
+        ) : (
+          <>
+            Selling <Amount value={q.sellAmount} asset={q.sell} /> for {q.buy.symbol}
+          </>
+        )}
       </p>
       <ol className="steps" aria-label="Swap progress">
         {STEPS.map((s, i) => {
@@ -496,9 +520,6 @@ function Progress(
                   <span className="muted step-sub num">
                     {left > 0 ? `Dealer has ${countdown(left)} to settle` : "Quote expired, checking…"}
                   </span>
-                )}
-                {s.key === "locked" && state === "now" && status === "locked" && (
-                  <span className="muted step-sub">{"The dealer may decline if the price moves before it settles. Your funds stay locked until the quote expires, then you can take them back."}</span>
                 )}
               </span>
             </li>

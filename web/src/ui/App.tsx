@@ -1,13 +1,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Balance, Config, Keeler, Order } from "../keeler/index";
-import { Info } from "./Info";
+import { Audience, ChainSees, Closing, Dealers, Facts, Faq, Features, Steps } from "./Landing";
 import { Orders } from "./Orders";
 import { Panel } from "./Panel";
 import type { DealerLight } from "./ring";
 import { RingCanvas } from "./RingCanvas";
 import { errorText } from "./shared";
 
-const NETWORK = { local: "local network", devnet: "devnet", mainnet: "mainnet" } as const;
+const PILL = { local: "Local", devnet: "Devnet beta", mainnet: "Mainnet" } as const;
+const OPEN: Order["status"][] = ["pending", "locked"];
+
+export function NetworkPill({ config }: { config: Config | null }) {
+  if (!config) return null;
+  return (
+    <span className="net-pill">
+      <span className="net-dot" aria-hidden="true" />
+      {PILL[config.network]}
+    </span>
+  );
+}
+
+export function Logo() {
+  return (
+    <svg viewBox="0 0 40 24" width="34" height="20" aria-hidden="true" className="logo">
+      <ellipse cx="20" cy="12" rx="17" ry="7" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <ellipse cx="20" cy="12" rx="12" ry="4.6" fill="none" stroke="currentColor" strokeWidth="1.6" opacity=".55" />
+      <circle cx="31.5" cy="8.6" r="1.9" fill="#F4EBD6" />
+    </svg>
+  );
+}
 
 export function App({ keeler }: { keeler: Keeler }) {
   const [config, setConfig] = useState<Config | null>(null);
@@ -22,23 +43,42 @@ export function App({ keeler }: { keeler: Keeler }) {
   const panel = useRef<HTMLElement>(null);
   const hero = useRef<HTMLElement>(null);
   const seen = useRef(new Map<string, Order["status"]>());
+  const inflight = useRef<Promise<Order[]> | null>(null);
+
+  const reloadConfig = useCallback(() => {
+    keeler.config().then(
+      (c) => {
+        setConfig(c);
+        setConfigError(null);
+      },
+      (e) => setConfigError((prev) => prev ?? errorText(e)),
+    );
+  }, [keeler]);
 
   useEffect(() => {
-    keeler.config().then(setConfig, (e) => setConfigError(errorText(e)));
+    reloadConfig();
+    // A pause or unpause shows without a reload.
+    const cfg = setInterval(reloadConfig, 60_000);
     const read = () =>
       keeler.chainNow().then(
         (t) => setChainOffset(t - Date.now() / 1000),
         () => {},
       );
     read();
-    const id = setInterval(read, 20_000);
-    return () => clearInterval(id);
-  }, [keeler]);
+    const clock = setInterval(read, 20_000);
+    return () => {
+      clearInterval(cfg);
+      clearInterval(clock);
+    };
+  }, [keeler, reloadConfig]);
 
   const refreshBalances = useCallback(() => keeler.balances().then(setBalances), [keeler]);
-  const refreshOrders = useCallback(
-    () =>
-      keeler.orders().then((list) => {
+  // Single flight: a call while one is running shares its result instead of starting another.
+  const refreshOrders = useCallback(() => {
+    if (inflight.current) return inflight.current;
+    const run = keeler
+      .orders()
+      .then((list) => {
         // The ring's settle front runs once for each order that settles while the page is open.
         for (const o of list) {
           const before = seen.current.get(o.id);
@@ -47,9 +87,13 @@ export function App({ keeler }: { keeler: Keeler }) {
         }
         setOrders(list);
         return list;
-      }),
-    [keeler],
-  );
+      })
+      .finally(() => {
+        inflight.current = null;
+      });
+    inflight.current = run;
+    return run;
+  }, [keeler]);
 
   useEffect(() => {
     if (!ready) return;
@@ -57,65 +101,80 @@ export function App({ keeler }: { keeler: Keeler }) {
     refreshOrders().catch(() => {});
   }, [ready, refreshBalances, refreshOrders]);
 
-  // Poll while an order waits on the dealer or the clock.
-  const waiting = orders.some((o) => o.status === "pending" || o.status === "locked");
+  // Poll every 5 s while an order is open, never overlapping, backing off on errors; stop when none is open.
+  const open = orders.some((o) => OPEN.includes(o.status));
   useEffect(() => {
-    if (!waiting) return;
-    const id = setInterval(() => {
-      refreshOrders()
-        .then((list) => {
-          if (list.some((o) => o.status === "settled" || o.status === "refundable")) refreshBalances();
-        })
-        .catch(() => {});
-    }, 2000);
-    return () => clearInterval(id);
-  }, [waiting, refreshOrders, refreshBalances]);
+    if (!open) return;
+    let stopped = false;
+    let delay = 5000;
+    let timer = 0;
+    const tick = async () => {
+      try {
+        const before = new Map(seen.current);
+        const list = await refreshOrders();
+        if (list.some((o) => before.get(o.id) !== o.status)) refreshBalances().catch(() => {});
+        delay = 5000;
+      } catch {
+        delay = Math.min(delay * 2, 60_000);
+      }
+      if (!stopped) timer = window.setTimeout(tick, delay);
+    };
+    timer = window.setTimeout(tick, delay);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [open, refreshOrders, refreshBalances]);
 
   const ringInput = useMemo(() => ({ dealers: lights, proving, settled }), [lights, proving, settled]);
+  const startSwap = useCallback(() => {
+    panel.current?.focus();
+    panel.current?.scrollIntoView({ block: "center" });
+  }, []);
 
   return (
     <>
-      <p className="banner" role="note">
-        <span className="banner-dot" aria-hidden="true" />
-        Test version{config ? ` on ${NETWORK[config.network]}` : ""}: test tokens only, unaudited. Do not use real funds.
-      </p>
+      <a className="skip" href="#swap">
+        Skip to the swap
+      </a>
       <div className="stage">
-      <RingCanvas input={ringInput} anchor={panel} hero={hero} />
-      <header className="top">
-        <a className="wordmark" href="#top" aria-label="Keeler, top of page">
-          <svg viewBox="0 0 40 24" width="34" height="20" aria-hidden="true">
-            <ellipse cx="20" cy="12" rx="17" ry="7" fill="none" stroke="currentColor" strokeWidth="1.6" />
-            <ellipse cx="20" cy="12" rx="12" ry="4.6" fill="none" stroke="currentColor" strokeWidth="1.6" opacity=".55" />
-            <circle cx="31.5" cy="8.6" r="1.9" fill="#F4EBD6" />
-          </svg>
-          Keeler
-        </a>
-        <nav aria-label="On this page">
-          <a href="#how">How it works</a>
-          <a href="#privacy">Privacy</a>
-          <a href="#limits">Limits</a>
-        </nav>
-      </header>
-      <main id="top">
-        <section className="hero" ref={hero} aria-labelledby="hero-title">
+        <RingCanvas mode="hero" input={ringInput} anchor={panel} hero={hero} />
+        <header className="top">
+          <a className="wordmark" href="#top" aria-label="Keeler, top of page">
+            <Logo />
+            Keeler
+          </a>
+          <nav aria-label="On this page">
+            <a href="#how">How it works</a>
+            <a href="#privacy">Privacy</a>
+            <a href="#dealers">Dealers</a>
+            <a href="#faq">FAQ</a>
+          </nav>
+          <NetworkPill config={config} />
+        </header>
+        <main id="top">
+          <section className="hero" ref={hero} aria-labelledby="hero-title">
             <div className="intro">
-              <h1 id="hero-title">A private lane for your trades.</h1>
+              <h1 id="hero-title">Swap without showing your hand.</h1>
               <p className="lede">
-                Keeler asks several dealers for a price, drops any quote too far from the reference, and locks a
-                private order for the best one. Assets and amounts stay private. If the dealer does not settle, you take
-                your funds back.
+                Keeler gets you signed quotes from dealers, checks them against a reference price, and settles the best
+                one privately on Solana. The chain sees that you traded. It never sees how much, or at what price.
               </p>
               <div className="pills">
-                <a className="pill pill-soft" href="#how">
-                  How a swap works
-                </a>
-                <a className="pill pill-outline" href="#privacy">
-                  What stays private
+                <button className="pill pill-gold" onClick={startSwap}>
+                  Start a swap
+                </button>
+                <a className="pill pill-outline" href="#how">
+                  See how it works
                 </a>
               </div>
-              <p className="built">Built on Helius Privacy Rings, on Solana.</p>
+              <ul className="chips" aria-label="Foundations">
+                <li>Built on Helius Privacy Rings</li>
+                <li>Settles on Solana</li>
+                <li>Order proved in your browser</li>
+              </ul>
             </div>
-            <section className="panel" ref={panel} aria-label="Private swap">
+            <section className="panel" id="swap" ref={panel} tabIndex={-1} aria-label="Private swap">
               {config ? (
                 <Panel
                   keeler={keeler}
@@ -126,6 +185,7 @@ export function App({ keeler }: { keeler: Keeler }) {
                   onReady={() => setReady(true)}
                   refreshBalances={refreshBalances}
                   refreshOrders={refreshOrders}
+                  reloadConfig={reloadConfig}
                   setLights={setLights}
                   setProving={setProving}
                 />
@@ -145,32 +205,40 @@ export function App({ keeler }: { keeler: Keeler }) {
                 </div>
               )}
             </section>
-        </section>
-        {ready && (
-          <Orders
-            keeler={keeler}
-            orders={orders}
-            chainOffset={chainOffset}
-            refresh={refreshOrders}
-            refreshBalances={refreshBalances}
-            rescan={() =>
-              keeler.rescanOrders().then((list) => {
-                for (const o of list) seen.current.set(o.id, o.status);
-                setOrders(list);
-                return list;
-              })
-            }
-          />
-        )}
-        <Info />
-      </main>
+          </section>
+          <Facts />
+          {ready && (
+            <Orders
+              keeler={keeler}
+              orders={orders}
+              chainOffset={chainOffset}
+              refresh={refreshOrders}
+              refreshBalances={refreshBalances}
+              rescan={() =>
+                keeler.rescanOrders().then((list) => {
+                  for (const o of list) seen.current.set(o.id, o.status);
+                  setOrders(list);
+                  return list;
+                })
+              }
+            />
+          )}
+          <Features />
+          <ChainSees />
+          <Steps />
+          <Audience />
+          <Dealers />
+          <Faq />
+          <Closing onStart={startSwap} />
+        </main>
       </div>
       <footer className="foot">
-        <p>
-          Named after the Keeler Gap, a thin dark lane in Saturn's A ring. The small moon Daphnis keeps it open and
-          raises waves on its edges as it passes.
-        </p>
-        <p className="muted">Unaudited test software, running with test tokens.</p>
+        <div className="foot-brand">
+          <Logo />
+          <span>Keeler</span>
+        </div>
+        <p className="muted">Built on Helius Privacy Rings</p>
+        <NetworkPill config={config} />
       </footer>
     </>
   );
