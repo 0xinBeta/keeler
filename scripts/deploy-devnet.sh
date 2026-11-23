@@ -47,6 +47,9 @@ fi
 rpc="https://devnet.helius-rpc.com/?api-key=$helius"
 spr="https://devnet.helius-rpc.com/v1/spr?api-key=$helius"
 unset helius
+# Devnet only: refuse any cluster whose genesis is not devnet's.
+devnet_genesis=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG
+[[ $(solana -u "$rpc" genesis-hash) == "$devnet_genesis" ]] || { echo "the RPC is not devnet; refusing" >&2; exit 1; }
 
 for item in deploy program dealer faucet tusd-mint tsol-mint; do
     ensure_keypair "keeler-devnet-$item"
@@ -136,7 +139,13 @@ cat >"$out/dealer-config.json" <<EOF
     "lamports": 20000000,
     "per_wallet_daily": 1,
     "daily_cap": 200
-  }
+  },
+  "pause_file": "$out/PAUSE",
+  "settle_tolerance_bps": 0,
+  "limits": [
+    {"mint": "$mint_tusd", "max_sell_amount": 10000000000, "hourly_sell_cap": 100000000000},
+    {"mint": "$mint_tsol", "max_sell_amount": 100000000000, "hourly_sell_cap": 1000000000000}
+  ]
 }
 EOF
 echo "programId $program_id; tUSD $mint_tusd; tSOL $mint_tsol; dealer $dealer" >&2

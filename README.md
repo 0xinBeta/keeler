@@ -79,8 +79,11 @@ on the wall clock.
 - `keeler dealer <config>`: registers, serves quotes on `listen`
   (loopback only) at the reference price less `spread_bps`, and settles only
   orders that exactly match a quote it gave, while `now + settle_margin_secs`
-  is before the expiry. It splits off a note of exactly the quoted amount
-  first when it has none.
+  is before the expiry and, at the last look, the quoted amount is at most
+  the fair amount at the current price plus `settle_tolerance_bps`. It signs
+  every quote, keeps its quotes in a state file across restarts, and splits
+  off a note of exactly the quoted amount first when it has none. The trader
+  drops a quote not signed by the dealer's configured `pubkey`.
 - `keeler refund <config>` (trader config): cancels every unspent order of
   this trader whose expiry has passed. Running it again is a no-op.
   It only sees orders in the assets the config lists: an order in any other
@@ -99,20 +102,28 @@ binary finds the proving keys (`SWAP_KEYS_DIR`).
   on `47500+offset` with `x-keeler-key: keeler-localnet-dealer-key`, faucet
   on. Prints and writes `target/localnet/keeler-web.json` (and
   `keeler-web-<offset>.json`). Fixture test keys only.
-- `scripts/deploy-devnet.sh`, `scripts/run-dealer.sh`: devnet deployment and
-  the dealer behind a quick tunnel. Not run until the owner approves
-  publishing the example's code.
+- `scripts/deploy-devnet.sh` (refuses any cluster but devnet),
+  `scripts/run-dealer.sh` (restarts the dealer and the tunnel with backoff,
+  rewrites the Worker's `DEALERS` when the tunnel URL changes) and
+  `scripts/set-upgrade-authority.sh <program> <new-authority>`: devnet
+  deployment, the dealer behind a quick tunnel, and the authority handoff.
+  Not run until the owner approves publishing the example's code.
 - Dealer HTTP (loopback only, every request carries `x-keeler-key`, 4 KiB
   body cap), amounts as decimal strings:
   `POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` ->
-  `{"quote":{"buy_amount","expiry"}}` or `{"error":"no quote"}`;
+  `{"quote":{"buy_amount","expiry","signature"}}` or `{"error":"no quote"}`;
   `POST /faucet` `{"wallet"}` -> `{"ok":true}` or `{"error"}` (404 off,
   429 over a limit, 502 transfer failed); `GET /health` ->
   `{"ok":true,"now":<chain time>}`. 401 bad key, 403 not loopback, 413 body
   too large, 400 bad request.
+- Quote signature: Ed25519 by the dealer's key over 167 bytes,
+  `"keeler-quote-v1"`, then program ID, sell mint, buy mint, trader (32
+  bytes each), then sell amount, buy amount, expiry (u64 little-endian);
+  128 hex characters on the wire.
 - `web/tests/fixtures/{make,cancel}-ix.json`: golden instruction bytes for
-  the web client; `KEELER_WRITE_FIXTURES=1 cargo test -p keeler --test
-  fixtures` regenerates them (needed after a program ID change).
+  the web client, and `quote-sig.json`, a signed quote test vector;
+  `KEELER_WRITE_FIXTURES=1 cargo test -p keeler --test fixtures`
+  regenerates them (needed after a program ID change).
 
 ## Configuration
 
@@ -127,7 +138,14 @@ The dealer also takes, all optional: `"http": {"listen", "key": <key
 source>}` for the HTTP API; `"poll_secs"` (default 1 with the local prover,
 else 5); and `"faucet": {"key", "tokens": [{"mint", "amount"}], "lamports",
 "per_wallet_daily", "daily_cap"}`, where `key` is the tokens' mint authority
-and pays the fee SOL, and the limits count claims per UTC day.
+and pays the fee SOL, and the limits count claims per UTC day. Also:
+`"state_file"` (default `~/.local/state/keeler/dealer-<pubkey>.json`, mode
+0600; unexpired quotes reload on start); `"pause_file"` (while it exists, no
+new quotes; bound orders still settle); `"settle_tolerance_bps"` (default 0;
+a failed price fetch settles nothing that poll); and `"limits": [{"mint",
+"max_sell_amount", "hourly_sell_cap"}]` on what traders sell the dealer per
+order and per rolling hour of bound orders (the hourly count restarts with
+the dealer).
 
 `key` is `{"file": "<keypair.json>"}` for local test keys or
 `{"keychain": "<name>"}`, read with `security find-generic-password -s <name>

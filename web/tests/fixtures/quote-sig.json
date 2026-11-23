@@ -1,0 +1,23 @@
+{
+  "about": "Ed25519 over message_hex by pubkey. message = \"keeler-quote-v1\" || program_id || sell_mint || buy_mint || trader || sell_amount u64 LE || buy_amount u64 LE || expiry u64 LE (167 bytes). http_reply is the dealer's POST /quote reply for this request.",
+  "inputs": {
+    "program_id": "F4hjig5RJbXW6vrgYaMcuWzR55kZF6tbKyf8c36nrtvU",
+    "sell_mint": "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
+    "buy_mint": "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+    "trader": "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq",
+    "sell_amount": "400000000",
+    "buy_amount": "2997000",
+    "expiry": 1763900030,
+    "dealer_keypair_seed": "0101010101010101010101010101010101010101010101010101010101010101"
+  },
+  "message_hex": "6b65656c65722d71756f74652d7631d0f66b9af233585938c233fe9ac2da8faac4f6c5918c24233706b08312fb12e10202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030304040404040404040404040404040404040404040404040404040404040404040084d7170000000008bb2d00000000007efa226900000000",
+  "pubkey": "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9",
+  "signature_hex": "720c66ca5ded96bcec1e90f25e935cafd90e876aa25d7700859424037f218777e9523acf1766cee4d791eaba840c673d3c5e2a3cd4e84649919d0f76bb8c2a05",
+  "http_reply": {
+    "quote": {
+      "buy_amount": "2997000",
+      "expiry": 1763900030,
+      "signature": "720c66ca5ded96bcec1e90f25e935cafd90e876aa25d7700859424037f218777e9523acf1766cee4d791eaba840c673d3c5e2a3cd4e84649919d0f76bb8c2a05"
+    }
+  }
+}

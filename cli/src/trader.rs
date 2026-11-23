@@ -4,12 +4,13 @@ use std::{net::SocketAddr, thread::sleep, time::Duration};
 
 use anyhow::{anyhow, bail, Result};
 use keeler_core::{
-    price::fair_buy_amount,
-    rfq::{best_quote, request_quotes, Rfq},
+    price::{fair_buy_amount, Price},
+    rfq::{best_quote, quote_message, request_quotes, Quote, Rfq, QUOTE_MESSAGE_LEN},
 };
 use solana_address::Address;
+use solana_keypair::Keypair;
 use solana_signer::Signer;
-use spr_keypair::ShieldedKeypair;
+use spr_keypair::{PublicKey, ShieldedKeypair};
 use swap_sdk::{
     shared::identity,
     state::{OrderTerms, OrderUtxo},
@@ -42,14 +43,60 @@ pub fn fair_amount(
     amount: u64,
 ) -> Result<u64> {
     let p = pricer.prices(&[sell, buy])?;
+    fair_at(p[0], p[1], chain, sell, buy, amount)
+}
+
+/// The fair amount at the given prices of `sell` and `buy`.
+pub fn fair_at(
+    sell_price: Price,
+    buy_price: Price,
+    chain: &Chain,
+    sell: Address,
+    buy: Address,
+    amount: u64,
+) -> Result<u64> {
     fair_buy_amount(
         amount,
-        p[0],
-        p[1],
+        sell_price,
+        buy_price,
         chain.mint_decimals(sell)?,
         chain.mint_decimals(buy)?,
     )
     .ok_or_else(|| anyhow!("no fair amount for {amount} of {sell} in {buy}"))
+}
+
+/// The message a dealer signs for a quote of `buy_amount` until `expiry`
+/// answering `rfq`, under this build's swap program ID.
+pub fn quote_message_for(
+    rfq: &Rfq,
+    buy_amount: u64,
+    expiry: u64,
+) -> Result<[u8; QUOTE_MESSAGE_LEN]> {
+    let key = |s: &str| Ok::<_, anyhow::Error>(*parse_address(s)?.as_array());
+    Ok(quote_message(
+        swap_program::ID.as_array(),
+        &key(&rfq.sell_mint)?,
+        &key(&rfq.buy_mint)?,
+        &key(&rfq.trader)?,
+        rfq.sell_amount,
+        buy_amount,
+        expiry,
+    ))
+}
+
+pub fn sign_quote(dealer: &Keypair, rfq: &Rfq, buy_amount: u64, expiry: u64) -> Result<Quote> {
+    let sig = dealer.sign_message(&quote_message_for(rfq, buy_amount, expiry)?);
+    Ok(Quote {
+        buy_amount,
+        expiry,
+        signature: sig.as_ref().try_into()?,
+    })
+}
+
+/// Whether `dealer` signed `q` as an answer to `rfq`.
+pub fn signed_by(dealer: &Address, rfq: &Rfq, q: &Quote) -> bool {
+    quote_message_for(rfq, q.buy_amount, q.expiry)
+        .is_ok_and(|m| PublicKey::from_ed25519(dealer.as_array()).verify_message(&m, &q.signature))
 }
 
 /// Context for every error once a make may have been sent.
@@ -85,7 +132,25 @@ pub fn swap(
         trader: kp.pubkey().to_string(),
     };
     let addrs: Vec<SocketAddr> = cfg.dealers.iter().map(|d| d.address).collect();
-    let quotes = request_quotes(&addrs, &rfq, RFQ_TIMEOUT);
+    let dealer_pks = cfg
+        .dealers
+        .iter()
+        .map(|d| parse_address(&d.pubkey))
+        .collect::<Result<Vec<_>>>()?;
+    let quotes: Vec<_> = request_quotes(&addrs, &rfq, RFQ_TIMEOUT)
+        .into_iter()
+        .zip(&dealer_pks)
+        .enumerate()
+        .map(|(i, (q, pk))| {
+            q.filter(|q| {
+                let ok = signed_by(pk, &rfq, q);
+                if !ok {
+                    log!("trader: dropped dealer {i}'s quote: bad signature");
+                }
+                ok
+            })
+        })
+        .collect();
     let now = chain.now()?;
     let best = best_quote(
         &quotes,
@@ -97,7 +162,7 @@ pub fn swap(
     )
     .ok_or_else(|| anyhow!("no acceptable quote (fair {fair}, {} asked)", addrs.len()))?;
     let quote = quotes[best].ok_or_else(|| anyhow!("best quote missing"))?;
-    let dealer_pk = parse_address(&cfg.dealers[best].pubkey)?;
+    let dealer_pk = dealer_pks[best];
     let dealer = chain.resolve(dealer_pk)?;
 
     let terms = OrderTerms {
@@ -212,4 +277,42 @@ fn refund_one(
         "cancel failed: {:#}",
         last.unwrap_or_else(|| anyhow!("order still unspent"))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rfq() -> Rfq {
+        Rfq {
+            sell_mint: Address::new_from_array([2; 32]).to_string(),
+            buy_mint: Address::new_from_array([3; 32]).to_string(),
+            sell_amount: 400_000_000,
+            trader: Address::new_from_array([4; 32]).to_string(),
+        }
+    }
+
+    #[test]
+    fn signed_quote_round_trips_and_tampering_fails() {
+        let dealer = Keypair::new_from_array([1; 32]);
+        let q = sign_quote(&dealer, &rfq(), 999, 1_000).unwrap();
+        assert!(signed_by(&dealer.pubkey(), &rfq(), &q));
+        let other = Keypair::new_from_array([9; 32]).pubkey();
+        assert!(!signed_by(&other, &rfq(), &q), "another dealer's key");
+        let more = Quote {
+            buy_amount: 1_000,
+            ..q
+        };
+        assert!(!signed_by(&dealer.pubkey(), &rfq(), &more), "buy amount");
+        let later = Quote { expiry: 1_001, ..q };
+        assert!(!signed_by(&dealer.pubkey(), &rfq(), &later), "expiry");
+        let bigger = Rfq {
+            sell_amount: 1,
+            ..rfq()
+        };
+        assert!(!signed_by(&dealer.pubkey(), &bigger, &q), "request");
+        let mut bad = q;
+        bad.signature[0] ^= 1;
+        assert!(!signed_by(&dealer.pubkey(), &rfq(), &bad), "signature bit");
+    }
 }

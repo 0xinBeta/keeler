@@ -209,6 +209,32 @@ pub struct DealerConfig {
     pub poll_secs: Option<u64>,
     #[serde(default)]
     pub faucet: Option<Faucet>,
+    /// Quote book and bound orders, reloaded on start. Default:
+    /// `~/.local/state/keeler/dealer-<pubkey>.json`.
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
+    /// While this file exists the dealer gives no new quotes; it still
+    /// settles bound orders.
+    #[serde(default)]
+    pub pause_file: Option<PathBuf>,
+    /// Last look: settle only while the quoted amount is at most the fair
+    /// amount at the current price plus this much.
+    #[serde(default)]
+    pub settle_tolerance_bps: u16,
+    #[serde(default)]
+    pub limits: Vec<SellLimit>,
+}
+
+/// Limits on what traders sell to the dealer in `mint`.
+#[derive(Clone, Deserialize)]
+pub struct SellLimit {
+    pub mint: String,
+    /// The largest sell amount one order may have.
+    #[serde(default)]
+    pub max_sell_amount: Option<u64>,
+    /// The most sold over bound orders in any rolling hour of chain time.
+    #[serde(default)]
+    pub hourly_sell_cap: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -291,6 +317,13 @@ impl DealerConfig {
                 parse_address(&t.mint)?;
             }
         }
+        for l in &self.limits {
+            parse_address(&l.mint)?;
+        }
+        ensure!(
+            self.settle_tolerance_bps <= 10_000,
+            "settle_tolerance_bps above 10000"
+        );
         self.common.check()
     }
 }

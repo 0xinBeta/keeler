@@ -243,6 +243,8 @@ fn start(offset: u16, dir: PathBuf) -> Result<()> {
             "per_wallet_daily": 10,
             "daily_cap": 1000,
         },
+        "state_file": dir.join("dealer-state.json"),
+        "pause_file": dir.join("PAUSE"),
     });
     std::fs::write(
         dir.join("dealer-config.json"),

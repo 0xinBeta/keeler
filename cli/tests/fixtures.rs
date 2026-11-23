@@ -1,12 +1,16 @@
 //! Golden make and cancel instructions for the web client's encoder, built
 //! by the swap SDK's own instruction builders from fixed inputs. The proofs
 //! and the transact data are fixed byte patterns, not valid proofs: the
-//! fixture pins the encoding and the account list only.
+//! fixture pins the encoding and the account list only. Also a signed quote
+//! test vector for the web client's verifier.
 //!
-//! Checks `web/tests/fixtures/{make,cancel}-ix.json`; regenerate with
+//! Checks `web/tests/fixtures/{make,cancel}-ix.json` and `quote-sig.json`;
+//! regenerate with
 //! `KEELER_WRITE_FIXTURES=1 cargo test -p keeler --test fixtures`.
 use std::path::PathBuf;
 
+use keeler::trader::{quote_message_for, sign_quote, signed_by};
+use keeler_core::rfq::Rfq;
 use serde_json::{json, Value};
 use solana_address::Address;
 use solana_instruction::Instruction;
@@ -215,6 +219,42 @@ fn cancel_instruction() {
                 "order_authority": order_authority_pda(&maker).to_string(),
             },
             "instruction": instruction_json(&ix),
+        }),
+    );
+}
+
+#[test]
+fn quote_signature() {
+    let dealer = Keypair::new_from_array([1; 32]);
+    let rfq = Rfq {
+        sell_mint: Address::new_from_array([2; 32]).to_string(),
+        buy_mint: Address::new_from_array([3; 32]).to_string(),
+        sell_amount: 400_000_000,
+        trader: Address::new_from_array([4; 32]).to_string(),
+    };
+    let (buy_amount, expiry) = (2_997_000, 1_763_900_030);
+    let q = sign_quote(&dealer, &rfq, buy_amount, expiry).unwrap();
+    assert!(signed_by(&dealer.pubkey(), &rfq, &q));
+    let mut wire = serde_json::to_value(q).unwrap();
+    wire["buy_amount"] = json!(buy_amount.to_string());
+    check(
+        "quote-sig.json",
+        json!({
+            "about": "Ed25519 over message_hex by pubkey. message = \"keeler-quote-v1\" || program_id || sell_mint || buy_mint || trader || sell_amount u64 LE || buy_amount u64 LE || expiry u64 LE (167 bytes). http_reply is the dealer's POST /quote reply for this request.",
+            "inputs": {
+                "program_id": swap_program::ID.to_string(),
+                "sell_mint": rfq.sell_mint,
+                "buy_mint": rfq.buy_mint,
+                "trader": rfq.trader,
+                "sell_amount": rfq.sell_amount.to_string(),
+                "buy_amount": buy_amount.to_string(),
+                "expiry": expiry,
+                "dealer_keypair_seed": hex(&[1; 32]),
+            },
+            "message_hex": hex(&quote_message_for(&rfq, buy_amount, expiry).unwrap()),
+            "pubkey": dealer.pubkey().to_string(),
+            "signature_hex": hex(&q.signature),
+            "http_reply": {"quote": wire},
         }),
     );
 }
