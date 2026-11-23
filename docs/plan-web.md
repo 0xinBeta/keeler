@@ -305,7 +305,7 @@ mainnet.
    a custom domain, an always-on dealer host with real inventory.
 
 
-## Round 2: product gaps (added 2026-11-23, built in the same pass)
+## Round 2: product gaps (added 2026-11-23, revised after review)
 
 Each item goes to the piece that owns the files.
 
@@ -315,56 +315,90 @@ Each item goes to the piece that owns the files.
   167-byte message: `"keeler-quote-v1"` ‖ program ID (32) ‖ sell mint (32) ‖ buy
   mint (32) ‖ trader (32) ‖ sell amount (u64 LE) ‖ buy amount (u64 LE) ‖ expiry
   (u64 LE).
-- `Quote` gains `signature` (hex, 64 bytes) in `core/src/rfq.rs`, on TCP and
-  HTTP. The Worker passes it through untouched.
+- `Quote` gains `signature`: `[u8; 64]` in Rust (so `Quote` stays `Copy`), 128
+  hex characters on TCP and HTTP. The Worker passes it through after checking
+  its shape.
 - The CLI trader and the browser verify it against the dealer's public key
-  and drop a quote that fails. The browser keeps the signed quote in the order
-  record as evidence.
-- Dealer public keys are compiled into the site at build time
-  (`VITE_DEALERS`), so the Worker cannot swap them; `/api/config` dealers must
-  match or the page refuses to quote.
+  and drop a quote that fails. Dealer keys are compiled into the site
+  (`VITE_DEALERS`) and must match `/api/config`.
+- What this buys: a hijacked tunnel address, a leaked dealer secret or a wrong
+  `DEALERS` setting cannot produce quotes. What it does not buy: protection
+  from whoever operates the Worker (it serves the page itself), or any
+  on-chain enforcement.
+- The dealer keeps its quote book and bound orders in a state file and
+  reloads them on start, dropping expired entries, so a restart does not
+  strand a trader who holds a valid quote.
 
-### G2. Prices (A, D, B)
+### G2. Prices (A, D, B, C)
 
-- Dealer: before settling, recompute the fair amount from its own price source
-  and refuse to settle an order whose price has moved outside
-  `settle_band_bps` (new config, default = `spread_bps` × 4). The trader then
-  refunds after expiry.
-- Worker: `GET /api/prices` → `{[mint]: {price, expo, publishTime}}`. With a
-  `PYTH_API_KEY` secret and `PYTH_FEEDS` (mint → feed id) it reads Hermes,
-  applies the same age and confidence limits as `core::price::parse_hermes`,
-  and caches for 5 s. Without them it returns the fixed `REFERENCE` values.
-- Browser: uses `/api/prices` for the band check and shows the price's age.
+- Dealer, last look: before settling, recompute the fair amount at the
+  current price and decline if `buy_amount > fair_now × (1 +
+  settle_tolerance_bps)` (default 0: never settle at a loss against the
+  current price). Prices are fetched once per poll; a failed fetch means do
+  not settle. The trader refunds after expiry.
+- Dealer limits: `max_sell_amount` per mint per order and `hourly_sell_cap`
+  per mint (rolling hour over bound orders).
+- The page says it plainly: "The dealer may decline if the price moves before
+  it settles. Your funds stay locked until the quote expires, then you can
+  take them back."
+- Worker: `GET /api/prices` → `{[mint]: {price: "<int>", expo, publishTime}}`.
+  With a `PYTH_API_KEY` secret and `PYTH_FEEDS` (mint → feed id) it reads
+  Hermes with the same checks as the CLI (`core::price::parse_hermes` plus the
+  future-timestamp and missing-feed checks in `cli/src/config.rs`), limits
+  `PYTH_MAX_AGE_SECS` and `PYTH_MAX_CONF_BPS`, caches 5 s and re-checks age on
+  every read. A Hermes failure is a 503, never a fall-back to fixed values.
+  Without feeds it returns the fixed `REFERENCE` values; on `mainnet` a mint
+  without a feed is an error.
+- Browser: the band check uses `/api/prices`; the quotes view shows the
+  price's age.
 
 ### G3. Orders found again from the chain (B)
 
-- Port the swap SDK's maker index (`sdk/src/index/`): derive the maker's
-  order-authority PDA, find its order UTXOs, decode them with
-  `orderTermsDataUtxo`, and check the nullifier.
-- `orders()` merges `localStorage` with the chain scan; `refund()` works on an
-  order that exists only on chain.
-- Test: lock an order, clear `localStorage`, reload, the order is listed, and
-  after expiry the refund succeeds.
+- Port the swap SDK's maker scan (`sdk/src/index/`, `scan_maker`): it rebuilds
+  the whole order (terms, blinding, source) from chain data; the leaf index
+  comes from `getMerkleProofs`. Every indexer method it needs is already on
+  the Worker's allowlist.
+- `Order.id` is the order hash, so local and chain records merge. A local
+  `locked` order the indexer has not shown yet is kept.
+- The scan runs on unlock and on a "Find my orders" button only. Settled and
+  refunded orders are stored and never checked again.
+- Test: lock an order, delete only the order records from `localStorage`
+  (the in-page wallet key stays), reload, the order is listed, and after
+  expiry the refund succeeds.
 
 ### G4. Limits and pause (A, D, B, C)
 
-- Dealer config `max_sell_amount` per mint: no quote above it.
 - `/api/config` assets carry `maxSell`; the form's maximum is the smaller of
   `maxSell` and the largest note.
-- Worker var `PAUSED=1`: `/api/config` says `paused: true`, `/api/quotes` and
+- Worker `PAUSED=1`: `/api/config` says `paused: true`; `/api/quotes` and
   `/api/faucet` return 503. The page shows "Swaps are paused" and disables
   quoting. Refunds, balances and withdrawals keep working.
-- On `mainnet` the browser refuses any proving key marked
-  `insecureTestSetup`.
+- Dealer pause file: while it exists the dealer gives no new quotes and keeps
+  settling.
+- `/v1/spr/*` gets its own rate limit, stricter on `/prove/*` (1,000 Helius
+  credits each).
+- `proving-keys.json` is bundled into the site at build time; the browser
+  checks each fetched proving key against it, and on `mainnet` refuses a key
+  marked `insecureTestSetup`.
 
-### G5. Deployment (A, scripts only)
+### G5. Deployment (A, scripts only, not run)
 
-- `deploy-devnet.sh` becomes `deploy.sh <devnet|mainnet>`; after deploying it
-  can hand the upgrade authority to an address given with
-  `--upgrade-authority` (a multisig vault). Mainnet refuses to run while the
-  keys are the test setup (`zolana vks check`).
-- `run-dealer.sh` restarts the dealer and the tunnel if either exits.
+- `scripts/set-upgrade-authority.sh <program> <new-authority>`: checks the
+  new authority account exists on the cluster, sets it, reads it back. The
+  upgrade authority can change the program and therefore spend every open
+  order, so on mainnet handing it to a multisig is mandatory and happens
+  before the Worker points at the program.
+- `run-dealer.sh` restarts the dealer and the tunnel with backoff and rewrites
+  the Worker's `DEALERS` each time the tunnel address changes.
+- A mainnet deploy script is not written until the key ceremony. It must not
+  create tokens, run a faucet or move inventory; real funds are moved by the
+  owner.
 
 Not in this round: the always-on dealer host (needs a machine or a paid
 plan; owner's choice), the custom domain, the key ceremony, the npm SDK
 release.
+
+Interface additions for this round (`web/src/keeler/index.ts`):
+`Config.paused: boolean`; `Asset.maxSell?: bigint`; `quotes()` resolves to
+`{ fair, priceTime, quotes }` (`priceTime` in unix seconds);
+`rescanOrders(): Promise<Order[]>`; `KeelerError` code `"paused"`.
