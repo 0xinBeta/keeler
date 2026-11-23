@@ -126,7 +126,11 @@ binary finds the proving keys (`SWAP_KEYS_DIR`).
     failure skips the chunks already written and checks the deployed bytes),
     creates the mints and their pool interfaces, mints only the inventory
     shortfall and deposits it. After any failure, run the script again. It
-    writes `target/devnet/deploy-summary.json` and `dealer-config.json`.
+    writes `target/devnet/deploy-summary.json` and `dealer-config.json`, and
+    keeps the first build's `swap_program.so` there to deploy on reruns. The
+    faucet pays 0.01 SOL and the test tokens per claim, one claim per wallet
+    and 60 in all per UTC day: about 0.85 SOL a day with rent and fees, so
+    the faucet's 2.5 SOL lasts about three days at the cap.
   - `run-dealer.sh` refuses unless `.tools` is built for the config's
     `program_id`, restarts the dealer and the tunnel with backoff, and
     rewrites the Worker's `DEALERS` (backing off on failure) when the

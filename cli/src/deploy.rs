@@ -25,6 +25,8 @@ use spr_program::instruction::{
     AssetDeposit, CreateSplInterface, Deposit, DepositAsset, DepositSplAccounts,
 };
 
+use spr_transaction::SOL_MINT;
+
 use crate::{
     chain::{shielded, Chain},
     config::{redact, KeySource, Network},
@@ -53,8 +55,7 @@ const TOP_UP_BELOW_PCT: u64 = 90;
 pub struct Plan {
     pub network: Network,
     /// Refuse unless the RPC reports this genesis hash.
-    #[serde(default)]
-    pub genesis_hash: Option<String>,
+    pub genesis_hash: String,
     /// Pays for everything and is the program's upgrade authority.
     pub deploy_key: KeySource,
     pub program_key: KeySource,
@@ -471,6 +472,21 @@ fn ensure_inventory(
     let ata = pda::associated_token_address(&dealer.pubkey(), mint);
     let public = token_balance(rpc, &ata)?;
     if public < need {
+        // Supply, not the indexer's view, decides what to mint: a deposit
+        // that landed but is not indexed yet must not be minted again.
+        let data = rpc
+            .get_account(*mint)
+            .map_err(err)?
+            .ok_or_else(|| anyhow!("mint {mint} is missing"))?
+            .data;
+        ensure!(data.len() >= MINT_LEN, "{mint} is not a mint account");
+        let supply = u64::from_le_bytes(data[36..44].try_into()?);
+        ensure!(
+            public + inventory.saturating_sub(supply) >= need,
+            "{mint}: supply {supply} already covers the inventory but the dealer holds \
+             {private} privately and {public} publicly; a deposit may still be indexing; \
+             wait and rerun"
+        );
         let ixs = faucet::instructions(
             &faucet_key.pubkey(),
             &dealer.pubkey(),
@@ -525,7 +541,7 @@ fn ensure_inventory(
 }
 
 /// The RPC's genesis hash, through a plain JSON-RPC call.
-fn genesis_hash(rpc_url: &str) -> Result<String> {
+pub fn genesis_hash(rpc_url: &str) -> Result<String> {
     let reply: serde_json::Value = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?
@@ -541,22 +557,32 @@ fn genesis_hash(rpc_url: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no genesis hash in the RPC reply"))
 }
 
-/// Runs every step of `plan`.
-pub fn setup(plan: &Plan) -> Result<Summary> {
-    let (rpc_url, _) = plan.network.urls()?;
-    if let Some(want) = &plan.genesis_hash {
+impl Plan {
+    /// The plan's RPC, after checking it is the plan's cluster.
+    pub fn rpc(&self) -> Result<SolanaRpc> {
+        let (rpc_url, _) = self.network.urls()?;
         let got = genesis_hash(&rpc_url)?;
+        let want = &self.genesis_hash;
         ensure!(
             got == *want,
             "the RPC's genesis hash is {got}, not {want}; refusing"
         );
+        Ok(SolanaRpc::new(rpc_url))
     }
-    let rpc = SolanaRpc::new(rpc_url);
+}
+
+/// Runs every step of `plan`.
+pub fn setup(plan: &Plan) -> Result<Summary> {
+    let rpc = plan.rpc()?;
     let deployer = plan.deploy_key.keypair()?;
     let program = plan.program_key.keypair()?;
     let buffer = plan.buffer_key.keypair()?;
     let dealer = plan.dealer_key.keypair()?;
     let faucet_key = plan.faucet_key.keypair()?;
+    // A bad indexer or tree fails here, before anything is spent.
+    Chain::connect(&plan.network, &[])?
+        .balance(&shielded(&dealer)?, SOL_MINT)
+        .context("indexer check")?;
     log!(
         "deploy: deploy key {}, balance {} lamports",
         deployer.pubkey(),

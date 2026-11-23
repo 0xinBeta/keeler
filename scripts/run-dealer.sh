@@ -47,7 +47,8 @@ dealer_pid="" tunnel_pid=""
 trap 'kill $dealer_pid $tunnel_pid 2>/dev/null || true' EXIT
 
 start_dealer() {
-    "$bin" dealer "$cfg" >>"$logs/dealer.log" 2>&1 &
+    # The dealer redacts its own logs; this catches a dependency that does not.
+    "$bin" dealer "$cfg" > >(redact >>"$logs/dealer.log") 2>&1 &
     dealer_pid=$! dealer_since=$SECONDS
 }
 start_tunnel() {

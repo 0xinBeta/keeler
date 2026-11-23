@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        mpsc, Mutex,
     },
     thread::{self, sleep},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -128,6 +128,14 @@ fn load_state(path: &Path, now: u64, dealer: &Address) -> Result<Loaded> {
     };
     let state: State = serde_json::from_slice(&text)
         .map_err(|_| anyhow!("state file {} is not valid", path.display()))?;
+    // A live bound quote binds its order again after the restart, which
+    // counts its sell again, so its old count goes.
+    let rebinds: Vec<(String, u64)> = state
+        .bound
+        .iter()
+        .filter(|(r, q)| q.expiry > now && signed_by(dealer, r, q))
+        .map(|(r, _)| (r.sell_mint.clone(), r.sell_amount))
+        .collect();
     let live: Vec<_> = state
         .book
         .into_iter()
@@ -146,12 +154,20 @@ fn load_state(path: &Path, now: u64, dealer: &Address) -> Result<Loaded> {
             count - quotes.len()
         );
     }
-    let bound_sells = state
+    let mut bound_sells: Vec<(u64, Address, u64)> = state
         .bound_sells
         .into_iter()
         .filter(|(t, _, _)| t.saturating_add(HOUR) > now)
         .map(|(t, m, a)| Ok((t, parse_address(&m)?, a)))
         .collect::<Result<_>>()?;
+    for (mint, amount) in rebinds {
+        if let Some(i) = bound_sells
+            .iter()
+            .position(|(_, m, a)| m.to_string() == mint && *a == amount)
+        {
+            bound_sells.remove(i);
+        }
+    }
     Ok(Loaded {
         quotes,
         bound_sells,
@@ -281,7 +297,9 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
     });
     refresh(cfg, &chain, &kp, &signer.pubkey(), &cache)?;
     let faucet = cfg.faucet.as_ref().map(Faucet::new).transpose()?;
+    let (payouts, queue) = mpsc::channel();
     let api = DealerApi {
+        payouts: Mutex::new(payouts),
         cfg,
         pricer: &pricer,
         chain: &chain,
@@ -309,6 +327,7 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
     let api = &api;
     thread::scope(|s| {
         let server = s.spawn(|| serve(listener, stop, |rfq| api.quote(rfq)));
+        s.spawn(|| api.pay_claims(queue, stop));
         let web =
             http.map(|(l, key)| s.spawn(move || serve_http(l, &key, stop, api, HTTP_DEADLINE)));
         let mut seen = HashSet::new();
@@ -364,11 +383,39 @@ struct DealerApi<'a> {
     faucet: Option<&'a Faucet>,
     signer: &'a Keypair,
     state: &'a Path,
+    payouts: Mutex<mpsc::Sender<Address>>,
 }
 
 type HttpError = (u16, String);
 
 impl DealerApi<'_> {
+    fn give_back(&self, wallet: Address) {
+        let _ = self.count(|l| {
+            l.undo(wallet);
+            Ok(())
+        });
+    }
+
+    /// Pays queued faucet claims until `stop`.
+    fn pay_claims(&self, queue: mpsc::Receiver<Address>, stop: &AtomicBool) {
+        let Some(faucet) = self.faucet else { return };
+        while !stop.load(Ordering::Relaxed) {
+            let Ok(wallet) = queue.recv_timeout(Duration::from_millis(200)) else {
+                continue;
+            };
+            match faucet.pay(self.chain, wallet) {
+                Ok(()) => log!("dealer: faucet paid {wallet}"),
+                Err((sent, e)) => {
+                    log!("dealer: faucet for {wallet} (sent: {sent}): {e:#}");
+                    // A send that may land keeps the claim: no second payout.
+                    if !sent {
+                        self.give_back(wallet);
+                    }
+                }
+            }
+        }
+    }
+
     /// Applies `f` to the faucet counts and saves them.
     fn count(&self, f: impl FnOnce(&mut Limits) -> Result<(), HttpError>) -> Result<(), HttpError> {
         let mut c = self
@@ -407,14 +454,14 @@ impl Api for DealerApi<'_> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() / 86_400);
         self.count(|l| l.take(wallet, day).map_err(|m| (429, m.to_string())))?;
-        faucet.pay(self.chain, wallet).map_err(|e| {
-            log!("dealer: faucet for {wallet}: {e:#}");
-            let _ = self.count(|l| {
-                l.undo(wallet);
-                Ok(())
-            });
-            (502, "faucet transfer failed".to_string())
-        })
+        // Paid off the request thread: a confirmation takes longer than the
+        // Worker waits, and the HTTP server answers one request at a time.
+        let queued = self.payouts.lock().ok().and_then(|tx| tx.send(wallet).ok());
+        if queued.is_none() {
+            self.give_back(wallet);
+            return Err((502, "faucet transfer failed".to_string()));
+        }
+        Ok(())
     }
 
     fn now(&self) -> Result<u64, String> {
@@ -814,6 +861,15 @@ fn after_settle(cache: &mut Cache, auto_pause: &Path, limit: u32, outcome: &Resu
     }
 }
 
+/// With no bound order left to settle, failed settles no longer count and
+/// an auto-pause ends.
+fn clear_when_idle(cache: &mut Cache, auto_pause: &Path) {
+    cache.failed_settles = 0;
+    if auto_pause.exists() && std::fs::remove_file(auto_pause).is_ok() {
+        log!("dealer: no bound order left to settle; quoting resumed");
+    }
+}
+
 /// One pass. Errors are logged per step and per order, so one bad order or a
 /// failed discovery never stops settling orders already bound.
 #[allow(clippy::too_many_arguments)]
@@ -859,7 +915,14 @@ fn poll(
             }
         }
     }
+    if bound.is_empty() {
+        if let Ok(mut c) = cache.lock() {
+            clear_when_idle(&mut c, &auto_pause_path(state));
+        }
+    }
 }
+
+const OVER_LIMIT: &str = "is over a sell limit";
 
 /// Moves the quote an open order matches from the book to `bound`, or says
 /// why the order is not settled.
@@ -880,7 +943,7 @@ fn bind(
         .position(|(r, q)| matches(r, q, o))
         .ok_or("matches no quote")?;
     if within_limits(&cfg.limits, &cache.bound_sells, sell, amount, now).is_err() {
-        return Err("is over a sell limit");
+        return Err(OVER_LIMIT);
     }
     if now.saturating_add(cfg.settle_margin_secs) >= o.order_utxo.terms.expiry {
         return Err("is past the settle margin");
@@ -917,7 +980,10 @@ fn consider(
             save_state(state, &cache)?;
         }
         Err(why) => {
-            seen.insert(hash);
+            // The hourly window moves on, so a later poll may take it.
+            if why != OVER_LIMIT {
+                seen.insert(hash);
+            }
             log!("dealer: order {} {why}; not settling", hex(&hash));
         }
     }
@@ -1298,7 +1364,7 @@ mod tests {
         forged.buy_amount = 99;
         cache.book.push((r, forged));
         cache.bound.insert([7; 32], signed(&bound, 90, 1_000));
-        cache.bound_sells = vec![(100, addr(1), 7), (590, addr(1), 8)];
+        cache.bound_sells = vec![(100, addr(1), 7), (590, addr(1), 8), (595, addr(1), 200)];
         let mut faucet = Limits::new(1, 5);
         faucet.take(addr(4), 3).unwrap();
         cache.faucet = Some(faucet);
@@ -1316,10 +1382,17 @@ mod tests {
         assert!(loaded.quotes.iter().any(|(r, q)| matches(r, q, &o)));
         // Another dealer's key verifies none of them.
         assert!(load_state(&path, 600, &addr(3)).unwrap().quotes.is_empty());
-        // The hourly window and the faucet's day survive.
-        assert_eq!(loaded.bound_sells.len(), 2);
+        // The hourly window and the faucet's day survive; the live bound
+        // quote's sell is left to be counted when its order binds again.
+        assert_eq!(
+            loaded.bound_sells,
+            vec![(100, addr(1), 7), (590, addr(1), 8)]
+        );
         let later = load_state(&path, 3_700, &d.pubkey()).unwrap();
-        assert_eq!(later.bound_sells, vec![(590, addr(1), 8)]);
+        assert_eq!(
+            later.bound_sells,
+            vec![(590, addr(1), 8), (595, addr(1), 200)]
+        );
         let mut again = Limits::new(1, 5);
         again.claims = loaded.faucet.unwrap();
         assert!(again.take(addr(4), 3).is_err());
@@ -1421,6 +1494,12 @@ mod tests {
         after_settle(&mut cache, &flag, 3, &Ok(Settle::Took));
         after_settle(&mut cache, &flag, 3, &fail());
         assert!(!flag.exists());
+        // Once the failing order is gone, nothing is left to settle: resume.
+        after_settle(&mut cache, &flag, 3, &fail());
+        after_settle(&mut cache, &flag, 3, &fail());
+        assert!(flag.exists());
+        clear_when_idle(&mut cache, &flag);
+        assert!(!flag.exists() && cache.failed_settles == 0);
     }
 
     #[test]

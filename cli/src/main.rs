@@ -14,10 +14,10 @@ fn main() -> ExitCode {
     // A panic in any thread ends the process, so the supervisor restarts the
     // dealer rather than leave quoting up with settling dead. This is
     // `panic = "abort"` without the profile setting, which breaks
-    // `cargo test --release`.
-    let report = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        report(info);
+    // `cargo test --release`. The message is redacted: it may quote an RPC
+    // URL with the API key.
+    std::panic::set_hook(Box::new(|info| {
+        keeler::config::log(format_args!("panic: {info}"));
         std::process::abort();
     }));
     let args: Vec<String> = std::env::args().skip(1).collect();

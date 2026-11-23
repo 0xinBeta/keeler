@@ -554,7 +554,7 @@ fn deploy_tool_is_idempotent() {
     let payer = fixture::payer();
     let plan = Plan {
         network: net.network(),
-        genesis_hash: None,
+        genesis_hash: deploy::genesis_hash(&net.ports.rpc_url()).unwrap(),
         deploy_key: file("deploy", &payer),
         program_key: seeded("program", 41),
         buffer_key: seeded("buffer", 42),

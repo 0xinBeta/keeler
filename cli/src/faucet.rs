@@ -9,7 +9,7 @@ use solana_address::Address;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
-use spr_client::{ComputeBudgetConfig, Rpc};
+use spr_client::{compile_message, sign_transaction, ComputeBudgetConfig, Rpc};
 use spr_interface::pda;
 
 use crate::{
@@ -113,19 +113,24 @@ impl Faucet {
     }
 
     /// Mints every token to `wallet`'s associated token account and sends
-    /// the fee SOL, in one transaction.
-    pub fn pay(&self, chain: &Chain, wallet: Address) -> Result<()> {
+    /// the fee SOL, in one transaction. `Err((sent, e))`: `sent` is false
+    /// only when the transaction never went out, so the claim can be given
+    /// back; after a send that failed or timed out it may still land.
+    pub fn pay(&self, chain: &Chain, wallet: Address) -> Result<(), (bool, anyhow::Error)> {
         let ixs = instructions(&self.key.pubkey(), &wallet, &self.tokens, self.lamports);
-        chain
-            .client
-            .rpc()
-            .create_and_send_transaction(
-                &ixs,
-                self.key.pubkey(),
-                &[&self.key],
-                ComputeBudgetConfig::for_instruction_count(ixs.len()),
-            )
-            .map_err(|e| anyhow!("faucet transfer: {e:?}"))?;
+        let rpc = chain.client.rpc();
+        let unsent = |e: &dyn std::fmt::Debug| (false, anyhow!("faucet transfer: {e:?}"));
+        let (blockhash, _) = rpc.get_latest_blockhash().map_err(|e| unsent(&e))?;
+        let message = compile_message(
+            &self.key.pubkey(),
+            &ixs,
+            blockhash,
+            ComputeBudgetConfig::for_instruction_count(ixs.len()),
+        )
+        .map_err(|e| unsent(&e))?;
+        let tx = sign_transaction(message, &[&self.key]).map_err(|e| unsent(&e))?;
+        rpc.process_transaction(tx)
+            .map_err(|e| (true, anyhow!("faucet transfer: {e:?}")))?;
         Ok(())
     }
 }
