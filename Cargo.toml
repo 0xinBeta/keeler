@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["core", "cli"]
+# .tools holds the pinned Helius examples checkout, which is its own workspace.
+exclude = [".tools", ".worktrees"]
+
+[profile.release]
+overflow-checks = true
