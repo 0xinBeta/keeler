@@ -283,11 +283,15 @@ moon Daphnis, which raises waves on the gap's edges as it passes.
 - The local network proves with client-side proof data; the hosted-prover
   path is exercised only on devnet.
 
-## Mainnet gates, in order (each is the owner's decision)
+## Path to mainnet (owner's decisions, 2026-11-23)
 
-1. Licence or written permission from Helius for the swap example, or our own
-   program. This also comes before a public devnet deployment.
-2. An audit of the program and circuits.
+Order: devnet working → fill the product gaps (item 5) → audit → key ceremony →
+mainnet.
+
+1. Licence: the owner says Helius is fine with shipping the swap example.
+   Devnet publication approved. Worth having in writing before mainnet.
+2. Audit: the owner will run it with their Daybreak access, after the code
+   stops changing. Legal: the owner handles it.
 3. Proving keys from a real Xark phase-2 ceremony with at least one outside
    contributor. A setup run only by the dealer's operator lets the dealer
    forge a take. Then: drop `insecure-test-setup`, `export-verifier
@@ -299,4 +303,4 @@ moon Daphnis, which raises waves on the gap's edges as it passes.
 5. Product: orders rediscovered from the chain, signed quotes, a live price
    check at settlement, an npm SDK release that matches the deployed programs,
    a custom domain, an always-on dealer host with real inventory.
-6. A legal view on running a private trading venue.
+
