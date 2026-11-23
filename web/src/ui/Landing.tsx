@@ -185,7 +185,7 @@ export function ChainSees() {
                       {r.value}
                     </span>
                     <span className="mask" aria-hidden={!hidden}>
-                      <span className="sr-only">Encrypted</span>
+                      <span className="mask-word">Encrypted</span>
                       <span aria-hidden="true">
                         <i />
                         <i />

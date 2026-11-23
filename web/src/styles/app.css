@@ -228,7 +228,7 @@ h1 {
   text-wrap: balance;
 }
 .lede {
-  max-width: 50ch;
+  max-width: 42ch;
   color: var(--mist);
   font-size: 19px;
   line-height: 1.6;
@@ -1051,6 +1051,13 @@ select.wide {
   border-radius: 999px;
   background: rgb(233 184 114 / 0.08);
 }
+.mask-word {
+  order: 2;
+  align-self: center;
+  margin-left: 12px;
+  color: var(--gold);
+  font-size: 14px;
+}
 .mask i {
   width: 8px;
   height: 8px;
@@ -1579,5 +1586,13 @@ details[open] .faq-icon::after {
   }
   .sees-val {
     font-size: 16px;
+  }
+  /* The dots say it on a narrow screen; the word stays for screen readers. */
+  .mask-word {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
   }
 }

@@ -55,10 +55,11 @@ export function RingCanvas(props: Props) {
       if (h.width >= 800 && a) {
         layout = {
           // Centred a little left of the panel and wide, so the ring reaches behind the headline's right edge.
-          cx: a.left - h.left + a.width * 0.42,
+          cx: a.left - h.left + a.width * 0.58,
           // Anchored to the panel's top, not its height, so the ring does not jump as the panel changes.
-          cy: a.top - h.top + 300,
-          radius: Math.max(a.width * 1.55, h.width * 0.5),
+          // High enough that its left arc runs behind the headline's large type, not the smaller paragraph.
+          cy: a.top - h.top + 230,
+          radius: Math.max(a.width * 1.5, h.width * 0.47),
           lights: 3.35, // near arc, left of the panel
         };
       } else {
