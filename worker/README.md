@@ -8,7 +8,7 @@ network peer, so the Helius key and the dealer key never reach the browser.
 | Route | Method | What it does |
 | --- | --- | --- |
 | `/api/config` | GET | Public config: `{network, rpcPath, sprPath, programId, assets:[{mint,symbol,decimals,maxSell?}], dealers:[{pubkey}], bandBps, minTtlSecs, maxTtlSecs, faucet, paused}` |
-| `/api/prices` | GET | `{[mint]: {price: "<int>", expo, publishTime}}` from Pyth's on-chain price accounts when `PYTH_ACCOUNTS` is set, otherwise the fixed `REFERENCE` values stamped now |
+| `/api/prices` | GET | `{[mint]: {price: "<int>", expo, publishTime}}` from Pyth's on-chain price accounts when `PYTH_ACCOUNTS` is set, otherwise the fixed `REFERENCE` values stamped now and marked `"fixed": true` |
 | `/api/rpc` | POST | Solana JSON-RPC proxy. Method allowlist, batches checked per element, 64 KiB body cap |
 | `/v1/spr/*` | GET, POST | Helius Privacy Rings indexer and TEE prover proxy. Exact path allowlist, 1 MiB request cap, response cap 10 MiB (indexer) / 1 MiB (prover) |
 | `/api/tee-policy` | GET | The signed TEE policy for `devnet`/`mainnet` (the browser checks the signatures). 404 on `local` |
@@ -38,7 +38,7 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 
 | Name | Kind | Meaning |
 | --- | --- | --- |
-| `HELIUS_API_KEY` | secret | Added as `api-key` to every RPC, indexer and prover request |
+| `HELIUS_API_KEY` | secret | Added as `api-key` to RPC, indexer and prover requests sent to the built-in Helius hosts only |
 | `DEALER_KEY` | secret | Sent to dealers as `x-keeler-key` |
 | `NETWORK` | var | `local`, `devnet` or `mainnet` |
 | `DEALERS` | var | JSON `[{"url","pubkey"}]` |
@@ -57,6 +57,7 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 
 Prices: one `getMultipleAccounts` (base64) to the RPC upstream reads every configured account.
 Each must exist, be owned by Pyth's receiver `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`,
+start with the PriceUpdateV2 discriminator (first 8 bytes of sha256 of `account:PriceUpdateV2`),
 be fully verified (byte 40 = 1), and hold the configured feed id; then the price, age and
 confidence checks above apply. The result is cached for 5 s per isolate and the age is re-checked
 on every read. Any failure is a 503 naming the asset, never the fixed values. On `mainnet` every
@@ -65,10 +66,59 @@ asset in `ASSETS` needs an account, or `/api/prices` is a 500.
 A path below `/v1/spr` is appended to the chosen base, so `/v1/spr/getUserRecords` goes to
 `<UPSTREAM_INDEXER>/getUserRecords` and `/v1/spr/prove/x` to `<UPSTREAM_PROVER>/prove/x`.
 
-Rate limits per client IP (bindings in `wrangler.jsonc`): `RPC_LIMIT` 600/min (RPC, TEE policy,
-prices), `SPR_LIMIT` 600/min (indexer calls and prover GETs, including proof status polls),
-`PROVE_LIMIT` 5/min (POST `/prove/*`, 1,000 Helius credits each), `QUOTE_LIMIT` 30/min,
-`FAUCET_LIMIT` 3/min. Without a binding there is no limit.
+## Rate limits
+
+Bindings in `wrangler.jsonc`, all with a 60 s period. Per-client limits key on the IPv4 address,
+or on the IPv6 /64, since one subscriber usually holds a whole /64. Global limits use one
+constant key for everyone. These are settings: tune them to your Helius plan. A proof costs
+1,000 credits, an indexer read 10, and most RPC calls 1.
+
+| Binding | Limit / 60 s | Key | Counts |
+| --- | --- | --- | --- |
+| `RPC_LIMIT` | 600 | client | each JSON-RPC call (a batch counts each call), TEE policy, prices |
+| `RPC_GLOBAL_LIMIT` | 1200 | global | each JSON-RPC call |
+| `SPR_LIMIT` | 300 | client | indexer calls and prover GETs (including proof status polls) |
+| `SPR_GLOBAL_LIMIT` | 1200 | global | same |
+| `PROVE_LIMIT` | 20 | client | POST `/prove/*` (a normal flow uses about 4 proofs in a few minutes) |
+| `PROVE_GLOBAL_LIMIT` | 30 | global | POST `/prove/*` |
+| `QUOTE_LIMIT` | 30 | client | `/api/quotes` |
+| `FAUCET_LIMIT` | 3 | client | `/api/faucet` |
+
+When a binding is missing, `NETWORK=local` means no limit. On any other network the request
+is refused with a 503.
+
+Other RPC limits:
+- A batch holds at most 10 calls. A larger batch is refused whole.
+- `getProgramAccounts` is allowed only for the user registry
+  (`regy3WAeRXMYuMYxr5iK3Bf9Arr3PcxGxyzAddbiqDQ`), the pool
+  (`ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW`) and `PROGRAM_ID`. These are the only
+  programs the SDK scans.
+- The Worker forwards the parsed and checked call, re-serialised with only `jsonrpc`, `id`,
+  `method` and `params`. A call holding an integer above 2^53 is refused, because
+  re-serialising it would change its value.
+- The Helius key is added only for `devnet.helius-rpc.com` and `mainnet.helius-rpc.com`.
+  An `UPSTREAM_*` override host never receives it.
+- Every `/api/*` and `/v1/*` reply carries `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: default-src 'none'`. `/api/rpc` replies are always
+  `application/json`.
+
+### What an anonymous visitor can cost you
+
+Anyone can load the page and call these routes without signing in. At the global limits above,
+the worst case per minute is:
+- about 30,000 credits from proofs (30 × 1,000);
+- up to 12,000 credits from indexer reads (1,200 × 10);
+- about 1,200 credits or more from RPC (a scan of the registry or pool costs more than 1).
+
+That totals about 43,000 credits a minute, or roughly 60 million a day, if someone saturates
+every limit around the clock. Two things raise that ceiling:
+- Workers rate limits only allow periods of 10 s or 60 s, so a daily budget cannot be set here.
+- The counters are kept per Cloudflare location, so a spread-out attacker can reach the global
+  numbers in several locations at once.
+
+To lower it: set the global limits to what your plan can absorb, watch Helius usage, and set
+`PAUSED=1` or delete the Worker if spend spikes. `sendTransaction` and `simulateTransaction`
+stay open (wallets need them) and count under the RPC limits.
 
 ## Run locally against a local network
 

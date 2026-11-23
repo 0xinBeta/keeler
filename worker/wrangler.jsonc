@@ -5,14 +5,18 @@
   // The Worker runs first for every path so HTML gets the CSP and hashed files a long cache.
   // The binding is STATIC because the ASSETS var holds the token list.
   "assets": { "directory": "../web/dist", "binding": "STATIC", "not_found_handling": "single-page-application", "run_worker_first": true },
-  // Per client IP. period must be 10 or 60 seconds.
+  // Per client (IPv4 address or IPv6 /64) unless named GLOBAL. period must be 10 or 60 seconds.
   "ratelimits": [
     { "name": "RPC_LIMIT", "namespace_id": "4101", "simple": { "limit": 600, "period": 60 } },
     { "name": "QUOTE_LIMIT", "namespace_id": "4102", "simple": { "limit": 30, "period": 60 } },
     { "name": "FAUCET_LIMIT", "namespace_id": "4103", "simple": { "limit": 3, "period": 60 } },
-    { "name": "SPR_LIMIT", "namespace_id": "4104", "simple": { "limit": 600, "period": 60 } },
+    { "name": "SPR_LIMIT", "namespace_id": "4104", "simple": { "limit": 300, "period": 60 } },
     // Each proof costs 1,000 Helius credits.
-    { "name": "PROVE_LIMIT", "namespace_id": "4105", "simple": { "limit": 5, "period": 60 } }
+    { "name": "PROVE_LIMIT", "namespace_id": "4105", "simple": { "limit": 20, "period": 60 } },
+    // Global (constant key) caps on spend, whatever the number of client addresses. Tune to the Helius plan.
+    { "name": "RPC_GLOBAL_LIMIT", "namespace_id": "4106", "simple": { "limit": 1200, "period": 60 } },
+    { "name": "SPR_GLOBAL_LIMIT", "namespace_id": "4107", "simple": { "limit": 1200, "period": 60 } },
+    { "name": "PROVE_GLOBAL_LIMIT", "namespace_id": "4108", "simple": { "limit": 30, "period": 60 } }
   ],
   "vars": { "NETWORK": "local" }
 }
