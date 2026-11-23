@@ -3,6 +3,8 @@ import worker, { type Env } from "../src/index";
 
 const KEY = "HELIUSSECRET123";
 const DKEY = "DEALERSECRET456";
+const PKEY = "PYTHSECRET789";
+const SIG = "ab".repeat(64);
 const MINT_A = "So11111111111111111111111111111111111111112";
 const MINT_B = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const TRADER = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
@@ -37,6 +39,8 @@ function env(over: Partial<Env> = {}): Env {
     RPC_LIMIT: allow,
     QUOTE_LIMIT: allow,
     FAUCET_LIMIT: allow,
+    SPR_LIMIT: allow,
+    PROVE_LIMIT: allow,
     ...over,
   };
 }
@@ -53,6 +57,7 @@ async function call(r: Request, e = env()) {
   const text = await res.text();
   expect(text).not.toContain(KEY);
   expect(text).not.toContain(DKEY);
+  expect(text).not.toContain(PKEY);
   expect(text).not.toContain("helius-rpc.com");
   for (const [, v] of res.headers) expect(v).not.toContain(KEY);
   return { res, text, body: text ? JSON.parse(text) : null };
@@ -230,7 +235,7 @@ describe("/api/config and /api/tee-policy", () => {
       assets: [{ mint: MINT_A, symbol: "tSOL", decimals: 9 }],
       dealers: [{ pubkey: "D1" }, { pubkey: "D2" }, { pubkey: "D3" }],
       bandBps: 100, minTtlSecs: 120, maxTtlSecs: 600,
-      reference: { [MINT_A]: { price: "150", expo: -2 } }, faucet: true,
+      faucet: true, paused: false,
     });
     expect((await call(req("/api/config"), env({ FAUCET: undefined }))).body.faucet).toBe(false);
     expect((await call(req("/api/config"), env({ DEALERS: "[{" }))).res.status).toBe(500);
@@ -266,7 +271,7 @@ describe("/api/quotes", () => {
 
   it("fans out in parallel with a timeout, in dealer order; bad replies are null", async () => {
     mockFetch((url, init) => {
-      if (url.startsWith("https://d1")) return Response.json({ quote: { buy_amount: "18446744073709551615", expiry: 1700000000, extra: 1 } });
+      if (url.startsWith("https://d1")) return Response.json({ quote: { buy_amount: "18446744073709551615", expiry: 1700000000, signature: SIG, extra: 1 } });
       if (url.startsWith("https://d2")) {
         return new Promise((_, reject) => init.signal!.addEventListener("abort", () => reject(new Error("timeout"))));
       }
@@ -276,7 +281,7 @@ describe("/api/quotes", () => {
     const { body } = await call(post("/api/quotes", { ...good, extra: "dropped" }));
     expect(Date.now() - started).toBeLessThan(3900);
     expect(body).toEqual([
-      { dealer: "D1", quote: { buy_amount: "18446744073709551615", expiry: 1700000000 } },
+      { dealer: "D1", quote: { buy_amount: "18446744073709551615", expiry: 1700000000, signature: SIG } },
       { dealer: "D2", quote: null },
       { dealer: "D3", quote: null },
     ]);
@@ -321,5 +326,145 @@ describe("/api/faucet", () => {
     const { res, body } = await call(post("/api/faucet", { wallet: TRADER }));
     expect(res.status).toBe(429);
     expect(body).toEqual({ error: "daily limit reached" });
+  });
+});
+
+describe("round 2", () => {
+  const good = { sell_mint: MINT_A, buy_mint: MINT_B, sell_amount: "1000000", trader: TRADER };
+
+  it("passes a well-formed quote signature and nulls any other", async () => {
+    const sigs: unknown[] = [SIG, SIG.toUpperCase(), SIG.slice(2), undefined];
+    const list = sigs.map((_, i) => ({ url: `https://d${i}.example`, pubkey: `D${i}` }));
+    mockFetch((url) => Response.json({ quote: { buy_amount: "5", expiry: 9, signature: sigs[Number(url[9])] } }));
+    const { body } = await call(post("/api/quotes", good), env({ DEALERS: JSON.stringify(list) }));
+    expect(body.map((q: { quote: unknown }) => q.quote)).toEqual([{ buy_amount: "5", expiry: 9, signature: SIG }, null, null, null]);
+  });
+
+  it("PAUSED stops quotes and faucet only", async () => {
+    mockFetch(() => Response.json({ jsonrpc: "2.0", id: 1, result: 1 }));
+    const e = env({ PAUSED: "1" });
+    expect((await call(req("/api/config"), e)).body.paused).toBe(true);
+    for (const r of [post("/api/quotes", good), post("/api/faucet", { wallet: TRADER })]) {
+      const { res, body } = await call(r, e);
+      expect(res.status).toBe(503);
+      expect(body).toEqual({ error: "Swaps are paused." });
+    }
+    expect(calls).toHaveLength(0);
+    expect((await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" }), e)).res.status).toBe(200);
+    expect((await call(post("/v1/spr/getUserRecords", {}), e)).res.status).toBe(200);
+  });
+
+  it("config assets carry maxSell; a bad maxSell is a config error", async () => {
+    const a = [{ mint: MINT_A, symbol: "tSOL", decimals: 9, maxSell: "5000000000" }, { mint: MINT_B, symbol: "tUSD", decimals: 6 }];
+    expect((await call(req("/api/config"), env({ ASSETS: JSON.stringify(a) }))).body.assets).toEqual(a);
+    const bad = [{ mint: MINT_A, symbol: "tSOL", decimals: 9, maxSell: 5 }];
+    expect((await call(req("/api/config"), env({ ASSETS: JSON.stringify(bad) }))).res.status).toBe(500);
+  });
+
+  it("limits proofs separately from indexer and status calls", async () => {
+    mockFetch(() => Response.json({}));
+    const seen: string[] = [];
+    const named = (name: string, ok: boolean) => ({ limit: async () => (seen.push(name), { success: ok }) }) as RateLimit;
+    const e = env({ SPR_LIMIT: named("spr", true), PROVE_LIMIT: named("prove", false), RPC_LIMIT: named("rpc", true) });
+    expect((await call(post("/v1/spr/prove/merge_8_1", {}), e)).res.status).toBe(429);
+    expect((await call(post("/v1/spr/prove/merge_8_1/indexed", {}), e)).res.status).toBe(429);
+    expect((await call(req("/v1/spr/prove/merge_8_1/status?jobId=a"), e)).res.status).toBe(200);
+    expect((await call(post("/v1/spr/getMerkleProofs", {}), e)).res.status).toBe(200);
+    expect(seen).toEqual(["prove", "prove", "spr", "spr"]);
+    expect(calls).toHaveLength(2);
+    expect((await call(post("/v1/spr/getMerkleProofs", {}), env({ SPR_LIMIT: named("spr", false) }))).res.status).toBe(429);
+  });
+
+  it("allows indexer replies up to 10 MiB, prover replies up to 1 MiB", async () => {
+    mockFetch(() => new Response(new Uint8Array(5 * 1024 * 1024)));
+    expect((await worker.fetch(post("/v1/spr/getEncryptedUtxosByTags", {}), env())).status).toBe(200);
+    expect((await worker.fetch(post("/v1/spr/prove/merge_8_1", {}), env())).status).toBe(502);
+    mockFetch(() => new Response(new Uint8Array(10 * 1024 * 1024 + 1)));
+    expect((await worker.fetch(post("/v1/spr/getEncryptedUtxosByTags", {}), env())).status).toBe(502);
+  });
+});
+
+describe("/api/prices", () => {
+  const FEED_A = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+  const FEED_B = "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a";
+  let n = 0;
+  const NOW = 1_800_000_000;
+  // A fresh PYTH_URL per test keeps the module's 5 s cache from leaking between tests.
+  const pythEnv = (over: Partial<Env> = {}) => env({
+    PYTH_API_KEY: PKEY, PYTH_URL: `https://hermes${++n}.example/`,
+    PYTH_FEEDS: JSON.stringify({ [MINT_A]: "0x" + FEED_A.toUpperCase(), [MINT_B]: FEED_B }),
+    PYTH_MAX_AGE_SECS: "60", PYTH_MAX_CONF_BPS: "100", ...over,
+  });
+  const feed = (id: string, price: Record<string, unknown> = {}) =>
+    ({ id, price: { price: "15000000000", conf: "1000000", expo: -8, publish_time: NOW - 5, ...price } });
+  const hermes = (...parsed: unknown[]) => () => Response.json({ parsed });
+  const at = (secs: number) => vi.spyOn(Date, "now").mockReturnValue(secs * 1000);
+
+  it("returns REFERENCE values stamped now when no feeds are set", async () => {
+    at(NOW);
+    const { body } = await call(req("/api/prices"));
+    expect(body).toEqual({ [MINT_A]: { price: "150", expo: -2, publishTime: NOW } });
+  });
+
+  it("refuses mainnet without a feed for every asset", async () => {
+    at(NOW);
+    const a = await call(req("/api/prices"), env({ NETWORK: "mainnet" }));
+    expect(a.res.status).toBe(500);
+    expect(a.body.error).toContain(MINT_A);
+    const assets = JSON.stringify([{ mint: MINT_A, symbol: "tSOL", decimals: 9 }, { mint: TRADER, symbol: "X", decimals: 6 }]);
+    expect((await call(req("/api/prices"), pythEnv({ NETWORK: "mainnet", ASSETS: assets }))).res.status).toBe(500);
+  });
+
+  it("reads Hermes with the bearer key and checks every feed", async () => {
+    at(NOW);
+    mockFetch(hermes(feed("0x" + FEED_A), feed(FEED_B, { price: "100000000", conf: "10000" })));
+    const { res, body } = await call(req("/api/prices"), pythEnv());
+    expect(res.status).toBe(200);
+    expect(body).toEqual({
+      [MINT_A]: { price: "15000000000", expo: -8, publishTime: NOW - 5 },
+      [MINT_B]: { price: "100000000", expo: -8, publishTime: NOW - 5 },
+    });
+    expect(calls[0]!.url).toBe(`https://hermes${n}.example/v2/updates/price/latest?ids[]=${FEED_A}&ids[]=${FEED_B}&parsed=true`);
+    expect((calls[0]!.init.headers as Record<string, string>).authorization).toBe(`Bearer ${PKEY}`);
+  });
+
+  it("is a 503 for each failed check, never a fixed fallback", async () => {
+    at(NOW);
+    const cases: (() => Response)[] = [
+      () => new Response("down", { status: 500 }),
+      () => { throw new Error(`fetch failed ${PKEY}`); },
+      () => new Response("not json"),
+      () => Response.json({}),
+      hermes(feed(FEED_A)), // FEED_B missing
+      hermes(feed(FEED_A), feed(FEED_B, { publish_time: NOW - 61 })), // stale
+      hermes(feed(FEED_A), feed(FEED_B, { publish_time: NOW + 61 })), // future
+      hermes(feed(FEED_A), feed(FEED_B, { price: "0" })),
+      hermes(feed(FEED_A), feed(FEED_B, { price: "-5" })),
+      hermes(feed(FEED_A), feed(FEED_B, { conf: "150000001" })), // over 100 bps of 150e8
+      hermes(feed(FEED_A), feed(FEED_B, { price: 15 })),
+      hermes(feed(FEED_A), feed(FEED_B), feed("ff".repeat(32), { publish_time: NOW - 999 })), // any bad feed fails all
+    ];
+    for (const [i, c] of cases.entries()) {
+      mockFetch(c);
+      const { res, body } = await call(req("/api/prices"), pythEnv());
+      expect(res.status, `case ${i}`).toBe(503);
+      expect(body.error).toBeTypeOf("string");
+      expect(body[MINT_A]).toBeUndefined();
+    }
+    mockFetch(hermes(feed(FEED_A), feed(FEED_B, { conf: "150000000", publish_time: NOW + 60 }))); // edges pass
+    expect((await call(req("/api/prices"), pythEnv())).res.status).toBe(200);
+  });
+
+  it("caches for 5 s and re-checks age on every read", async () => {
+    const e = pythEnv();
+    const clock = at(NOW);
+    mockFetch(hermes(feed(FEED_A, { publish_time: NOW - 58 }), feed(FEED_B, { publish_time: NOW - 58 })));
+    await call(req("/api/prices"), e);
+    clock.mockReturnValue((NOW + 1) * 1000);
+    await call(req("/api/prices"), e);
+    expect(calls).toHaveLength(1);
+    clock.mockReturnValue((NOW + 3) * 1000); // still inside 5 s but now 61 s old: fetched again
+    await call(req("/api/prices"), e);
+    expect(calls).toHaveLength(2);
   });
 });

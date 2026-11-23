@@ -18,7 +18,15 @@ export interface Env {
   MAX_TTL_SECS?: string | number;
   REFERENCE?: unknown;
   FAUCET?: string;
+  PAUSED?: string;
+  PYTH_API_KEY?: string;
+  PYTH_URL?: string;
+  PYTH_FEEDS?: unknown;
+  PYTH_MAX_AGE_SECS?: string | number;
+  PYTH_MAX_CONF_BPS?: string | number;
   RPC_LIMIT?: RateLimit;
+  SPR_LIMIT?: RateLimit;
+  PROVE_LIMIT?: RateLimit;
   QUOTE_LIMIT?: RateLimit;
   FAUCET_LIMIT?: RateLimit;
 }
@@ -26,6 +34,10 @@ export interface Env {
 const RPC_BODY_CAP = 64 * 1024;
 // 1 MiB plus the TEE envelope (nonce 12 + status 2 + GCM tag 16) the SDK allows on top.
 const SPR_CAP = 1024 * 1024 + 64;
+// The SDK's own indexer limit (dist/api/index.js MAX_BODY_BYTES).
+const INDEXER_RESPONSE_CAP = 10 * 1024 * 1024;
+const PRICE_CACHE_MS = 5000;
+const HERMES_TIMEOUT_MS = 5000;
 const SMALL_BODY_CAP = 4 * 1024;
 const DEALER_TIMEOUT_MS = 3000;
 const FAUCET_TIMEOUT_MS = 15000;
@@ -90,9 +102,14 @@ export default {
       if (path === "/api/config") return only(request, "GET") ?? json(config(env));
       if (path === "/api/rpc") return only(request, "POST") ?? (await limit(env.RPC_LIMIT, request), await rpc(request, env));
       if (path === "/api/tee-policy") return only(request, "GET") ?? (await limit(env.RPC_LIMIT, request), await teePolicy(env));
-      if (path === "/api/quotes") return only(request, "POST") ?? (await limit(env.QUOTE_LIMIT, request), await quotes(request, env));
+      if (path === "/api/prices") return only(request, "GET") ?? (await limit(env.RPC_LIMIT, request), json(await prices(env)));
+      if (path === "/api/quotes") {
+        if (env.PAUSED === "1") throw new Fail(503, "Swaps are paused.");
+        return only(request, "POST") ?? (await limit(env.QUOTE_LIMIT, request), await quotes(request, env));
+      }
       if (path === "/api/faucet") {
         if (env.FAUCET !== "1") throw new Fail(404, "Not found.");
+        if (env.PAUSED === "1") throw new Fail(503, "Swaps are paused.");
         return only(request, "POST") ?? (await limit(env.FAUCET_LIMIT, request), await faucet(request, env));
       }
       if (path.startsWith("/v1/spr/")) return await spr(request, env, url);
@@ -157,14 +174,126 @@ function config(env: Env) {
     rpcPath: "/api/rpc",
     sprPath: "/v1/spr",
     programId: env.PROGRAM_ID ?? null,
-    assets: parsed(env.ASSETS ?? [], "ASSETS"),
+    assets: assets(env),
     dealers: dealers(env).map((d) => ({ pubkey: d.pubkey })),
     bandBps: Number(env.BAND_BPS ?? 0),
     minTtlSecs: Number(env.MIN_TTL_SECS ?? 0),
     maxTtlSecs: Number(env.MAX_TTL_SECS ?? 0),
-    reference: parsed(env.REFERENCE ?? {}, "REFERENCE"),
     faucet: env.FAUCET === "1",
+    paused: env.PAUSED === "1",
   };
+}
+
+type Asset = { mint: string; symbol: string; decimals: number; maxSell?: string };
+
+function assets(env: Env): Asset[] {
+  const list = parsed(env.ASSETS ?? [], "ASSETS");
+  const ok = (a: Asset) =>
+    isAddress(a?.mint) && typeof a.symbol === "string" && Number.isInteger(a.decimals) && (a.maxSell === undefined || isAmount(a.maxSell));
+  if (!Array.isArray(list) || !list.every(ok)) throw new Fail(500, "The server setting ASSETS is malformed.");
+  return list;
+}
+
+// ---- /api/prices ----
+
+type Quoted = { price: string; expo: number; publishTime: number };
+let priceCache: { key: string; at: number; prices: Record<string, Quoted> } | undefined;
+
+function limitVar(value: string | number | undefined, name: string): number {
+  const n = Number(value);
+  if (value === undefined || value === "" || !Number.isSafeInteger(n) || n < 0) throw new Fail(500, `The server setting ${name} is missing or not a whole number.`);
+  return n;
+}
+
+async function prices(env: Env): Promise<Record<string, Quoted>> {
+  const now = Math.floor(Date.now() / 1000);
+  const feedsRaw = parsed(env.PYTH_FEEDS ?? {}, "PYTH_FEEDS");
+  if (typeof feedsRaw !== "object" || feedsRaw === null || Array.isArray(feedsRaw)) throw new Fail(500, "The server setting PYTH_FEEDS is malformed.");
+  const feeds: Record<string, string> = {};
+  for (const [mint, id] of Object.entries(feedsRaw)) {
+    const norm = typeof id === "string" ? id.replace(/^0x/, "").toLowerCase() : "";
+    if (!isAddress(mint) || !/^[0-9a-f]{64}$/.test(norm)) throw new Fail(500, "The server setting PYTH_FEEDS is malformed.");
+    feeds[mint] = norm;
+  }
+  if (env.NETWORK === "mainnet") {
+    const missing = assets(env).find((a) => feeds[a.mint] === undefined);
+    if (missing) throw new Fail(500, `No Pyth feed is configured for ${missing.symbol} (${missing.mint}); mainnet needs one for every asset.`);
+  }
+  const reference = parsed(env.REFERENCE ?? {}, "REFERENCE") as Record<string, { price: unknown; expo: unknown }>;
+  const out: Record<string, Quoted> = {};
+  for (const [mint, r] of Object.entries(reference ?? {})) {
+    if (feeds[mint] !== undefined || env.NETWORK === "mainnet") continue;
+    out[mint] = { price: String(r?.price), expo: Number(r?.expo), publishTime: now };
+  }
+  if (Object.keys(feeds).length === 0) return out;
+  return { ...out, ...(await pyth(env, feeds, now)) };
+}
+
+async function pyth(env: Env, feeds: Record<string, string>, now: number): Promise<Record<string, Quoted>> {
+  if (!env.PYTH_API_KEY) throw new Fail(500, "PYTH_FEEDS is set but the PYTH_API_KEY secret is missing.");
+  const maxAge = limitVar(env.PYTH_MAX_AGE_SECS, "PYTH_MAX_AGE_SECS");
+  const maxConf = limitVar(env.PYTH_MAX_CONF_BPS, "PYTH_MAX_CONF_BPS");
+  const base = (env.PYTH_URL ?? "https://hermes.pyth.network").replace(/\/+$/, "");
+  const key = JSON.stringify([base, feeds]);
+  // Age is re-checked on every read; a cached price that went stale is fetched again.
+  const fresh = (p: Record<string, Quoted>) => Object.values(p).every((q) => now - q.publishTime <= maxAge);
+  if (priceCache?.key === key && Date.now() - priceCache.at < PRICE_CACHE_MS && fresh(priceCache.prices)) return priceCache.prices;
+
+  const ids = [...new Set(Object.values(feeds))];
+  const url = `${base}/v2/updates/price/latest?${ids.map((id) => `ids[]=${id}`).join("&")}&parsed=true`;
+  let text: string;
+  try {
+    const response = await fetch(url, { headers: { authorization: `Bearer ${env.PYTH_API_KEY}` }, redirect: "manual", signal: AbortSignal.timeout(HERMES_TIMEOUT_MS) });
+    const bytes = response.ok ? await readCapped(response.body, 256 * 1024) : null;
+    if (bytes === null) throw new Error();
+    text = new TextDecoder().decode(bytes);
+  } catch {
+    throw new Fail(503, "Live prices are unavailable right now. Try again shortly.");
+  }
+  const byId = checkHermes(text, now, maxAge, maxConf);
+  const result: Record<string, Quoted> = {};
+  for (const [mint, id] of Object.entries(feeds)) {
+    const q = byId.get(id);
+    if (q === undefined) throw new Fail(503, `The price feed for ${mint} is missing from Pyth's reply.`);
+    result[mint] = q;
+  }
+  priceCache = { key, at: Date.now(), prices: result };
+  return result;
+}
+
+const I64_MAX = (1n << 63n) - 1n;
+
+// Port of core::price::parse_hermes plus the future-timestamp check of cli/src/config.rs
+// hermes_prices: any bad feed in the reply fails the whole call.
+export function checkHermes(text: string, now: number, maxAge: number, maxConfBps: number): Map<string, Quoted> {
+  const fail = (why: string): never => {
+    throw new Fail(503, `Live prices failed a safety check: ${why}.`);
+  };
+  let reply: { parsed?: unknown };
+  try {
+    reply = JSON.parse(text);
+  } catch {
+    return fail("the reply is not JSON");
+  }
+  if (!Array.isArray(reply?.parsed)) return fail("the reply has no parsed feeds");
+  const out = new Map<string, Quoted>();
+  for (const feed of reply.parsed as { id?: unknown; price?: Record<string, unknown> }[]) {
+    if (typeof feed?.id !== "string" || typeof feed.price !== "object" || feed.price === null) return fail("a feed is malformed");
+    const id = feed.id.replace(/^0x/, "").toLowerCase();
+    const { price, conf, expo, publish_time: published } = feed.price;
+    if (typeof price !== "string" || !/^[+-]?[0-9]{1,19}$/.test(price) || BigInt(price) > I64_MAX) return fail(`feed ${id} has a bad price`);
+    if (typeof conf !== "string" || !/^\+?[0-9]{1,20}$/.test(conf) || BigInt(conf) > U64_MAX) return fail(`feed ${id} has a bad confidence`);
+    if (!Number.isInteger(expo) || Math.abs(expo as number) > 2 ** 31) return fail(`feed ${id} has a bad exponent`);
+    if (!Number.isSafeInteger(published)) return fail(`feed ${id} has a bad publish time`);
+    const p = BigInt(price);
+    const t = published as number;
+    if (t > now + maxAge) return fail(`feed ${id} is published in the future`);
+    if (now - t > maxAge) return fail(`feed ${id} is stale (published ${now - t} s ago, max ${maxAge} s)`);
+    if (p <= 0n) return fail(`feed ${id} has a non-positive price`);
+    if (BigInt(conf) * 10_000n > p * BigInt(maxConfBps)) return fail(`feed ${id} is too uncertain (confidence wider than ${maxConfBps} bps)`);
+    out.set(id, { price: p.toString(), expo: expo as number, publishTime: t });
+  }
+  return out;
 }
 
 // ---- upstreams ----
@@ -268,6 +397,9 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
   if (!isIndexer && !isProver) throw new Fail(404, "Not found.");
   const allowed = isIndexer ? request.method === "POST" : PROVER.some(([m, re]) => m === request.method && re.test(sub));
   if (!allowed) throw new Fail(405, "This method is not allowed for this route.");
+  // A proof POST costs Helius credits; status polls and the rest use the indexer limit.
+  const proving = request.method === "POST" && sub.startsWith("/prove/");
+  await limit(proving ? env.PROVE_LIMIT : env.SPR_LIMIT, request);
 
   const headers = new Headers();
   for (const name of SPR_REQUEST_HEADERS) {
@@ -287,9 +419,10 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
   const target = withKey(base.replace(/\/+$/, "") + sub, env, url.search.slice(1));
   const response = await upstream(target, { method: request.method, headers, body });
 
+  const cap = isIndexer ? INDEXER_RESPONSE_CAP : SPR_CAP;
   const length = Number(response.headers.get("content-length") ?? 0);
-  const bytes = length > SPR_CAP ? null : await readCapped(response.body, SPR_CAP);
-  if (bytes === null) throw new Fail(502, "The upstream reply is larger than 1 MiB.");
+  const bytes = length > cap ? null : await readCapped(response.body, cap);
+  if (bytes === null) throw new Fail(502, `The upstream reply is larger than ${isIndexer ? 10 : 1} MiB.`);
   if (env.HELIUS_API_KEY && new TextDecoder().decode(bytes).includes(env.HELIUS_API_KEY)) {
     throw new Fail(502, "The upstream service returned an error.");
   }
@@ -364,8 +497,9 @@ async function quotes(request: Request, env: Env): Promise<Response> {
       try {
         const bytes = response?.ok ? await readCapped(response.body, SMALL_BODY_CAP) : null;
         const q = bytes && JSON.parse(new TextDecoder().decode(bytes))?.quote;
-        if (isAmount(q?.buy_amount) && Number.isSafeInteger(q.expiry) && q.expiry >= 0) {
-          quote = { buy_amount: q.buy_amount, expiry: q.expiry };
+        // The signature is checked for shape only; the browser verifies it against the dealer key.
+        if (isAmount(q?.buy_amount) && Number.isSafeInteger(q.expiry) && q.expiry >= 0 && typeof q.signature === "string" && /^[0-9a-f]{128}$/.test(q.signature)) {
+          quote = { buy_amount: q.buy_amount, expiry: q.expiry, signature: q.signature };
         }
       } catch {}
       return { dealer: d.pubkey, quote };

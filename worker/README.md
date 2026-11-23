@@ -7,12 +7,13 @@ network peer, so the Helius key and the dealer key never reach the browser.
 
 | Route | Method | What it does |
 | --- | --- | --- |
-| `/api/config` | GET | Public config: `{network, rpcPath, sprPath, programId, assets, dealers:[{pubkey}], bandBps, minTtlSecs, maxTtlSecs, reference, faucet}` |
+| `/api/config` | GET | Public config: `{network, rpcPath, sprPath, programId, assets:[{mint,symbol,decimals,maxSell?}], dealers:[{pubkey}], bandBps, minTtlSecs, maxTtlSecs, faucet, paused}` |
+| `/api/prices` | GET | `{[mint]: {price: "<int>", expo, publishTime}}` from Pyth Hermes when `PYTH_FEEDS` is set, otherwise the fixed `REFERENCE` values stamped now |
 | `/api/rpc` | POST | Solana JSON-RPC proxy. Method allowlist, batches checked per element, 64 KiB body cap |
-| `/v1/spr/*` | GET, POST | Helius Privacy Rings indexer and TEE prover proxy. Exact path allowlist, 1 MiB caps |
+| `/v1/spr/*` | GET, POST | Helius Privacy Rings indexer and TEE prover proxy. Exact path allowlist, 1 MiB request cap, response cap 10 MiB (indexer) / 1 MiB (prover) |
 | `/api/tee-policy` | GET | The signed TEE policy for `devnet`/`mainnet` (the browser checks the signatures). 404 on `local` |
-| `/api/quotes` | POST | `{sell_mint, buy_mint, sell_amount, trader}` sent to every dealer's `/quote` (3 s each) → `[{dealer, quote\|null}]` |
-| `/api/faucet` | POST | `{wallet}` sent to the first dealer's `/faucet`. 404 unless `FAUCET` is `"1"` |
+| `/api/quotes` | POST | `{sell_mint, buy_mint, sell_amount, trader}` sent to every dealer's `/quote` (3 s each) → `[{dealer, quote: {buy_amount, expiry, signature}\|null}]`. A signature that is not 128 lowercase hex makes the quote `null`; the Worker never verifies it. 503 while paused |
+| `/api/faucet` | POST | `{wallet}` sent to the first dealer's `/faucet`. 404 unless `FAUCET` is `"1"`; 503 while paused |
 | everything else | | Static files. HTML gets the CSP, `nosniff` and `no-referrer`; `/assets/*-<hash>.*` is cached for a year |
 
 Allowed RPC methods: `getAccountInfo getMultipleAccounts getProgramAccounts getLatestBlockhash
@@ -48,14 +49,26 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `PROGRAM_ID` | var | Swap program ID |
 | `ASSETS` | var | JSON `[{"mint","symbol","decimals"}]` |
 | `BAND_BPS`, `MIN_TTL_SECS`, `MAX_TTL_SECS` | var | Numbers |
-| `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}` |
+| `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}`: fixed prices for mints without a Pyth feed. Ignored on `mainnet` |
 | `FAUCET` | var | `"1"` turns on `/api/faucet` |
+| `PAUSED` | var | `"1"` stops `/api/quotes` and `/api/faucet` (503); everything else keeps working |
+| `PYTH_API_KEY` | secret | Hermes key, sent as `Authorization: Bearer` |
+| `PYTH_FEEDS` | var | JSON `{"<mint>":"<feed id hex>"}` |
+| `PYTH_URL` | var | Hermes base URL. Default `https://hermes.pyth.network` |
+| `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_FEEDS`. A feed older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
+
+Prices: Hermes is asked for `/v2/updates/price/latest?ids[]=…&parsed=true` (as the CLI does),
+checked as `core::price::parse_hermes` and `cli/src/config.rs` do, and cached for 5 s per
+isolate; the age is re-checked on every read. A Hermes failure is a 503, never the fixed values.
+On `mainnet` every asset in `ASSETS` needs a feed, or `/api/prices` is a 500.
 
 A path below `/v1/spr` is appended to the chosen base, so `/v1/spr/getUserRecords` goes to
 `<UPSTREAM_INDEXER>/getUserRecords` and `/v1/spr/prove/x` to `<UPSTREAM_PROVER>/prove/x`.
 
-Rate limits per client IP (bindings in `wrangler.jsonc`): `RPC_LIMIT` 600/min (RPC, `/v1/spr`,
-TEE policy), `QUOTE_LIMIT` 30/min, `FAUCET_LIMIT` 3/min. Without a binding there is no limit.
+Rate limits per client IP (bindings in `wrangler.jsonc`): `RPC_LIMIT` 600/min (RPC, TEE policy,
+prices), `SPR_LIMIT` 600/min (indexer calls and prover GETs, including proof status polls),
+`PROVE_LIMIT` 5/min (POST `/prove/*`, 1,000 Helius credits each), `QUOTE_LIMIT` 30/min,
+`FAUCET_LIMIT` 3/min. Without a binding there is no limit.
 
 ## Run locally against a local network
 
@@ -67,7 +80,7 @@ NETWORK=local
 DEALER_KEY=replace-with-the-dealer-key
 DEALERS=[{"url":"http://127.0.0.1:<dealer-http-port>","pubkey":"REPLACE_WITH_DEALER_PUBKEY"}]
 PROGRAM_ID=REPLACE_WITH_PROGRAM_ID
-ASSETS=[{"mint":"REPLACE_MINT_A","symbol":"tUSD","decimals":6},{"mint":"REPLACE_MINT_B","symbol":"tSOL","decimals":9}]
+ASSETS=[{"mint":"REPLACE_MINT_A","symbol":"tUSD","decimals":6,"maxSell":"1000000000"},{"mint":"REPLACE_MINT_B","symbol":"tSOL","decimals":9}]
 BAND_BPS=100
 MIN_TTL_SECS=120
 MAX_TTL_SECS=600
@@ -92,6 +105,7 @@ npx tsc --noEmit
 cd ../web && pnpm build && cd ../worker
 npx wrangler secret put HELIUS_API_KEY
 npx wrangler secret put DEALER_KEY
+npx wrangler secret put PYTH_API_KEY   # only with PYTH_FEEDS
 npx wrangler deploy --var NETWORK:devnet --var FAUCET:1 \
   --var DEALERS:'[{"url":"https://<tunnel>","pubkey":"<pubkey>"}]' \
   --var PROGRAM_ID:<id> --var ASSETS:'[...]' --var REFERENCE:'{...}' \
