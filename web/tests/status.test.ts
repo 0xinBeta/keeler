@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refundRefusal, type ChainReads, type SignatureState } from "../src/keeler/status";
+import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refreshAll, refundRefusal, type ChainReads, type SignatureState } from "../src/keeler/status";
 import type { OrderRecord } from "../src/keeler/storage";
 import type { ChainStatus } from "../src/keeler/swap";
 
@@ -45,6 +45,12 @@ describe("a pending order", () => {
 
   it("confirmed after its expiry is refundable, not failed", async () => {
     expect((await nextRecord(record(), EXPIRY + 1, chain({ height: 900n, sig: confirmed, spend: "open" }))).status).toBe("refundable");
+  });
+
+  it("with an error seen only at processed level stays pending (a dropped fork), and locks if it later confirms", async () => {
+    const forked = await nextRecord(record(), 10, chain({ height: 100n, sig: { err: { InstructionError: [0, "x"] }, confirmationStatus: "processed" } }));
+    expect(forked.status).toBe("pending");
+    expect((await nextRecord(forked, 10, chain({ height: 120n, sig: confirmed, spend: "open" }))).status).toBe("locked");
   });
 
   it("stays pending while processed but not confirmed", async () => {
@@ -103,6 +109,20 @@ describe("a locked order", () => {
       const r = record({ status });
       expect(await nextRecord(r, EXPIRY + 1, chain({}))).toBe(r);
     }
+  });
+});
+
+describe("listing orders", () => {
+  it("returns the stored records unchanged when chain time cannot be read", async () => {
+    const stored = [record({ id: "a", status: "locked" }), record({ id: "b", status: "refundable" })];
+    const out = await refreshAll(stored, () => Promise.reject(new Error("RPC down")), () => Promise.reject(new Error("not reached")));
+    expect(out).toEqual(stored);
+  });
+  it("keeps each record whose own read fails, and refreshes the rest", async () => {
+    const a = record({ id: "a", status: "locked" });
+    const b = record({ id: "b", status: "locked" });
+    const out = await refreshAll([a, b], async () => EXPIRY + 1, (r, now) => (r.id === "a" ? Promise.reject(new Error("indexer down")) : nextRecord(r, now, chain({ spend: "open" }))));
+    expect(out.map((r) => [r.id, r.status])).toEqual([["a", "locked"], ["b", "refundable"]]);
   });
 });
 
