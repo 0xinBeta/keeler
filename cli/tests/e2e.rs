@@ -18,6 +18,8 @@ use keeler::{
         Asset, Common, DealerConfig, DealerRef, Http, KeySource, Network, PriceSource, TraderConfig,
     },
     dealer,
+    deploy::{self, Plan, PlanToken},
+    faucet,
     trader::{self, fair_amount, sign_quote, signed_by, Outcome},
 };
 use keeler_core::{
@@ -27,7 +29,8 @@ use keeler_core::{
 use solana_address::Address;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
-use spr_client::{ComputeBudgetConfig, Rpc};
+use spr_client::{ComputeBudgetConfig, Rpc, SolanaRpc};
+use spr_interface::pda;
 use spr_program::instruction::{AssetDeposit, Deposit};
 use spr_program_test::{
     fixture,
@@ -218,6 +221,10 @@ fn spawn_dealer_with(net: &Net, test: u16, actor: u8, t: Terms, http: Option<Htt
         pause_file: None,
         settle_tolerance_bps: 0,
         limits: Vec::new(),
+        program_id: swap_program::ID.to_string(),
+        pubkey: Some(fixture::actor(actor).pubkey().to_string()),
+        auto_pause_after: None,
+        min_fee_lamports: None,
     };
     cfg.check().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -528,4 +535,101 @@ fn http_quote_settles() {
         (before.0 - amount, before.1 + buy_amount)
     );
     d1.stop();
+}
+
+#[test]
+fn deploy_tool_is_idempotent() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let net = start(9);
+    let file = |name: &str, kp: &Keypair| {
+        let path = net.keys.join(format!("{name}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_string(&kp.to_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
+        KeySource::File(path)
+    };
+    let seeded = |name: &str, seed: u8| file(name, &Keypair::new_from_array([seed; 32]));
+    let payer = fixture::payer();
+    let plan = Plan {
+        network: net.network(),
+        genesis_hash: None,
+        deploy_key: file("deploy", &payer),
+        program_key: seeded("program", 41),
+        buffer_key: seeded("buffer", 42),
+        program_so: env_path("KEELER_SWAP_PROGRAM_SO"),
+        dealer_key: seeded("dealer", 43),
+        faucet_key: seeded("faucet", 44),
+        dealer_lamports: 500_000_000,
+        faucet_lamports: 2_500_000_000,
+        tokens: vec![
+            PlanToken {
+                symbol: "tUSD".into(),
+                decimals: 6,
+                key: seeded("tusd", 45),
+                inventory: 1_000_000_000_000,
+            },
+            PlanToken {
+                symbol: "tSOL".into(),
+                decimals: 9,
+                key: seeded("tsol", 46),
+                inventory: 10_000_000_000_000,
+            },
+        ],
+    };
+    let rpc = SolanaRpc::new(net.ports.rpc_url());
+    let key = |k: &KeySource| k.keypair().unwrap();
+    let (program, buffer) = (key(&plan.program_key), key(&plan.buffer_key));
+    let so = std::fs::read(&plan.program_so).unwrap();
+
+    // A deploy that stopped after five buffer writes resumes from there.
+    deploy::deploy_program(&rpc, &payer, &program, &buffer, &so, Some(5)).unwrap();
+    let first = deploy::setup(&plan).unwrap();
+    assert_eq!(first.program_id, program.pubkey().to_string());
+    assert!(
+        rpc.get_account(buffer.pubkey()).unwrap().is_none(),
+        "the deploy closed the buffer"
+    );
+
+    let dealer = key(&plan.dealer_key);
+    let faucet_key = key(&plan.faucet_key);
+    let balances = || {
+        [payer.pubkey(), dealer.pubkey(), faucet_key.pubkey()].map(|a| rpc.get_balance(a).unwrap())
+    };
+    let before = balances();
+    assert_eq!(deploy::setup(&plan).unwrap(), first);
+    assert_eq!(balances(), before, "a rerun sends nothing");
+
+    let mints: Vec<Address> = first
+        .mints
+        .iter()
+        .map(|(_, m, _)| m.parse().unwrap())
+        .collect();
+    let chain = Chain::connect(&net.network(), &mints).unwrap();
+    let kp = shielded(&dealer).unwrap();
+    for (mint, t) in mints.iter().zip(&plan.tokens) {
+        assert_eq!(
+            chain.balance(&kp, *mint).unwrap(),
+            t.inventory,
+            "{}",
+            t.symbol
+        );
+        assert_eq!(chain.mint_decimals(*mint).unwrap(), t.decimals);
+        let ata = pda::associated_token_address(&dealer.pubkey(), mint);
+        let data = rpc.get_account(ata).unwrap().unwrap().data;
+        assert_eq!(&data[64..72], &0u64.to_le_bytes(), "all deposited");
+    }
+
+    // The authority handoff refuses a missing or non-system account.
+    let new = Keypair::new_from_array([47; 32]).pubkey();
+    assert!(deploy::set_upgrade_authority(&rpc, &payer, &program.pubkey(), &new).is_err());
+    assert!(deploy::set_upgrade_authority(&rpc, &payer, &program.pubkey(), &mints[0]).is_err());
+    let ixs = faucet::instructions(&payer.pubkey(), &new, &[], 1_000_000);
+    deploy::send(&rpc, &ixs, &payer, &[&payer]).unwrap();
+    deploy::set_upgrade_authority(&rpc, &payer, &program.pubkey(), &new).unwrap();
+    assert_eq!(
+        deploy::upgrade_authority(&rpc, &program.pubkey()).unwrap(),
+        Some(new)
+    );
 }

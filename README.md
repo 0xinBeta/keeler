@@ -109,20 +109,40 @@ binary finds the proving keys (`SWAP_KEYS_DIR`).
   on `47500+offset` with `x-keeler-key: keeler-localnet-dealer-key`, faucet
   on. Prints and writes `target/localnet/keeler-web.json` (and
   `keeler-web-<offset>.json`). Fixture test keys only.
-- `scripts/deploy-devnet.sh` (refuses any cluster but devnet),
-  `scripts/run-dealer.sh` (restarts the dealer and the tunnel with backoff,
-  rewrites the Worker's `DEALERS` when the tunnel URL changes) and
-  `scripts/set-upgrade-authority.sh <program> <new-authority>`: devnet
+- `scripts/deploy-devnet.sh`, `scripts/run-dealer.sh` and
+  `scripts/set-upgrade-authority.sh <program> <new-authority> [plan]`: devnet
   deployment, the dealer behind a quick tunnel, and the authority handoff.
-  Not run until the owner approves publishing the example's code.
+  Not run until the owner approves publishing the example's code. All three
+  pass their output through a filter that replaces `api-key=<value>`.
+  - `deploy-devnet.sh` creates the missing Keychain items, rebuilds `.tools`
+    for the devnet program ID (then prints the command that restores the
+    example's ID for local tests), writes `target/devnet/deploy-plan.json`
+    (Keychain names only) and runs the deploy tool, `cargo run --release -p
+    keeler --example deploy -- setup <plan>`. The tool reads every key from
+    the Keychain, refuses a cluster whose genesis hash is not the plan's, and
+    checks chain state before each step: funds the dealer and faucet to their
+    targets, deploys with the upgradeable loader through a buffer whose
+    keypair is the Keychain item `keeler-devnet-buffer` (a rerun after a
+    failure skips the chunks already written and checks the deployed bytes),
+    creates the mints and their pool interfaces, mints only the inventory
+    shortfall and deposits it. After any failure, run the script again. It
+    writes `target/devnet/deploy-summary.json` and `dealer-config.json`.
+  - `run-dealer.sh` refuses unless `.tools` is built for the config's
+    `program_id`, restarts the dealer and the tunnel with backoff, and
+    rewrites the Worker's `DEALERS` (backing off on failure) when the
+    `*-*.trycloudflare.com` URL changes.
+  - `set-upgrade-authority.sh` hands the authority to an existing
+    system-owned account after you type its address again.
 - Dealer HTTP (loopback only, every request carries `x-keeler-key`, 4 KiB
   body cap), amounts as decimal strings:
   `POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` ->
   `{"quote":{"buy_amount","expiry","signature"}}` or `{"error":"no quote"}`;
   `POST /faucet` `{"wallet"}` -> `{"ok":true}` or `{"error"}` (404 off,
-  429 over a limit, 502 transfer failed); `GET /health` ->
-  `{"ok":true,"now":<chain time>}`. 401 bad key, 403 not loopback, 413 body
-  too large, 400 bad request.
+  429 over a limit, 409 the faucet is out of SOL, 502 transfer failed);
+  `GET /health` -> `{"ok":true,"now":<chain time>}`. 401 bad key, 403 not
+  loopback, 413 body too large (refused from `Content-Length` before
+  reading), 400 bad request or chunked body, 408 when the request takes
+  over 3 s. One request per connection (`Connection: close`).
 - Quote signature: Ed25519 by the dealer's key over 167 bytes,
   `"keeler-quote-v1"`, then program ID, sell mint, buy mint, trader (32
   bytes each), then sell amount, buy amount, expiry (u64 little-endian);
@@ -151,8 +171,16 @@ and pays the fee SOL, and the limits count claims per UTC day. Also:
 new quotes; bound orders still settle); `"settle_tolerance_bps"` (default 0;
 a failed price fetch settles nothing that poll); and `"limits": [{"mint",
 "max_sell_amount", "hourly_sell_cap"}]` on what traders sell the dealer per
-order and per rolling hour of bound orders (the hourly count restarts with
-the dealer).
+order and per rolling hour of bound orders. The state file also keeps the
+faucet counts and the hourly sell window; on reload, quotes not signed by
+this dealer's key are dropped. Required: `"program_id"`, the swap program the
+binary was built for (the dealer refuses to start on a mismatch). Optional:
+`"pubkey"` (checked against `key`), `"auto_pause_after"` (default 3
+consecutive failed settles write `<state_file>.autopaused`, which stops new
+quotes until a settle succeeds or you delete it) and `"min_fee_lamports"` (no
+quotes while the dealer has less fee SOL; default 0.01 SOL). With the Helius
+prover, `rpc_url` and `indexer_url` must be Helius hosts. A panic in any
+dealer thread ends the process so the supervisor restarts it.
 
 `key` is `{"file": "<keypair.json>"}` for local test keys or
 `{"keychain": "<name>"}`, read with `security find-generic-password -s <name>
@@ -203,7 +231,8 @@ Dealer:
   "listen": "127.0.0.1:47001",
   "spread_bps": 10,
   "quote_ttl_secs": 30,
-  "settle_margin_secs": 5
+  "settle_margin_secs": 5,
+  "program_id": "F4hjig5RJbXW6vrgYaMcuWzR55kZF6tbKyf8c36nrtvU"
 }
 ```
 
@@ -218,11 +247,17 @@ cargo fmt -p keeler-core -p keeler -- --check
 ```
 
 The end-to-end tests start their own local network per test, the way the
-example's tests do, and fund one trader and three dealers.
+example's tests do, and fund one trader and three dealers; one runs the
+deploy tool twice (after a deploy stopped mid-buffer) and checks the rerun
+sends nothing. The fixtures test skips, with a note, on a build for another
+program ID. `cargo test -p keeler --test devnet_probe -- --ignored` is a
+read-only devnet simulation (no transaction is sent).
 
 ## Known limits
 
-- Local network only: the swap program's test keys let anyone forge proofs.
+- The swap program's test proving keys come from a fixed public seed, so
+  anyone can forge its proofs. On devnet, assume any open order can be taken
+  by anyone: devnet test tokens only, never real value.
 - The upstream prover listens on `0.0.0.0:3001`, every interface, not just
   loopback. Keeler does not change it.
 - The quote protocol is plain text on loopback, with no TLS.

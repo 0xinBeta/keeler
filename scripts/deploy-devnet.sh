@@ -1,152 +1,145 @@
 #!/usr/bin/env bash
 # Deploys Keeler's build of the swap example to devnet and sets up the dealer.
 # NOT TO BE RUN until the owner approves publishing the example's code (see
-# the mainnet gates in docs/plan-web.md). Idempotent: every step checks what
-# is already there.
+# the mainnet gates in docs/plan-web.md). Safe to rerun after any failure:
+# every step checks what is already on chain and resumes.
 #
 # 1. Creates these Keychain items if absent (Solana keypair JSON arrays, plus
-#    a random HTTP key): keeler-devnet-deploy, keeler-devnet-program,
+#    a random HTTP key): keeler-devnet-program, keeler-devnet-buffer,
 #    keeler-devnet-dealer, keeler-devnet-faucet, keeler-devnet-tusd-mint,
-#    keeler-devnet-tsol-mint, keeler-devnet-dealer-http-key. Keys are read
-#    by process substitution, never written to a file.
-# 2. Funds the deploy key by airdrop, the dealer and faucet keys from it.
-# 3. Builds with our program ID (scripts/setup.sh) and deploys the program.
-# 4. Creates tUSD and tSOL (faucet key is the mint authority) and their pool
-#    interfaces, and deposits the dealer's inventory, once.
-# 5. Writes target/devnet/dealer-config.json, which names only Keychain items.
+#    keeler-devnet-tsol-mint, keeler-devnet-dealer-http-key. The funded
+#    keeler-devnet-deploy must already exist.
+# 2. Rebuilds the swap example with our program ID (scripts/setup.sh; this
+#    changes the shared .tools build, see the restore line it prints).
+# 3. Runs the deploy tool (cli/examples/deploy.rs), which reads every key
+#    from the Keychain itself, refuses any cluster whose genesis is not
+#    devnet's, funds the dealer and faucet, deploys through a resumable
+#    buffer, creates tUSD and tSOL and their pool interfaces, and deposits
+#    the dealer's inventory.
+# 4. Writes target/devnet/dealer-config.json, which names only Keychain items.
 #
-# Needs: solana, spl-token, security (macOS), and the Helius key in the
+# Needs: security (macOS), openssl, python3, and the Helius key in the
 # Keychain item keeler-helius-api-key (a full Helius URL or a bare key).
 set -euo pipefail
+
+# Nothing here should print the Helius key; this catches it if a tool does.
+redact() { perl -pe 'BEGIN { $| = 1 } s/api-key=[^&"\s]+/api-key=REDACTED/g'; }
+exec > >(redact) 2> >(redact >&2)
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 target=${CARGO_TARGET_DIR:-$root/target}
 out=$root/target/devnet
 mkdir -p "$out"
+example_id=F4hjig5RJbXW6vrgYaMcuWzR55kZF6tbKyf8c36nrtvU
 
 key() { security find-generic-password -s "$1" -w; }
 have() { security find-generic-password -s "$1" >/dev/null 2>&1; }
-# The secret goes to security on stdin, never on a command line.
+# The secret goes to security on stdin, never on a command line or in a file.
 store() { printf 'add-generic-password -s "%s" -a keeler -w "%s"\n' "$1" "$2" | security -i >/dev/null; }
-ensure_keypair() {
-    have "$1" && return
-    local json
-    json=$(solana-keygen new --no-bip39-passphrase --silent --force --outfile /dev/fd/3 3>&1 >/dev/null)
-    store "$1" "$json"
-    echo "created Keychain item $1" >&2
-}
-pubkey() { solana-keygen pubkey <(key "$1"); }
+build() { cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler --example deploy; }
+tool=$target/release/examples/deploy
 
-helius=$(key keeler-helius-api-key)
-if [[ $helius == https://* ]]; then
-    helius=$(sed -nE 's/.*[?&]api-key=([A-Za-z0-9-]+).*/\1/p' <<<"$helius")
-fi
-[[ $helius =~ ^[A-Za-z0-9-]+$ ]] || { echo "keeler-helius-api-key holds no usable key" >&2; exit 1; }
-# These hold the key: only ever passed as arguments or in the environment
-# (so they show in `ps` while a command runs), never echoed or written.
-rpc="https://devnet.helius-rpc.com/?api-key=$helius"
-spr="https://devnet.helius-rpc.com/v1/spr?api-key=$helius"
-unset helius
-# Devnet only: refuse any cluster whose genesis is not devnet's.
-devnet_genesis=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG
-[[ $(solana -u "$rpc" genesis-hash) == "$devnet_genesis" ]] || { echo "the RPC is not devnet; refusing" >&2; exit 1; }
-
-for item in deploy program dealer faucet tusd-mint tsol-mint; do
-    ensure_keypair "keeler-devnet-$item"
+have keeler-devnet-deploy || { echo "no Keychain item keeler-devnet-deploy; fund one and rerun" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$root/.tools/env"
+build
+for item in program buffer dealer faucet tusd-mint tsol-mint; do
+    if ! have "keeler-devnet-$item"; then
+        store "keeler-devnet-$item" "$("$tool" keygen)"
+        echo "created Keychain item keeler-devnet-$item" >&2
+    fi
 done
 have keeler-devnet-dealer-http-key || store keeler-devnet-dealer-http-key "$(openssl rand -hex 24)"
 
-deploy=$(pubkey keeler-devnet-deploy)
-program_id=$(pubkey keeler-devnet-program)
-dealer=$(pubkey keeler-devnet-dealer)
-faucet=$(pubkey keeler-devnet-faucet)
-echo "deploy $deploy, program $program_id, dealer $dealer, faucet $faucet" >&2
-
-sol() { solana -u "$rpc" "$@"; }
-lamports() { sol balance --lamports "$1" | awk '{print $1}'; }
-# Deploying the program costs about 0.65 SOL; devnet airdrops cap at 2 SOL.
-for _ in 1 2 3; do
-    (($(lamports "$deploy") >= 3000000000)) && break
-    sol airdrop 2 "$deploy" || { echo "airdrop refused; fund $deploy by hand and rerun" >&2; exit 1; }
-done
-(($(lamports "$deploy") >= 3000000000)) || { echo "fund $deploy to 3 SOL and rerun" >&2; exit 1; }
-for who in "$dealer" "$faucet"; do
-    if (($(lamports "$who") < 200000000)); then
-        sol transfer --from <(key keeler-devnet-deploy) --fee-payer <(key keeler-devnet-deploy) \
-            --allow-unfunded-recipient "$who" 0.5
-    fi
-done
+# The public key is bytes 32..64 of the keypair array, read from a pipe.
+program_id=$(key keeler-devnet-program | python3 -c '
+import json, sys
+b = bytes(json.load(sys.stdin))[32:64]
+n = int.from_bytes(b, "big")
+abc = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+s = ""
+while n:
+    n, r = divmod(n, 58)
+    s = abc[r] + s
+print("1" * (len(b) - len(b.lstrip(b"\0"))) + s)')
+[[ $program_id =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || { echo "keeler-devnet-program is not a keypair" >&2; exit 1; }
 
 KEELER_SWAP_PROGRAM_ID=$program_id "$root/scripts/setup.sh"
 # shellcheck source=/dev/null
 . "$root/.tools/env"
-if sol program show "$program_id" >/dev/null 2>&1; then
-    echo "program $program_id is already deployed" >&2
-else
-    sol program deploy --keypair <(key keeler-devnet-deploy) \
-        --program-id <(key keeler-devnet-program) "$KEELER_SWAP_PROGRAM_SO"
-fi
+build
 
-cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler --example spl_interface
-spl() { spl-token -u "$rpc" --fee-payer <(key keeler-devnet-deploy) "$@"; }
-mint_tusd="" mint_tsol=""
-for t in tusd:6:1000000000000 tsol:9:10000000000000; do
-    IFS=: read -r name decimals inventory <<<"$t"
-    m=$(pubkey "keeler-devnet-$name-mint")
-    printf -v "mint_$name" %s "$m"
-    if ! sol account "$m" >/dev/null 2>&1; then
-        spl create-token --decimals "$decimals" --mint-authority "$faucet" <(key "keeler-devnet-$name-mint")
-    fi
-    KEELER_RPC_URL=$rpc "$target/release/examples/spl_interface" <(key keeler-devnet-deploy) "$m"
-    # A dealer token account means its inventory was already deposited.
-    ata=$(spl address --verbose --token "$m" --owner "$dealer" | awk '/Associated token address/ {print $4}')
-    if ! sol account "$ata" >/dev/null 2>&1; then
-        spl create-account "$m" --owner "$dealer"
-        spl mint "$m" "$inventory" --mint-authority <(key keeler-devnet-faucet) -- "$ata"
-        echo "depositing $inventory base units of $name into the dealer's private balance" >&2
-        "$ZOLANA_CLI_BIN" wallet register --keypair <(key keeler-devnet-dealer) --rpc-url "$rpc" || true
-        "$ZOLANA_CLI_BIN" deposit --keypair <(key keeler-devnet-dealer) \
-            --rpc-url "$rpc" --indexer-url "$spr" --prover-url "$spr" \
-            --prover-tee-policy "$root/.tools/privacy-ring-examples/devnet-e-tee-policy.json" \
-            --mint "$m" --amount "$inventory"
-    fi
-done
-unset rpc spr
-
-cat >"$out/dealer-config.json" <<EOF
-{
-  "network": {
-    "rpc_url": "https://devnet.helius-rpc.com",
-    "indexer_url": "https://devnet.helius-rpc.com/v1/spr",
-    "prover": {"helius": {"keychain": "keeler-helius-api-key"}}
-  },
-  "key": {"keychain": "keeler-devnet-dealer"},
-  "assets": [
-    {"mint": "$mint_tusd", "price": {"price": 1, "expo": 0}},
-    {"mint": "$mint_tsol", "price": {"price": 150, "expo": 0}}
-  ],
-  "listen": "127.0.0.1:47001",
-  "spread_bps": 10,
-  "quote_ttl_secs": 300,
-  "settle_margin_secs": 60,
-  "http": {"listen": "127.0.0.1:47500", "key": {"keychain": "keeler-devnet-dealer-http-key"}},
-  "faucet": {
-    "key": {"keychain": "keeler-devnet-faucet"},
+python3 - "$out/deploy-plan.json" "$KEELER_SWAP_PROGRAM_SO" <<'EOF'
+import json, sys
+k = lambda name: {"keychain": f"keeler-devnet-{name}"}
+plan = {
+    "network": {
+        "rpc_url": "https://devnet.helius-rpc.com",
+        "indexer_url": "https://devnet.helius-rpc.com/v1/spr",
+        "prover": {"helius": {"keychain": "keeler-helius-api-key"}},
+    },
+    "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "deploy_key": k("deploy"),
+    "program_key": k("program"),
+    "buffer_key": k("buffer"),
+    "program_so": sys.argv[2],
+    "dealer_key": k("dealer"),
+    "faucet_key": k("faucet"),
+    "dealer_lamports": 500_000_000,
+    "faucet_lamports": 2_500_000_000,
     "tokens": [
-      {"mint": "$mint_tusd", "amount": 1000000000},
-      {"mint": "$mint_tsol", "amount": 10000000000}
+        {"symbol": "tUSD", "decimals": 6, "key": k("tusd-mint"), "inventory": 1_000_000_000_000},
+        {"symbol": "tSOL", "decimals": 9, "key": k("tsol-mint"), "inventory": 10_000_000_000_000},
     ],
-    "lamports": 20000000,
-    "per_wallet_daily": 1,
-    "daily_cap": 200
-  },
-  "pause_file": "$out/PAUSE",
-  "settle_tolerance_bps": 0,
-  "limits": [
-    {"mint": "$mint_tusd", "max_sell_amount": 10000000000, "hourly_sell_cap": 100000000000},
-    {"mint": "$mint_tsol", "max_sell_amount": 100000000000, "hourly_sell_cap": 1000000000000}
-  ]
 }
+open(sys.argv[1], "w").write(json.dumps(plan, indent=2) + "\n")
 EOF
-echo "programId $program_id; tUSD $mint_tusd; tSOL $mint_tsol; dealer $dealer" >&2
+
+echo "running the deploy tool; about 100 buffer writes, then mints and deposits" >&2
+"$tool" setup "$out/deploy-plan.json" >"$out/deploy-summary.json.tmp"
+mv "$out/deploy-summary.json.tmp" "$out/deploy-summary.json"
+
+python3 - "$out/deploy-summary.json" "$out" <<'EOF'
+import json, sys
+s = json.load(open(sys.argv[1]))
+out = sys.argv[2]
+mint = {sym: m for sym, m, _ in s["mints"]}
+tusd, tsol = mint["tUSD"], mint["tSOL"]
+cfg = {
+    "network": {
+        "rpc_url": "https://devnet.helius-rpc.com",
+        "indexer_url": "https://devnet.helius-rpc.com/v1/spr",
+        "prover": {"helius": {"keychain": "keeler-helius-api-key"}},
+    },
+    "key": {"keychain": "keeler-devnet-dealer"},
+    "program_id": s["program_id"],
+    "pubkey": s["dealer"],
+    "assets": [
+        {"mint": tusd, "price": {"price": 1, "expo": 0}},
+        {"mint": tsol, "price": {"price": 150, "expo": 0}},
+    ],
+    "listen": "127.0.0.1:47001",
+    "spread_bps": 10,
+    "quote_ttl_secs": 300,
+    "settle_margin_secs": 60,
+    "http": {"listen": "127.0.0.1:47500", "key": {"keychain": "keeler-devnet-dealer-http-key"}},
+    "faucet": {
+        "key": {"keychain": "keeler-devnet-faucet"},
+        "tokens": [{"mint": tusd, "amount": 1_000_000_000}, {"mint": tsol, "amount": 10_000_000_000}],
+        "lamports": 10_000_000,
+        "per_wallet_daily": 1,
+        "daily_cap": 100,
+    },
+    "pause_file": f"{out}/PAUSE",
+    "settle_tolerance_bps": 0,
+    "limits": [
+        {"mint": tusd, "max_sell_amount": 10_000_000_000, "hourly_sell_cap": 100_000_000_000},
+        {"mint": tsol, "max_sell_amount": 100_000_000_000, "hourly_sell_cap": 1_000_000_000_000},
+    ],
+}
+open(f"{out}/dealer-config.json", "w").write(json.dumps(cfg, indent=2) + "\n")
+print(f"programId {s['program_id']}; tUSD {tusd}; tSOL {tsol}; dealer {s['dealer']}; faucet {s['faucet']}", file=sys.stderr)
+EOF
 echo "wrote $out/dealer-config.json; next: scripts/run-dealer.sh" >&2
+echo "the shared .tools build is now for $program_id; local tests and fixtures want the example's:" >&2
+echo "  KEELER_SWAP_PROGRAM_ID=$example_id scripts/setup.sh" >&2

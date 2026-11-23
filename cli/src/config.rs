@@ -69,6 +69,9 @@ impl Network {
         match &self.prover {
             Prover::Local => Ok((self.rpc_url.clone(), self.indexer_url.clone())),
             Prover::Helius { keychain } => {
+                // The key only ever goes to Helius.
+                helius_host(&self.rpc_url)?;
+                helius_host(&self.indexer_url)?;
                 let key = helius_key(&keychain_secret(keychain)?)?;
                 Ok((
                     with_api_key(&self.rpc_url, &key)?,
@@ -81,15 +84,29 @@ impl Network {
     fn check(&self) -> Result<()> {
         if let Prover::Helius { .. } = self.prover {
             for url in [&self.rpc_url, &self.indexer_url] {
-                ensure!(url.starts_with("https://"), "Helius URLs must be https");
                 ensure!(
                     !url.contains("api-key"),
                     "put the Helius key in the Keychain, not the URL"
                 );
+                helius_host(url)?;
             }
         }
         Ok(())
     }
+}
+
+/// Fails unless `url` is https on a Helius host.
+fn helius_host(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| anyhow!("invalid network URL"))?;
+    ensure!(
+        parsed.scheme() == "https"
+            && matches!(
+                parsed.host_str(),
+                Some("devnet.helius-rpc.com" | "mainnet.helius-rpc.com")
+            ),
+        "with the Helius prover, rpc_url and indexer_url must be https on devnet.helius-rpc.com or mainnet.helius-rpc.com"
+    );
+    Ok(())
 }
 
 /// The key from a Keychain value that is either the key or a Helius URL.
@@ -225,6 +242,18 @@ pub struct DealerConfig {
     pub settle_tolerance_bps: u16,
     #[serde(default)]
     pub limits: Vec<SellLimit>,
+    /// The swap program this config is for; must be the one the binary was
+    /// built with.
+    pub program_id: String,
+    /// The dealer key's public key, when the config names it.
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    /// Consecutive failed settles that pause quoting; default 3.
+    #[serde(default)]
+    pub auto_pause_after: Option<u32>,
+    /// No quotes while the dealer's fee SOL is below this; default 0.01 SOL.
+    #[serde(default)]
+    pub min_fee_lamports: Option<u64>,
 }
 
 /// Limits on what traders sell to the dealer in `mint`.
@@ -326,6 +355,10 @@ impl DealerConfig {
             self.settle_tolerance_bps <= 10_000,
             "settle_tolerance_bps above 10000"
         );
+        parse_address(&self.program_id)?;
+        if let Some(p) = &self.pubkey {
+            parse_address(p)?;
+        }
         self.common.check()
     }
 }
@@ -516,7 +549,8 @@ mod tests {
         format!(
             r#"{{"network":{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784","prover":"local"}},
             "key":{{"file":"k.json"}},"assets":[{{"mint":"11111111111111111111111111111111","price":{{"price":1,"expo":0}}}}],
-            "listen":"127.0.0.1:47001","spread_bps":10,{extra}}}"#
+            "listen":"127.0.0.1:47001","spread_bps":10,"program_id":"{id}",{extra}}}"#,
+            id = swap_program::ID
         )
     }
 
@@ -603,6 +637,16 @@ mod tests {
         };
         assert!(net("https://devnet.helius-rpc.com").check().is_ok());
         assert!(net("http://devnet.helius-rpc.com").check().is_err());
+        assert!(net("https://devnet.helius-rpc.com.evil.example")
+            .check()
+            .is_err());
+        let mut other = net("https://devnet.helius-rpc.com");
+        other.indexer_url = "https://indexer.example/v1/spr".into();
+        assert!(
+            other.check().is_err(),
+            "the key must not go to another host"
+        );
+        assert!(other.urls().is_err());
         assert!(net("https://devnet.helius-rpc.com/?api-key=x")
             .check()
             .is_err());

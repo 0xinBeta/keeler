@@ -125,7 +125,27 @@ fn maker() -> Address {
     Keypair::new_from_array([1; 32]).pubkey()
 }
 
+/// The swap example's own program ID; the fixtures are built for it.
+const EXAMPLE_ID: &str = "F4hjig5RJbXW6vrgYaMcuWzR55kZF6tbKyf8c36nrtvU";
+
+/// False, with a note, when this build is for another program ID: a devnet
+/// build's instructions differ from the fixtures by design.
+fn example_build() -> bool {
+    let ok = swap_program::ID.to_string() == EXAMPLE_ID;
+    if !ok {
+        eprintln!(
+            "skipped: built for {}, not the example's {EXAMPLE_ID}; run \
+             `KEELER_SWAP_PROGRAM_ID={EXAMPLE_ID} scripts/setup.sh` to check the fixtures",
+            swap_program::ID
+        );
+    }
+    ok
+}
+
 fn check(name: &str, got: Value) {
+    if !example_build() {
+        return;
+    }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../web/tests/fixtures")
         .join(name);

@@ -1,24 +1,24 @@
 //! The dealer: quote from cached note sizes, settle only orders that match a
-//! remembered quote exactly, and only while the current price still covers
-//! it. Quotes are signed, kept in a state file across restarts, and served
-//! over line-delimited TCP and, when configured, over HTTP with the same
-//! handler.
+//! remembered quote exactly, and only while a price read just before the
+//! take still covers it. Quotes are signed and kept, with the sell and
+//! faucet counters, in a state file across restarts. Quotes go out over
+//! line-delimited TCP and, when configured, over HTTP with the same handler.
 use std::{
     collections::{HashMap, HashSet},
-    io::{Read, Write},
-    net::{SocketAddr, TcpListener},
+    io::{self, BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
     thread::{self, sleep},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, ensure, Result};
 use keeler_core::{
-    price::{apply_spread, Price},
+    price::{apply_spread, fair_buy_amount},
     rfq::{serve, Quote, Rfq},
 };
 use serde::{Deserialize, Serialize};
@@ -26,22 +26,28 @@ use serde_json::{json, Value};
 use solana_address::Address;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
+use spr_client::Rpc;
 use spr_keypair::ShieldedKeypair;
 use swap_sdk::{index::TakerOrder, state::OrderUtxo};
 
 use crate::{
     chain::{hex, shielded, Chain, Status},
     config::{parse_address, DealerConfig, Pricer, Prover, SellLimit},
-    faucet::{Faucet, Limits},
-    trader::{fair_amount, fair_at, sign_quote},
+    faucet::{Claims, Faucet, Limits},
+    trader::{fair_amount, sign_quote, signed_by},
 };
 
-const DISCOVER_WAIT: Duration = Duration::from_secs(1);
 const MAX_BOOK: usize = 1024;
 /// Largest HTTP request body accepted.
 const MAX_BODY: usize = 4096;
+/// Largest HTTP request line plus headers accepted.
+const MAX_HEAD: usize = 8192;
 const HTTP_POLL: Duration = Duration::from_millis(100);
+/// Time one HTTP request may take from accept to reply.
+const HTTP_DEADLINE: Duration = Duration::from_secs(3);
 const HOUR: u64 = 3_600;
+const DEFAULT_AUTO_PAUSE: u32 = 3;
+const DEFAULT_MIN_FEE: u64 = 10_000_000;
 
 #[derive(Default)]
 struct Cache {
@@ -51,12 +57,14 @@ struct Cache {
     /// done with.
     bound: HashMap<[u8; 32], (Rfq, Quote)>,
     /// (chain time, sell mint, sell amount) of orders bound in the last hour.
-    // shortcut: not in the state file, so a restart resets the hourly window;
-    // persist it if the cap must hold across restarts.
     bound_sells: Vec<(u64, Address, u64)>,
     /// The largest single note per mint: `take` spends one note of exactly
     /// the quoted amount, split from one note that covers it.
     largest_note: HashMap<Address, u64>,
+    /// The dealer's public SOL at the last refresh; it pays every fee.
+    fee_lamports: u64,
+    failed_settles: u32,
+    faucet: Option<Limits>,
 }
 
 /// What the state file holds.
@@ -64,15 +72,25 @@ struct Cache {
 struct State {
     book: Vec<(Rfq, Quote)>,
     bound: Vec<(Rfq, Quote)>,
+    #[serde(default)]
+    bound_sells: Vec<(u64, String, u64)>,
+    #[serde(default)]
+    faucet: Option<Claims>,
 }
 
-/// Writes the book and the bound quotes to `path` atomically, readable by
-/// this user only.
+/// Writes the quotes and counters to `path` atomically, readable by this
+/// user only.
 fn save_state(path: &Path, cache: &Cache) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let state = State {
         book: cache.book.clone(),
         bound: cache.bound.values().cloned().collect(),
+        bound_sells: cache
+            .bound_sells
+            .iter()
+            .map(|(t, m, a)| (*t, m.to_string(), *a))
+            .collect(),
+        faucet: cache.faucet.as_ref().map(|l| l.claims.clone()),
     };
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::OpenOptions::new()
@@ -87,22 +105,58 @@ fn save_state(path: &Path, cache: &Cache) -> Result<()> {
     Ok(())
 }
 
-/// The unexpired quotes from `path`, bound ones included: the poll matches a
-/// bound order to its quote again, so it still settles after a restart.
-fn load_state(path: &Path, now: u64) -> Result<Vec<(Rfq, Quote)>> {
+struct Loaded {
+    /// Unexpired quotes this dealer signed, bound ones included: the poll
+    /// matches a bound order to its quote again, so it still settles after a
+    /// restart.
+    quotes: Vec<(Rfq, Quote)>,
+    bound_sells: Vec<(u64, Address, u64)>,
+    faucet: Option<Claims>,
+}
+
+fn load_state(path: &Path, now: u64, dealer: &Address) -> Result<Loaded> {
     let text = match std::fs::read(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Loaded {
+                quotes: Vec::new(),
+                bound_sells: Vec::new(),
+                faucet: None,
+            })
+        }
         Err(e) => return Err(e.into()),
     };
     let state: State = serde_json::from_slice(&text)
         .map_err(|_| anyhow!("state file {} is not valid", path.display()))?;
-    Ok(state
+    let live: Vec<_> = state
         .book
         .into_iter()
         .chain(state.bound)
         .filter(|(_, q)| q.expiry > now)
-        .collect())
+        .collect();
+    let count = live.len();
+    // A quote it did not sign never binds an order.
+    let quotes: Vec<_> = live
+        .into_iter()
+        .filter(|(r, q)| signed_by(dealer, r, q))
+        .collect();
+    if quotes.len() < count {
+        log!(
+            "dealer: dropped {} quotes from the state file: not signed by this dealer",
+            count - quotes.len()
+        );
+    }
+    let bound_sells = state
+        .bound_sells
+        .into_iter()
+        .filter(|(t, _, _)| t.saturating_add(HOUR) > now)
+        .map(|(t, m, a)| Ok((t, parse_address(&m)?, a)))
+        .collect::<Result<_>>()?;
+    Ok(Loaded {
+        quotes,
+        bound_sells,
+        faucet: state.faucet,
+    })
 }
 
 fn state_path(cfg: &DealerConfig, dealer: &Address) -> Result<PathBuf> {
@@ -112,6 +166,11 @@ fn state_path(cfg: &DealerConfig, dealer: &Address) -> Result<PathBuf> {
     let dir = PathBuf::from(std::env::var("HOME")?).join(".local/state/keeler");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("dealer-{dealer}.json")))
+}
+
+/// The file whose presence means quoting paused itself after failed settles.
+fn auto_pause_path(state: &Path) -> PathBuf {
+    state.with_extension("autopaused")
 }
 
 fn check_pause(file: Option<&Path>) -> Result<()> {
@@ -158,28 +217,70 @@ fn last_look(buy_amount: u64, fair_now: Option<u64>, tolerance_bps: u16) -> bool
     })
 }
 
-/// Serves quotes and settles until `stop` is set, or fails when the quote
-/// server stops on its own.
+/// The last look at prices read now, with the mints' `decimals`.
+fn fresh_last_look(
+    pricer: &Pricer,
+    rpc: &impl Rpc,
+    order: &OrderUtxo,
+    decimals: (u8, u8),
+    tolerance_bps: u16,
+) -> bool {
+    let (sell, buy) = (order.source_mint.asset, order.terms.destination_mint.asset);
+    let fair = match pricer.prices(rpc, &[sell, buy]) {
+        Ok(p) => fair_buy_amount(order.source_amount, p[0], p[1], decimals.0, decimals.1),
+        Err(e) => {
+            log!("dealer: prices: {e:#}");
+            None
+        }
+    };
+    let ok = last_look(order.terms.destination_amount, fair, tolerance_bps);
+    if !ok {
+        log!(
+            "dealer: declined at last look: quoted {}, fair now {fair:?}",
+            order.terms.destination_amount
+        );
+    }
+    ok
+}
+
+/// Serves quotes and settles until `stop` is set, or fails when a server
+/// stops on its own.
 pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
+    ensure!(
+        cfg.program_id == swap_program::ID.to_string(),
+        "this binary is built for swap program {}, the config is for {}; rebuild with \
+         `KEELER_SWAP_PROGRAM_ID={} scripts/setup.sh` and `cargo build --release -p keeler`",
+        swap_program::ID,
+        cfg.program_id,
+        cfg.program_id
+    );
     let c = &cfg.common;
+    let signer = c.keypair()?;
+    if let Some(p) = &cfg.pubkey {
+        ensure!(
+            signer.pubkey().to_string() == *p,
+            "the dealer key is {}, the config says {p}",
+            signer.pubkey()
+        );
+    }
     let pricer = c.pricer()?;
     let chain = Chain::connect(&c.network, &c.mints()?)?;
-    let signer = c.keypair()?;
     let kp = shielded(&signer)?;
     chain.register(&kp)?;
     let state = state_path(cfg, &signer.pubkey())?;
+    let loaded = load_state(&state, chain.now()?, &signer.pubkey())?;
     let cache = Mutex::new(Cache {
-        book: load_state(&state, chain.now()?)?,
+        book: loaded.quotes,
+        bound_sells: loaded.bound_sells,
+        faucet: cfg.faucet.as_ref().map(|f| {
+            let mut l = Limits::new(f.per_wallet_daily, f.daily_cap);
+            l.claims = loaded.faucet.unwrap_or_default();
+            l
+        }),
         ..Cache::default()
     });
-    refresh(cfg, &chain, &kp, &cache)?;
-    let faucet = match &cfg.faucet {
-        Some(f) => Some((
-            Faucet::new(f)?,
-            Mutex::new(Limits::new(f.per_wallet_daily, f.daily_cap)),
-        )),
-        None => None,
-    };
+    refresh(cfg, &chain, &kp, &signer.pubkey(), &cache)?;
+    let faucet = cfg.faucet.as_ref().map(Faucet::new).transpose()?;
     let api = DealerApi {
         cfg,
         pricer: &pricer,
@@ -201,17 +302,15 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
                 key.len() >= 16,
                 "the HTTP key must be at least 16 characters"
             );
-            let server = tiny_http::Server::http(h.listen)
-                .map_err(|e| anyhow!("listen on {}: {e}", h.listen))?;
-            Some((server, key))
+            Some((TcpListener::bind(h.listen)?, key))
         }
         None => None,
     };
+    let api = &api;
     thread::scope(|s| {
         let server = s.spawn(|| serve(listener, stop, |rfq| api.quote(rfq)));
-        let web = http
-            .as_ref()
-            .map(|(server, key)| s.spawn(|| serve_http(server, key, stop, &api)));
+        let web =
+            http.map(|(l, key)| s.spawn(move || serve_http(l, &key, stop, api, HTTP_DEADLINE)));
         let mut seen = HashSet::new();
         let mut bound = HashMap::new();
         while !stop.load(Ordering::Relaxed)
@@ -219,7 +318,15 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
             && !web.as_ref().is_some_and(|w| w.is_finished())
         {
             poll(
-                cfg, &pricer, &chain, &kp, &cache, &state, &mut seen, &mut bound,
+                cfg,
+                &pricer,
+                &chain,
+                &kp,
+                &signer.pubkey(),
+                &cache,
+                &state,
+                &mut seen,
+                &mut bound,
             );
             sleep(poll_every);
         }
@@ -232,8 +339,7 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
                 Ok(Ok(())) => {}
             }
         }
-        let served = server.join();
-        match served {
+        match server.join() {
             Err(_) => bail!("quote server panicked"),
             Ok(Err(e)) => Err(anyhow!("quote server failed: {e}")),
             Ok(Ok(())) if !stopped => bail!("quote server stopped"),
@@ -255,9 +361,28 @@ struct DealerApi<'a> {
     pricer: &'a Pricer,
     chain: &'a Chain,
     cache: &'a Mutex<Cache>,
-    faucet: Option<&'a (Faucet, Mutex<Limits>)>,
+    faucet: Option<&'a Faucet>,
     signer: &'a Keypair,
     state: &'a Path,
+}
+
+type HttpError = (u16, String);
+
+impl DealerApi<'_> {
+    /// Applies `f` to the faucet counts and saves them.
+    fn count(&self, f: impl FnOnce(&mut Limits) -> Result<(), HttpError>) -> Result<(), HttpError> {
+        let mut c = self
+            .cache
+            .lock()
+            .map_err(|_| (500, "cache poisoned".to_string()))?;
+        f(c.faucet
+            .as_mut()
+            .ok_or((404, "the faucet is off".to_string()))?)?;
+        save_state(self.state, &c).map_err(|e| {
+            log!("dealer: save state: {e:#}");
+            (500, "faucet unavailable".to_string())
+        })
+    }
 }
 
 impl Api for DealerApi<'_> {
@@ -269,23 +394,25 @@ impl Api for DealerApi<'_> {
     }
 
     fn faucet(&self, wallet: Address) -> Result<(), (u16, String)> {
-        let (faucet, limits) = self.faucet.ok_or((404, "the faucet is off".to_string()))?;
+        let faucet = self.faucet.ok_or((404, "the faucet is off".to_string()))?;
+        match faucet.check_funds(self.chain) {
+            Ok(true) => {}
+            Ok(false) => return Err((409, "the faucet is out of SOL".to_string())),
+            Err(e) => {
+                log!("dealer: faucet balance: {e:#}");
+                return Err((502, "faucet transfer failed".to_string()));
+            }
+        }
         let day = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() / 86_400);
-        let lock = || {
-            limits
-                .lock()
-                .map_err(|_| (500, "faucet poisoned".to_string()))
-        };
-        lock()?
-            .take(wallet, day)
-            .map_err(|m| (429, m.to_string()))?;
+        self.count(|l| l.take(wallet, day).map_err(|m| (429, m.to_string())))?;
         faucet.pay(self.chain, wallet).map_err(|e| {
             log!("dealer: faucet for {wallet}: {e:#}");
-            if let Ok(mut l) = lock() {
+            let _ = self.count(|l| {
                 l.undo(wallet);
-            }
+                Ok(())
+            });
             (502, "faucet transfer failed".to_string())
         })
     }
@@ -298,44 +425,159 @@ impl Api for DealerApi<'_> {
     }
 }
 
-/// Serves the HTTP API one request at a time until `stop` is set.
+/// A read that fails once `until` passes, however slowly bytes arrive.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        (&mut &*self.stream).read(buf)
+    }
+}
+
+#[derive(Default)]
+struct Head {
+    method: String,
+    path: String,
+    key: Option<String>,
+    length: Option<usize>,
+    chunked: bool,
+}
+
+/// The request line and headers, or `None` when they are malformed or
+/// longer than `MAX_HEAD`.
+fn read_head(r: &mut impl BufRead) -> io::Result<Option<Head>> {
+    let mut head = Head::default();
+    let mut used = 0;
+    loop {
+        let mut line = String::new();
+        let n = r.take((MAX_HEAD - used) as u64).read_line(&mut line)?;
+        used += n;
+        if n == 0 || !line.ends_with('\n') {
+            return Ok(None);
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if head.method.is_empty() {
+            let mut parts = line.split(' ');
+            let (Some(m), Some(p), Some(v), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Ok(None);
+            };
+            if m.is_empty() || !v.starts_with("HTTP/1.") {
+                return Ok(None);
+            }
+            (head.method, head.path) = (m.to_owned(), p.to_owned());
+            continue;
+        }
+        if line.is_empty() {
+            return Ok(Some(head));
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Ok(None);
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => {
+                if head.length.is_some()
+                    || value.is_empty()
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Ok(None);
+                }
+                // Too large to parse is too large to accept.
+                head.length = Some(value.parse().unwrap_or(usize::MAX));
+            }
+            "x-keeler-key" => head.key = Some(value.to_owned()),
+            "transfer-encoding" => head.chunked = true,
+            _ => {}
+        }
+    }
+}
+
+/// Serves the HTTP API one connection at a time until `stop` is set. Each
+/// connection gets `deadline` from accept to reply, no body is read before
+/// the key and the declared length pass, and every reply closes.
 fn serve_http(
-    server: &tiny_http::Server,
+    listener: TcpListener,
     key: &str,
     stop: &AtomicBool,
     api: &impl Api,
+    deadline: Duration,
 ) -> Result<()> {
-    let json = tiny_http::Header::from_bytes("Content-Type", "application/json")
-        .map_err(|_| anyhow!("bad header"))?;
+    listener.set_nonblocking(true)?;
     while !stop.load(Ordering::Relaxed) {
-        let Some(mut req) = server.recv_timeout(HTTP_POLL)? else {
-            continue;
-        };
-        let given = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("x-keeler-key"))
-            .map(|h| h.value.as_str().to_owned());
-        let method = req.method().as_str().to_owned();
-        let url = req.url().to_owned();
-        let (remote, length) = (req.remote_addr().copied(), req.body_length());
-        let (status, body) = handle(
-            api,
-            key,
-            remote,
-            &method,
-            &url,
-            given.as_deref(),
-            length,
-            req.as_reader(),
-        );
-        let reply = tiny_http::Response::from_string(body.to_string())
-            .with_status_code(status)
-            .with_header(json.clone());
-        // A client that hung up only loses its own reply.
-        let _ = req.respond(reply);
+        match listener.accept() {
+            Ok((stream, remote)) => one_request(stream, remote, key, api, deadline),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => sleep(HTTP_POLL),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
+}
+
+fn one_request(
+    stream: TcpStream,
+    remote: SocketAddr,
+    key: &str,
+    api: &impl Api,
+    deadline: Duration,
+) {
+    if stream.set_nonblocking(false).is_err() || stream.set_write_timeout(Some(deadline)).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(Deadline {
+        stream: &stream,
+        until: Instant::now() + deadline,
+    });
+    let (status, body) = match read_head(&mut reader) {
+        Ok(Some(h)) if h.chunked => error(400, "bad request"),
+        Ok(Some(h)) => {
+            let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
+            handle(
+                api,
+                key,
+                Some(remote),
+                &h.method,
+                &h.path,
+                h.key.as_deref(),
+                h.length,
+                &mut body,
+            )
+        }
+        Ok(None) => error(400, "bad request"),
+        Err(_) => error(408, "request timeout"),
+    };
+    let text = body.to_string();
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let reply = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    );
+    // A client that hung up only loses its own reply.
+    let _ = (&stream).write_all(reply.as_bytes());
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 #[derive(Deserialize)]
@@ -369,7 +611,8 @@ fn error(status: u16, msg: &str) -> (u16, Value) {
     (status, json!({ "error": msg }))
 }
 
-/// One HTTP request. The key is checked before any body byte is read.
+/// One HTTP request. The key and the declared length are checked before any
+/// body byte is read.
 #[allow(clippy::too_many_arguments)]
 fn handle(
     api: &impl Api,
@@ -444,30 +687,59 @@ fn handle(
 }
 
 fn quote(api: &DealerApi, rfq: Rfq) -> Result<Quote> {
-    let cfg = api.cfg;
-    check_pause(cfg.pause_file.as_deref())?;
     let sell = parse_address(&rfq.sell_mint)?;
     let buy = parse_address(&rfq.buy_mint)?;
     parse_address(&rfq.trader)?;
     let fair = fair_amount(api.pricer, api.chain, sell, buy, rfq.sell_amount)?;
-    let buy_amount = apply_spread(fair, cfg.spread_bps).ok_or_else(|| anyhow!("bad spread"))?;
-    ensure!(buy_amount > 0, "amount too small");
+    let buy_amount = apply_spread(fair, api.cfg.spread_bps).ok_or_else(|| anyhow!("bad spread"))?;
     let now = api.chain.now()?;
     let mut cache = api.cache.lock().map_err(|_| anyhow!("cache poisoned"))?;
+    admit(
+        api.cfg, &mut cache, api.state, api.signer, rfq, buy_amount, now,
+    )
+}
+
+/// Every check a priced quote must pass, then signs it into the book and
+/// the state file.
+fn admit(
+    cfg: &DealerConfig,
+    cache: &mut Cache,
+    state: &Path,
+    signer: &Keypair,
+    rfq: Rfq,
+    buy_amount: u64,
+    now: u64,
+) -> Result<Quote> {
+    check_pause(cfg.pause_file.as_deref())?;
+    ensure!(
+        !auto_pause_path(state).exists(),
+        "paused after failed settles"
+    );
+    let floor = cfg.min_fee_lamports.unwrap_or(DEFAULT_MIN_FEE);
+    ensure!(
+        cache.fee_lamports >= floor,
+        "fee SOL {} is below the floor {floor}",
+        cache.fee_lamports
+    );
+    ensure!(buy_amount > 0, "amount too small");
+    let (sell, buy) = (
+        parse_address(&rfq.sell_mint)?,
+        parse_address(&rfq.buy_mint)?,
+    );
     let largest = cache.largest_note.get(&buy).copied().unwrap_or(0);
     ensure!(largest >= buy_amount, "no single note covers {buy_amount}");
     within_limits(&cfg.limits, &cache.bound_sells, sell, rfq.sell_amount, now)?;
     cache.book.retain(|(_, q)| q.expiry > now);
     ensure!(cache.book.len() < MAX_BOOK, "quote book full");
     let q = sign_quote(
-        api.signer,
+        signer,
         &rfq,
         buy_amount,
         now.saturating_add(cfg.quote_ttl_secs),
     )?;
     cache.book.push((rfq, q));
     // A quote the state file does not hold would be forgotten on restart.
-    if let Err(e) = save_state(api.state, &cache) {
+    if let Err(e) = save_state(state, cache) {
         cache.book.pop();
         return Err(e.context("save the dealer state"));
     }
@@ -478,6 +750,7 @@ fn refresh(
     cfg: &DealerConfig,
     chain: &Chain,
     kp: &ShieldedKeypair,
+    dealer: &Address,
     cache: &Mutex<Cache>,
 ) -> Result<()> {
     let mut largest = HashMap::new();
@@ -485,10 +758,10 @@ fn refresh(
         let notes = chain.notes(kp, mint)?;
         largest.insert(mint, notes.iter().map(|u| u.utxo.amount).max().unwrap_or(0));
     }
-    cache
-        .lock()
-        .map_err(|_| anyhow!("cache poisoned"))?
-        .largest_note = largest;
+    let fee = chain.lamports(*dealer)?;
+    let mut c = cache.lock().map_err(|_| anyhow!("cache poisoned"))?;
+    c.largest_note = largest;
+    c.fee_lamports = fee;
     Ok(())
 }
 
@@ -502,6 +775,45 @@ fn matches(rfq: &Rfq, q: &Quote, o: &TakerOrder) -> bool {
         && q.expiry == t.terms.expiry
 }
 
+/// What became of one settle attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum Settle {
+    /// The dealer's take landed.
+    Took,
+    /// Done with: settled or spent elsewhere, or past the settle margin.
+    Gone,
+    /// Declined at the last look; tried again next poll.
+    Wait,
+}
+
+/// Counts a settle attempt toward the auto-pause: `limit` failures in a row
+/// pause quoting, a successful take resumes it.
+fn after_settle(cache: &mut Cache, auto_pause: &Path, limit: u32, outcome: &Result<Settle>) {
+    match outcome {
+        Ok(Settle::Took) => {
+            cache.failed_settles = 0;
+            if auto_pause.exists() && std::fs::remove_file(auto_pause).is_ok() {
+                log!("dealer: a settle succeeded; quoting resumed");
+            }
+        }
+        Ok(_) => {}
+        Err(_) => {
+            cache.failed_settles += 1;
+            if cache.failed_settles >= limit {
+                cache.failed_settles = 0;
+                match std::fs::write(auto_pause, "") {
+                    Ok(()) => log!(
+                        "dealer: {limit} settles failed in a row; quoting is PAUSED until a settle \
+                         succeeds or you delete {}",
+                        auto_pause.display()
+                    ),
+                    Err(e) => log!("dealer: could not write {}: {e}", auto_pause.display()),
+                }
+            }
+        }
+    }
+}
+
 /// One pass. Errors are logged per step and per order, so one bad order or a
 /// failed discovery never stops settling orders already bound.
 #[allow(clippy::too_many_arguments)]
@@ -510,52 +822,73 @@ fn poll(
     pricer: &Pricer,
     chain: &Chain,
     kp: &ShieldedKeypair,
+    dealer: &Address,
     cache: &Mutex<Cache>,
     state: &Path,
     seen: &mut HashSet<[u8; 32]>,
     bound: &mut HashMap<[u8; 32], OrderUtxo>,
 ) {
-    if let Err(e) = refresh(cfg, chain, kp, cache) {
-        log!("dealer: refresh notes: {e:#}");
+    if let Err(e) = refresh(cfg, chain, kp, dealer, cache) {
+        log!("dealer: refresh: {e:#}");
     }
-    // Once per poll; a failed fetch settles nothing this pass.
-    let prices = cfg.common.mints().and_then(|mints| {
-        let p = pricer.prices(chain.client.rpc(), &mints)?;
-        Ok(mints.into_iter().zip(p).collect::<HashMap<_, _>>())
-    });
-    let prices = match prices {
-        Ok(p) => Some(p),
-        Err(e) => {
-            log!("dealer: prices: {e:#}; not settling this pass");
-            None
-        }
-    };
-    match chain.taker_orders(kp, DISCOVER_WAIT) {
+    let skip: HashSet<[u8; 32]> = seen.iter().chain(bound.keys()).copied().collect();
+    match chain.taker_orders(kp, &skip) {
         Ok(orders) => {
             for o in orders {
-                if let Err(e) = consider(cfg, chain, cache, seen, bound, o) {
+                if let Err(e) = consider(cfg, chain, cache, state, seen, bound, o) {
                     log!("dealer: new order: {e:#}");
                 }
             }
         }
         Err(e) => log!("dealer: discover orders: {e:#}"),
     }
+    let limit = cfg.auto_pause_after.unwrap_or(DEFAULT_AUTO_PAUSE);
     for (hash, order) in bound.clone() {
-        match settle(cfg, chain, kp, &order, prices.as_ref()) {
-            Ok(true) => {
-                bound.remove(&hash);
-                seen.insert(hash);
-                if let Ok(mut c) = cache.lock() {
-                    c.bound.remove(&hash);
-                    if let Err(e) = save_state(state, &c) {
-                        log!("dealer: save state: {e:#}");
-                    }
-                }
+        let outcome = settle(cfg, pricer, chain, kp, &order);
+        if let Err(e) = &outcome {
+            log!("dealer: settle {} failed, will retry: {e:#}", hex(&hash));
+        }
+        let Ok(mut c) = cache.lock() else { continue };
+        after_settle(&mut c, &auto_pause_path(state), limit, &outcome);
+        if matches!(outcome, Ok(Settle::Took | Settle::Gone)) {
+            bound.remove(&hash);
+            seen.insert(hash);
+            c.bound.remove(&hash);
+            if let Err(e) = save_state(state, &c) {
+                log!("dealer: save state: {e:#}");
             }
-            Ok(false) => {}
-            Err(e) => log!("dealer: settle {} failed, will retry: {e:#}", hex(&hash)),
         }
     }
+}
+
+/// Moves the quote an open order matches from the book to `bound`, or says
+/// why the order is not settled.
+fn bind(
+    cfg: &DealerConfig,
+    cache: &mut Cache,
+    hash: [u8; 32],
+    o: &TakerOrder,
+    now: u64,
+) -> Result<(), &'static str> {
+    cache
+        .bound_sells
+        .retain(|(t, _, _)| t.saturating_add(HOUR) > now);
+    let (sell, amount) = (o.order_utxo.source_mint.asset, o.order_utxo.source_amount);
+    let i = cache
+        .book
+        .iter()
+        .position(|(r, q)| matches(r, q, o))
+        .ok_or("matches no quote")?;
+    if within_limits(&cfg.limits, &cache.bound_sells, sell, amount, now).is_err() {
+        return Err("is over a sell limit");
+    }
+    if now.saturating_add(cfg.settle_margin_secs) >= o.order_utxo.terms.expiry {
+        return Err("is past the settle margin");
+    }
+    let quote = cache.book.remove(i);
+    cache.bound.insert(hash, quote);
+    cache.bound_sells.push((now, sell, amount));
+    Ok(())
 }
 
 /// Binds an unseen open order to the quote it matches, or marks it seen.
@@ -563,6 +896,7 @@ fn consider(
     cfg: &DealerConfig,
     chain: &Chain,
     cache: &Mutex<Cache>,
+    state: &Path,
     seen: &mut HashSet<[u8; 32]>,
     bound: &mut HashMap<[u8; 32], OrderUtxo>,
     o: TakerOrder,
@@ -577,86 +911,61 @@ fn consider(
     }
     let now = chain.now()?;
     let mut cache = cache.lock().map_err(|_| anyhow!("cache poisoned"))?;
-    cache
-        .bound_sells
-        .retain(|(t, _, _)| t.saturating_add(HOUR) > now);
-    let (sell, amount) = (o.order_utxo.source_mint.asset, o.order_utxo.source_amount);
-    match cache.book.iter().position(|(r, q)| matches(r, q, &o)) {
-        Some(_) if within_limits(&cfg.limits, &cache.bound_sells, sell, amount, now).is_err() => {
-            seen.insert(hash);
-            log!(
-                "dealer: order {} is over a sell limit; not settling",
-                hex(&hash)
-            );
-        }
-        Some(i) if now.saturating_add(cfg.settle_margin_secs) < o.order_utxo.terms.expiry => {
-            let quote = cache.book.remove(i);
-            cache.bound.insert(hash, quote);
-            cache.bound_sells.push((now, sell, amount));
+    match bind(cfg, &mut cache, hash, &o, now) {
+        Ok(()) => {
             bound.insert(hash, o.order_utxo);
+            save_state(state, &cache)?;
         }
-        Some(_) => {
+        Err(why) => {
             seen.insert(hash);
-            log!("dealer: order {} is past the settle margin", hex(&hash));
-        }
-        None => {
-            seen.insert(hash);
-            log!(
-                "dealer: order {} matches no quote; not settling",
-                hex(&hash)
-            );
+            log!("dealer: order {} {why}; not settling", hex(&hash));
         }
     }
     Ok(())
 }
 
-/// Settles a bound order. `Ok(true)` when it is done with: settled, already
-/// spent, or past the settle margin.
+/// Settles a bound order once its quote still holds at prices read just
+/// before the take.
 fn settle(
     cfg: &DealerConfig,
+    pricer: &Pricer,
     chain: &Chain,
     kp: &ShieldedKeypair,
     order: &OrderUtxo,
-    prices: Option<&HashMap<Address, Price>>,
-) -> Result<bool> {
+) -> Result<Settle> {
     let hash = hex(&order.hash(0)?);
     // A take may have landed even though its send reported an error.
     let status = chain.status(order)?;
     if status != Status::Open {
         log!("dealer: order {hash} is {status:?}");
-        return Ok(true);
+        return Ok(Settle::Gone);
     }
     if chain.now()?.saturating_add(cfg.settle_margin_secs) >= order.terms.expiry {
         log!("dealer: order {hash} passed the settle margin unsettled");
-        return Ok(true);
+        return Ok(Settle::Gone);
     }
     let t = &order.terms;
     let (sell, buy) = (order.source_mint.asset, t.destination_mint.asset);
-    let fair_now = prices.and_then(|p| {
-        fair_at(
-            *p.get(&sell)?,
-            *p.get(&buy)?,
-            chain,
-            sell,
-            buy,
-            order.source_amount,
-        )
-        .ok()
-    });
-    if !last_look(t.destination_amount, fair_now, cfg.settle_tolerance_bps) {
-        log!("dealer: order {hash} declined at last look (fair now {fair_now:?})");
-        return Ok(false);
-    }
     let note = chain.exact_note(kp, buy, t.destination_amount)?;
+    let decimals = (chain.mint_decimals(sell)?, chain.mint_decimals(buy)?);
+    if !fresh_last_look(
+        pricer,
+        chain.client.rpc(),
+        order,
+        decimals,
+        cfg.settle_tolerance_bps,
+    ) {
+        return Ok(Settle::Wait);
+    }
     chain.take(kp, order, note)?;
     log!("dealer: settled order {hash}");
-    Ok(true)
+    Ok(Settle::Took)
 }
 
 #[cfg(test)]
 mod tests {
-    use solana_keypair::Keypair;
-    use solana_signer::Signer;
+    use solana_account::Account;
+    use spr_client::ClientError;
     use spr_keypair::ShieldedKeypair;
     use spr_transaction::Mint;
     use swap_sdk::state::OrderTerms;
@@ -724,6 +1033,12 @@ mod tests {
         }
     }
 
+    fn fake() -> Fake {
+        Fake {
+            limits: Mutex::new(Limits::new(1, 2)),
+        }
+    }
+
     fn call(
         remote: &str,
         method: &str,
@@ -731,10 +1046,7 @@ mod tests {
         key: Option<&str>,
         body: &str,
     ) -> (u16, String) {
-        let api = Fake {
-            limits: Mutex::new(Limits::new(1, 2)),
-        };
-        call_on(&api, remote, method, path, key, body)
+        call_on(&fake(), remote, method, path, key, body)
     }
 
     fn call_on(
@@ -821,28 +1133,11 @@ mod tests {
         );
         let big = format!("{body}{}", " ".repeat(MAX_BODY));
         assert_eq!(call(LOCAL, "POST", "/quote", Some(KEY), &big).0, 413);
-        // A body longer than its declared length is still capped.
-        let api = Fake {
-            limits: Mutex::new(Limits::new(1, 2)),
-        };
-        let (status, _) = handle(
-            &api,
-            KEY,
-            Some(LOCAL.parse().unwrap()),
-            "POST",
-            "/quote",
-            Some(KEY),
-            None,
-            &mut big.as_bytes(),
-        );
-        assert_eq!(status, 413);
     }
 
     #[test]
     fn http_faucet_caps() {
-        let api = Fake {
-            limits: Mutex::new(Limits::new(1, 2)),
-        };
+        let api = fake();
         let ask = |w: u8| {
             let body = format!(r#"{{"wallet":"{}"}}"#, addr(w));
             call_on(&api, LOCAL, "POST", "/faucet", Some(KEY), &body)
@@ -865,8 +1160,113 @@ mod tests {
         );
     }
 
+    /// The HTTP server on a real socket with a short deadline.
+    fn with_server(test: impl FnOnce(SocketAddr)) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let stop = AtomicBool::new(false);
+        let api = fake();
+        thread::scope(|s| {
+            let server =
+                s.spawn(|| serve_http(listener, KEY, &stop, &api, Duration::from_millis(400)));
+            test(at);
+            stop.store(true, Ordering::Relaxed);
+            server.join().unwrap().unwrap();
+        });
+    }
+
+    /// Sends `raw`, then reads the reply until the server closes.
+    fn exchange(at: SocketAddr, raw: &[u8], pause_after: Option<Duration>) -> (String, Duration) {
+        let started = Instant::now();
+        let mut s = TcpStream::connect(at).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = s.write_all(raw);
+        if let Some(p) = pause_after {
+            sleep(p);
+        }
+        let mut reply = String::new();
+        let _ = s.read_to_string(&mut reply);
+        (reply, started.elapsed())
+    }
+
+    fn health(at: SocketAddr) -> String {
+        let raw = format!("GET /health HTTP/1.1\r\nHost: x\r\nx-keeler-key: {KEY}\r\n\r\n");
+        exchange(at, raw.as_bytes(), None).0
+    }
+
+    #[test]
+    fn http_server_on_a_socket() {
+        with_server(|at| {
+            let ok = health(at);
+            assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
+            assert!(ok.contains("Connection: close"), "{ok}");
+            assert!(ok.ends_with(r#"{"ok":true,"now":42}"#), "{ok}");
+
+            let body = rfq_json(r#""100""#);
+            let quote = format!(
+                "POST /quote HTTP/1.1\r\nx-keeler-key: {KEY}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let (reply, _) = exchange(at, quote.as_bytes(), None);
+            assert!(reply.contains(r#""buy_amount":"50""#), "{reply}");
+
+            // A bad key with a declared body: refused at once, nothing read.
+            let bad = "POST /quote HTTP/1.1\r\nx-keeler-key: nope\r\nContent-Length: 100\r\n\r\n";
+            let (reply, took) = exchange(at, bad.as_bytes(), None);
+            assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+            assert!(took < Duration::from_millis(300), "{took:?}");
+
+            // A huge declared length: refused at once, nothing read.
+            let huge = format!(
+                "POST /quote HTTP/1.1\r\nx-keeler-key: {KEY}\r\nContent-Length: 99999999999999999999999\r\n\r\n"
+            );
+            let (reply, took) = exchange(at, huge.as_bytes(), None);
+            assert!(reply.starts_with("HTTP/1.1 413"), "{reply}");
+            assert!(took < Duration::from_millis(300), "{took:?}");
+
+            // A declared body that never comes: cut off at the deadline.
+            let none = format!(
+                "POST /quote HTTP/1.1\r\nx-keeler-key: {KEY}\r\nContent-Length: 50\r\n\r\n"
+            );
+            let (reply, took) = exchange(at, none.as_bytes(), None);
+            assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+            assert!(took < Duration::from_secs(2), "{took:?}");
+
+            // Chunked bodies are not accepted.
+            let chunked = format!(
+                "POST /quote HTTP/1.1\r\nx-keeler-key: {KEY}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            );
+            assert!(exchange(at, chunked.as_bytes(), None)
+                .0
+                .starts_with("HTTP/1.1 400"));
+
+            // A slow client that never finishes its headers.
+            let (reply, took) = exchange(
+                at,
+                b"GET /health HTTP/1.1\r\nx-kee",
+                Some(Duration::from_millis(800)),
+            );
+            assert!(reply.starts_with("HTTP/1.1 408"), "{reply}");
+            assert!(took < Duration::from_secs(2), "{took:?}");
+
+            // Headers past the cap.
+            let long = format!(
+                "GET /health HTTP/1.1\r\nx-pad: {}\r\n\r\n",
+                "a".repeat(MAX_HEAD)
+            );
+            assert!(exchange(at, long.as_bytes(), None)
+                .0
+                .starts_with("HTTP/1.1 400"));
+
+            // None of that stalled the server.
+            assert!(health(at).starts_with("HTTP/1.1 200"));
+        });
+    }
+
     fn temp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("keeler-{}-{name}", std::process::id()))
+        let dir = std::env::temp_dir().join(format!("keeler-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
     }
 
     fn rfq_for(sell: Address, amount: u64, buy: Address, trader: Address) -> Rfq {
@@ -878,41 +1278,291 @@ mod tests {
         }
     }
 
+    fn dealer() -> Keypair {
+        Keypair::new_from_array([5; 32])
+    }
+
     #[test]
-    fn state_reload_keeps_live_quotes_and_bound_orders() {
+    fn state_reload_keeps_live_signed_quotes_and_counters() {
         let path = temp("state.json");
         let trader = addr(9);
-        let q = |buy_amount, expiry| Quote {
-            buy_amount,
-            expiry,
-            signature: [1; 64],
-        };
+        let d = dealer();
+        let signed =
+            |rfq: &Rfq, buy, expiry| (rfq.clone(), sign_quote(&d, rfq, buy, expiry).unwrap());
+        let live = rfq_for(addr(1), 100, addr(2), trader);
+        let bound = rfq_for(addr(1), 200, addr(2), trader);
         let mut cache = Cache::default();
-        cache
-            .book
-            .push((rfq_for(addr(1), 100, addr(2), trader), q(50, 1_000)));
-        cache
-            .book
-            .push((rfq_for(addr(1), 100, addr(2), trader), q(51, 500)));
-        cache.bound.insert(
-            [7; 32],
-            (rfq_for(addr(1), 200, addr(2), trader), q(90, 1_000)),
-        );
+        cache.book.push(signed(&live, 50, 1_000));
+        cache.book.push(signed(&live, 51, 500));
+        let (r, mut forged) = signed(&live, 52, 1_000);
+        forged.buy_amount = 99;
+        cache.book.push((r, forged));
+        cache.bound.insert([7; 32], signed(&bound, 90, 1_000));
+        cache.bound_sells = vec![(100, addr(1), 7), (590, addr(1), 8)];
+        let mut faucet = Limits::new(1, 5);
+        faucet.take(addr(4), 3).unwrap();
+        cache.faucet = Some(faucet);
         save_state(&path, &cache).unwrap();
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
 
-        // A restart at chain time 600: the quote that expired at 500 is gone.
-        let book = load_state(&path, 600).unwrap();
-        assert_eq!(book.len(), 2);
-        assert!(book.iter().all(|(_, q)| q.expiry == 1_000));
-        // The bound order matches its quote again, so the poll binds and
-        // settles it.
+        // A restart at chain time 600: the quote that expired at 500 and the
+        // one whose signature fails are gone.
+        let loaded = load_state(&path, 600, &d.pubkey()).unwrap();
+        assert_eq!(loaded.quotes.len(), 2);
+        assert!(loaded.quotes.iter().all(|(_, q)| q.expiry == 1_000));
         let o = order(trader, addr(1), 200, addr(2), 90, 1_000);
-        assert!(book.iter().any(|(r, q)| matches(r, q, &o)));
-        assert!(load_state(&temp("missing.json"), 0).unwrap().is_empty());
+        assert!(loaded.quotes.iter().any(|(r, q)| matches(r, q, &o)));
+        // Another dealer's key verifies none of them.
+        assert!(load_state(&path, 600, &addr(3)).unwrap().quotes.is_empty());
+        // The hourly window and the faucet's day survive.
+        assert_eq!(loaded.bound_sells.len(), 2);
+        let later = load_state(&path, 3_700, &d.pubkey()).unwrap();
+        assert_eq!(later.bound_sells, vec![(590, addr(1), 8)]);
+        let mut again = Limits::new(1, 5);
+        again.claims = loaded.faucet.unwrap();
+        assert!(again.take(addr(4), 3).is_err());
+        assert!(load_state(&temp("missing.json"), 0, &d.pubkey())
+            .unwrap()
+            .quotes
+            .is_empty());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn cfg(extra: &str) -> DealerConfig {
+        DealerConfig::from_json(&format!(
+            r#"{{"network":{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784","prover":"local"}},
+            "key":{{"file":"k.json"}},"assets":[{{"mint":"{}","price":{{"price":1,"expo":0}}}}],
+            "listen":"127.0.0.1:47001","spread_bps":10,"quote_ttl_secs":60,"settle_margin_secs":10,
+            "program_id":"{}"{extra}}}"#,
+            addr(1),
+            swap_program::ID
+        ))
+        .unwrap()
+    }
+
+    fn ready_cache() -> Cache {
+        Cache {
+            largest_note: HashMap::from([(addr(2), 1_000)]),
+            fee_lamports: DEFAULT_MIN_FEE,
+            ..Cache::default()
+        }
+    }
+
+    #[test]
+    fn admit_checks_pause_fees_notes_limits_and_book() {
+        let state = temp("admit.json");
+        let pause = temp("admit.pause");
+        let c = cfg(&format!(
+            r#","pause_file":"{}","limits":[{{"mint":"{}","max_sell_amount":100}}]"#,
+            pause.display(),
+            addr(1)
+        ));
+        let d = dealer();
+        let rfq = rfq_for(addr(1), 100, addr(2), addr(9));
+        let mut cache = ready_cache();
+        let q = admit(&c, &mut cache, &state, &d, rfq.clone(), 500, 10).unwrap();
+        assert_eq!(q.expiry, 70);
+        assert!(signed_by(&d.pubkey(), &rfq, &q));
+        assert_eq!(load_state(&state, 10, &d.pubkey()).unwrap().quotes.len(), 1);
+
+        let refused = |cache: &mut Cache, rfq: Rfq, buy: u64| {
+            admit(&c, cache, &state, &d, rfq, buy, 10)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(refused(&mut cache, rfq.clone(), 1_001).contains("no single note"));
+        assert!(
+            refused(&mut cache, rfq_for(addr(1), 101, addr(2), addr(9)), 5)
+                .contains("max_sell_amount")
+        );
+        std::fs::write(&pause, "").unwrap();
+        assert_eq!(refused(&mut cache, rfq.clone(), 5), "paused");
+        std::fs::remove_file(&pause).unwrap();
+        std::fs::write(auto_pause_path(&state), "").unwrap();
+        assert!(refused(&mut cache, rfq.clone(), 5).contains("failed settles"));
+        std::fs::remove_file(auto_pause_path(&state)).unwrap();
+        cache.fee_lamports = DEFAULT_MIN_FEE - 1;
+        assert!(refused(&mut cache, rfq.clone(), 5).contains("fee SOL"));
+        cache.fee_lamports = DEFAULT_MIN_FEE;
+
+        // A full book, then a book whose state file cannot be written.
+        let mut full = ready_cache();
+        full.book = vec![(rfq.clone(), q); MAX_BOOK];
+        assert!(refused(&mut full, rfq.clone(), 5).contains("book full"));
+        let before = cache.book.len();
+        let unwritable = temp("no-such-dir").join("state.json");
+        let err = admit(&c, &mut cache, &unwritable, &d, rfq, 5, 10).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("save the dealer state"),
+            "{err:#}"
+        );
+        assert_eq!(cache.book.len(), before, "rolled back");
+        std::fs::remove_file(&state).unwrap();
+    }
+
+    #[test]
+    fn auto_pause_after_failed_settles_and_resume() {
+        let flag = temp("auto.autopaused");
+        let mut cache = Cache::default();
+        let fail = || Err(anyhow!("take failed"));
+        after_settle(&mut cache, &flag, 3, &fail());
+        after_settle(&mut cache, &flag, 3, &Ok(Settle::Wait));
+        after_settle(&mut cache, &flag, 3, &fail());
+        assert!(!flag.exists());
+        after_settle(&mut cache, &flag, 3, &fail());
+        assert!(flag.exists(), "third failure in a row pauses");
+        after_settle(&mut cache, &flag, 3, &Ok(Settle::Took));
+        assert!(!flag.exists(), "a settle resumes");
+        // A success in between resets the count.
+        after_settle(&mut cache, &flag, 3, &fail());
+        after_settle(&mut cache, &flag, 3, &fail());
+        after_settle(&mut cache, &flag, 3, &Ok(Settle::Took));
+        after_settle(&mut cache, &flag, 3, &fail());
+        assert!(!flag.exists());
+    }
+
+    #[test]
+    fn bind_checks_quote_limits_and_margin() {
+        let c = cfg(&format!(
+            r#","limits":[{{"mint":"{}","hourly_sell_cap":250}}]"#,
+            addr(1)
+        ));
+        let trader = addr(9);
+        let d = dealer();
+        let mut cache = Cache::default();
+        let quoted = |cache: &mut Cache, amount| {
+            let r = rfq_for(addr(1), amount, addr(2), trader);
+            let q = sign_quote(&d, &r, 50, 10_000).unwrap();
+            cache.book.push((r, q));
+        };
+        let o = |amount| order(trader, addr(1), amount, addr(2), 50, 10_000);
+        assert_eq!(
+            bind(&c, &mut cache, [1; 32], &o(100), 0),
+            Err("matches no quote")
+        );
+        quoted(&mut cache, 100);
+        assert_eq!(bind(&c, &mut cache, [1; 32], &o(100), 0), Ok(()));
+        assert!(cache.book.is_empty() && cache.bound.contains_key(&[1; 32]));
+        quoted(&mut cache, 200);
+        assert_eq!(
+            bind(&c, &mut cache, [2; 32], &o(200), 10),
+            Err("is over a sell limit")
+        );
+        // An hour later the first sell has left the window.
+        assert_eq!(bind(&c, &mut cache, [2; 32], &o(200), HOUR), Ok(()));
+        quoted(&mut cache, 30);
+        assert_eq!(
+            bind(&c, &mut cache, [3; 32], &o(30), 9_990),
+            Err("is past the settle margin")
+        );
+    }
+
+    /// Answers `getMultipleAccounts` with a Clock and one Pyth account.
+    struct MockRpc {
+        now: i64,
+        pyth_price: Option<i64>,
+    }
+
+    impl Rpc for MockRpc {
+        fn get_multiple_accounts(
+            &self,
+            addresses: Vec<Address>,
+        ) -> Result<Vec<Option<Account>>, ClientError> {
+            let mut clock = vec![0; 40];
+            clock[32..40].copy_from_slice(&self.now.to_le_bytes());
+            let account = |data, owner| Account {
+                lamports: 1,
+                data,
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            };
+            let mut out = vec![Some(account(clock, addr(0)))];
+            for _ in 1..addresses.len() {
+                out.push(self.pyth_price.map(|p| {
+                    account(
+                        pyth_account(p, self.now),
+                        Address::new_from_array(keeler_core::price::PYTH_RECEIVER),
+                    )
+                }));
+            }
+            Ok(out)
+        }
+    }
+
+    const FEED: [u8; 32] = [0xef; 32];
+
+    /// A Full Pyth price update at expo -8.
+    fn pyth_account(price: i64, published: i64) -> Vec<u8> {
+        let mut d = vec![34, 241, 35, 99, 157, 126, 244, 205];
+        d.extend([7; 32]);
+        d.push(1);
+        d.extend(FEED);
+        d.extend(price.to_le_bytes());
+        d.extend(0u64.to_le_bytes());
+        d.extend((-8i32).to_le_bytes());
+        d.extend(published.to_le_bytes());
+        d.extend([0; 33]);
+        d
+    }
+
+    /// Sells addr(1) at a fixed 2 USD for SOL priced by Pyth.
+    fn pyth_pricer() -> Pricer {
+        let common: crate::config::Common = serde_json::from_value(json!({
+            "network": {"rpc_url": "http://127.0.0.1:8899", "indexer_url": "http://127.0.0.1:8784", "prover": "local"},
+            "key": {"file": "k.json"},
+            "assets": [
+                {"mint": addr(1).to_string(), "price": {"price": 2, "expo": 0}},
+                {"mint": addr(2).to_string(), "price": {"pyth": {"account": addr(8).to_string(), "feed_id": hex(&FEED)}}}
+            ],
+            "pyth": {"max_age_secs": 60, "max_conf_bps": 100}
+        }))
+        .unwrap();
+        common.pricer().unwrap()
+    }
+
+    #[test]
+    fn pricer_reads_pyth_through_one_rpc_call() {
+        let pricer = pyth_pricer();
+        let rpc = MockRpc {
+            now: 1_000,
+            pyth_price: Some(10_000_000_000),
+        };
+        let p = pricer.prices(&rpc, &[addr(1), addr(2)]).unwrap();
+        assert_eq!((p[0].price, p[0].expo), (2, 0));
+        assert_eq!((p[1].price, p[1].expo), (10_000_000_000, -8));
+        let missing = MockRpc {
+            now: 1_000,
+            pyth_price: None,
+        };
+        assert!(pricer.prices(&missing, &[addr(2)]).is_err());
+        // Fixed prices need no RPC at all.
+        assert!(pricer.prices(&missing, &[addr(1)]).is_ok());
+    }
+
+    #[test]
+    fn settle_declines_when_the_price_moved() {
+        let pricer = pyth_pricer();
+        // 100 base units (2 decimals) of a 2 USD token for SOL (0 decimals
+        // in this order): fair is 2 / sol_price.
+        let o = order(addr(9), addr(1), 100_000, addr(2), 20, 1_000).order_utxo;
+        let at = |sol_usd: i64| MockRpc {
+            now: 1_000,
+            pyth_price: Some(sol_usd * 100_000_000),
+        };
+        // 1000 tokens at 2 USD for SOL at 100 USD: 20 SOL, as quoted.
+        assert!(fresh_last_look(&pricer, &at(100), &o, (2, 0), 0));
+        // SOL rose: 20 SOL is now worth more than the tokens.
+        assert!(!fresh_last_look(&pricer, &at(101), &o, (2, 0), 0));
+        assert!(fresh_last_look(&pricer, &at(101), &o, (2, 0), 600));
+        // No price, no settlement.
+        let gone = MockRpc {
+            now: 1_000,
+            pyth_price: None,
+        };
+        assert!(!fresh_last_look(&pricer, &gone, &o, (2, 0), 10_000));
     }
 
     #[test]
