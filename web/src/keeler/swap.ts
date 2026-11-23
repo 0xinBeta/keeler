@@ -3,9 +3,14 @@
 import {
   AccountRole,
   address,
+  decompileTransactionMessage,
   getAddressDecoder,
   getAddressEncoder,
+  getBase64Encoder,
+  getCompiledTransactionMessageDecoder,
   getProgramDerivedAddress,
+  getTransactionDecoder,
+  isSignerRole,
   type Address,
   type Instruction,
   type Transaction,
@@ -130,7 +135,6 @@ async function prove(ctx: SwapContext, circuit: Circuit, raw: RawProgramTransact
   const { proof, ms } = await callWorker<{ proof: Uint8Array; ms: number }>({
     op: "prove",
     circuit,
-    network: ctx.network,
     proofInputs: raw.proofInputs,
     publicHash: raw.publicHash,
   });
@@ -190,13 +194,11 @@ async function proveSpp(ctx: SwapContext, tx: Decoded, spp: SppProofInputs, auth
   return data;
 }
 
-async function compile(ctx: SwapContext, ix: Instruction): Promise<Transaction> {
-  return compileUnsignedTransaction({
-    feePayer: ctx.payer,
-    lifetime: await ctx.client.getLatestBlockhash(),
-    instructions: [ix],
-    computeUnitLimit: COMPUTE_UNIT_LIMIT,
-  });
+/** The transaction and the last block height at which it can still land. */
+async function compile(ctx: SwapContext, ix: Instruction): Promise<{ transaction: Transaction; lastValidBlockHeight: bigint }> {
+  const lifetime = await ctx.client.getLatestBlockhash();
+  const transaction = await compileUnsignedTransaction({ feePayer: ctx.payer, lifetime, instructions: [ix], computeUnitLimit: COMPUTE_UNIT_LIMIT });
+  return { transaction, lastValidBlockHeight: lifetime.lastValidBlockHeight };
 }
 
 export type MakeParams = {
@@ -249,7 +251,7 @@ export async function buildMake(ctx: SwapContext, p: MakeParams, onProving: () =
     accounts: makeAccounts(ctx.payer, ctx.client.tree, pdas, authority.pda),
     data: ixData(TAG.make, proof, makeArgs(taker.address.viewingPublicKey.toBytes(), authority.bump), encodeTransactInstructionData(transact)),
   };
-  return { transaction: await compile(ctx, ix), opening: { orderHash, output } satisfies OrderOpening };
+  return { ...(await compile(ctx, ix)), opening: { orderHash, output } satisfies OrderOpening };
 }
 
 /** The order UTXO as an SPP input at `leafIndex`, owned by the maker's order authority. */
@@ -276,14 +278,10 @@ export function orderNullifier(o: OrderOpening): Uint8Array {
   return ProgramOwner.nullifierKey().nullifier(bytes32(o.orderHash), bytes32(o.output.blinding));
 }
 
+/** The order's leaf index. An indexer error propagates: it is never read as "not on chain". */
 export async function leafIndex(ctx: SwapContext, o: OrderOpening): Promise<bigint | undefined> {
-  try {
-    const res = await ctx.client.getMerkleProofs(ctx.client.tree, [bytes32(o.orderHash)]);
-    return res.proofs[0]?.leafIndex;
-  } catch {
-    // The indexer answers a leaf it does not have with a generic error.
-    return undefined;
-  }
+  const res = await ctx.client.getMerkleProofs(ctx.client.tree, [bytes32(o.orderHash)]);
+  return res.proofs[0]?.leafIndex;
 }
 
 export type OrderTerms = {
@@ -337,7 +335,7 @@ export async function buildCancel(ctx: SwapContext, o: OrderOpening, onProving: 
     accounts: cancelAccounts(ctx.payer, ctx.payer, ctx.client.tree, pdas, authority.pda),
     data: ixData(TAG.cancel, proof, cancelArgs(terms.expiry, authority.bump), encodeTransactInstructionData(transact)),
   };
-  return compile(ctx, ix);
+  return (await compile(ctx, ix)).transaction;
 }
 
 /** The terms' destination asset: all zeros is SOL, any other is the mint's address bytes. */
@@ -349,21 +347,43 @@ export function mintOf(ctx: SwapContext, asset: unknown): Address {
   return mint;
 }
 
-export type ChainStatus = "open" | "settled" | "cancelled";
+/** `taken-unmatched`: spent by a transaction that is not this maker's cancel, with no payout that matched. */
+export type ChainStatus = "open" | "settled" | "cancelled" | "taken-unmatched";
 
 /**
  * Spent or not, and if spent whether by a take (the maker's derived payout is
- * a tree-0 leaf the spending transaction appended) or by a cancel.
+ * a tree-0 leaf the spending transaction appended) or by this maker's cancel.
+ * A read error propagates, so a caller never takes a failed read for a status.
  */
 export async function orderStatus(ctx: SwapContext, o: OrderOpening, buy: { mint: Address; amount: bigint }): Promise<ChainStatus> {
   const nullifier = orderNullifier(o);
   const slot = await ctx.client.getSlot();
   const page = await ctx.client.getShieldedTransactionsByNullifiers({ nullifiers: [nullifier as never] }, atSlot(slot));
-  const spend = page.data.flatMap((g) => g.events).find((e) => e.nullifiers.some((n) => equal(n, nullifier)));
-  if (!spend) return "open";
+  const spends = (e: (typeof page.data)[number]["events"][number]) => e.nullifiers.some((n) => equal(n, nullifier));
+  const group = page.data.find((g) => g.events.some(spends));
+  const spend = group?.events.find(spends);
+  if (!group || !spend) return "open";
   const payout = derivedPayoutHash(ctx, o, nullifier, buy);
-  const paid = spend.outputSlots.some((s) => equal(s.outputContext.hash, payout));
-  return paid ? "settled" : "cancelled";
+  if (spend.outputSlots.some((s) => equal(s.outputContext.hash, payout))) return "settled";
+  // No matching payout: only a cancel this maker signed counts as a refund.
+  const tx = await ctx.client.solanaRpc
+    .getTransaction(group.signature, { encoding: "base64", maxSupportedTransactionVersion: 1, commitment: "confirmed" })
+    .send();
+  if (!tx) throw new Error("the RPC has no copy of the transaction that spent this order yet");
+  const wire = new Uint8Array(getBase64Encoder().encode(tx.transaction[0]));
+  return isMakersCancel(wire, ctx.programId, ctx.payer) ? "cancelled" : "taken-unmatched";
+}
+
+/** Whether a wire transaction holds a swap-program cancel whose maker account is `maker`, signed by it. */
+export function isMakersCancel(wire: Uint8Array, programId: Address, maker: Address): boolean {
+  const tx = getTransactionDecoder().decode(wire);
+  if (tx.signatures[maker] == null) return false;
+  // `compile` uses no address lookup tables, so the static accounts are all of them.
+  const message = decompileTransactionMessage(getCompiledTransactionMessageDecoder().decode(tx.messageBytes));
+  return message.instructions.some((ix) => {
+    const m = ix.accounts?.[1];
+    return ix.programAddress === programId && ix.data?.[0] === TAG.cancel && m?.address === maker && isSignerRole(m.role);
+  });
 }
 
 /** The maker's payout of the take whose first nullifier is the order's: output slot 1. */
@@ -418,15 +438,33 @@ export async function scanMaker(ctx: SwapContext): Promise<FoundOrder[]> {
   return found;
 }
 
-async function scanOne(ctx: SwapContext, tx: Indexed, owner: ProgramOwner): Promise<FoundOrder | undefined> {
-  const { txViewingPublicKey, salt } = tx;
-  if (!txViewingPublicKey || !salt) return undefined;
-  const viewingPublicKey = ctx.keys.address().viewingPublicKey;
+/**
+ * The transaction viewing key this maker would have used for `tx`, re-derived from its viewing
+ * key and each input nullifier; undefined when another wallet wrote the transaction.
+ */
+export async function writerKey(keys: Pick<LocalKeys, "address" | "transactionKeys">, tx: Pick<Indexed, "txViewingPublicKey" | "nullifiers">) {
+  const { txViewingPublicKey } = tx;
+  if (!txViewingPublicKey) return undefined;
+  const viewingPublicKey = keys.address().viewingPublicKey;
   const candidates = tx.nullifiers.length
-    ? await ctx.keys.transactionKeys(tx.nullifiers.map((firstNullifier) => ({ viewingPublicKey, firstNullifier })))
+    ? await keys.transactionKeys(tx.nullifiers.map((firstNullifier) => ({ viewingPublicKey, firstNullifier })))
     : [];
   const txKey = candidates.find((k) => equal(k.publicKey().toBytes(), txViewingPublicKey.toBytes()));
   for (const k of candidates) if (k !== txKey) k.destroy();
+  return txKey;
+}
+
+/** `from_data_utxo`: the terms must name this maker, by its Solana key and its nullifier key. */
+export function termsNameMaker(maker: unknown, payer: Address, nullifierPublicKey: Uint8Array): boolean {
+  const m = maker as { key?: { bytes?: Record<string, number> }; nullifierPk?: string };
+  const makerKey = Uint8Array.from({ length: 32 }, (_, i) => m.key?.bytes?.[i] ?? -1);
+  return equal(makerKey, addressBytes(payer)) && m.nullifierPk === decimal(nullifierPublicKey);
+}
+
+export async function scanOne(ctx: SwapContext, tx: Indexed, owner: ProgramOwner): Promise<FoundOrder | undefined> {
+  if (!tx.salt) return undefined;
+  const salt = tx.salt;
+  const txKey = await writerKey(ctx.keys, tx);
   if (!txKey) return undefined;
   try {
     // Ciphertext slot indexes count data-bearing slots only, as `unified_slots` does.
@@ -475,12 +513,7 @@ async function openSlot(
       leafIndex: slot.outputContext.leafIndex,
     },
   });
-  // `from_data_utxo` also requires the terms to name this maker: its Solana key and nullifier key.
-  const maker = decoded.data.maker as { key?: { bytes?: Record<string, number> }; nullifierPk?: string };
-  const makerKey = Uint8Array.from({ length: 32 }, (_, i) => maker.key?.bytes?.[i] ?? -1);
-  if (!equal(makerKey, addressBytes(ctx.payer)) || maker.nullifierPk !== decimal(ctx.keys.address().nullifierPublicKey)) {
-    return undefined;
-  }
+  if (!termsNameMaker(decoded.data.maker, ctx.payer, ctx.keys.address().nullifierPublicKey)) return undefined;
   const output: RawOutput = {
     asset,
     amount: plain.amount,

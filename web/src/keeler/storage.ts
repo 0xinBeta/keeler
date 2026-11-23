@@ -17,6 +17,8 @@ export type OrderRecord = {
   expiry: number;
   status: OrderStatus;
   error?: string;
+  /** The signed make, saved before it is sent: its signature and the last block height it can land at. */
+  tx?: { signature: string; lastValidBlockHeight: bigint };
   createdAt: number;
   opening: OrderOpening;
 };

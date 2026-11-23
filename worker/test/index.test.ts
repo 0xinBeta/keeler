@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { type Env } from "../src/index";
+import worker, { PRICE_UPDATE_V2, type Env } from "../src/index";
 
 const KEY = "HELIUSSECRET123";
 const DKEY = "DEALERSECRET456";
@@ -40,6 +40,9 @@ function env(over: Partial<Env> = {}): Env {
     FAUCET_LIMIT: allow,
     SPR_LIMIT: allow,
     PROVE_LIMIT: allow,
+    RPC_GLOBAL_LIMIT: allow,
+    SPR_GLOBAL_LIMIT: allow,
+    PROVE_GLOBAL_LIMIT: allow,
     ...over,
   };
 }
@@ -62,14 +65,51 @@ async function call(r: Request, e = env()) {
 }
 
 describe("/api/rpc", () => {
-  it("forwards an allowed method with the key added and the bytes unchanged", async () => {
-    mockFetch(() => Response.json({ jsonrpc: "2.0", id: 1, result: 12345678901234567890 }));
-    const raw = '{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["x",{"minContextSlot":18446744073709551615}]}';
+  it("forwards the validated call re-serialised, with the key added and hardened JSON headers", async () => {
+    mockFetch(() => new Response('{"jsonrpc":"2.0","id":1,"result":12345678901234567890}', { headers: { "content-type": "text/html" } }));
+    // Duplicate "method" (JSON.parse keeps the last) and extra keys must not reach upstream as sent.
+    const raw = '{"jsonrpc":"2.0","id":1,"method":"requestAirdrop","method":"getBalance","params":["x",{"minContextSlot":5}],"extra":1}';
     const { res, text } = await call(post("/api/rpc", raw));
     expect(res.status).toBe(200);
-    expect(text).toContain("result");
+    expect(text).toContain("12345678901234567890");
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toBe("default-src 'none'");
     expect(calls[0]!.url).toBe(`https://devnet.helius-rpc.com/?api-key=${KEY}`);
-    expect(new TextDecoder().decode(calls[0]!.init.body as Uint8Array)).toBe(raw);
+    expect(calls[0]!.init.body).toBe('{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["x",{"minContextSlot":5}]}');
+  });
+
+  it("refuses an integer that would lose precision when re-serialised", async () => {
+    mockFetch(() => Response.json({}));
+    const raw = '{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["x",{"minContextSlot":18446744073709551615}]}';
+    expect((await call(post("/api/rpc", raw))).body.error.code).toBe(-32602);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("caps batches at 10 and charges both limiters once per call", async () => {
+    mockFetch(() => Response.json([]));
+    const batch = (n: number) => Array.from({ length: n }, (_, i) => ({ jsonrpc: "2.0", id: i, method: "getSlot" }));
+    const big = await call(post("/api/rpc", batch(11)));
+    expect(big.body).toEqual({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Batch refused: more than 10 requests" } });
+    expect(calls).toHaveLength(0);
+    const charged: string[] = [];
+    const count = (name: string) => ({ limit: async ({ key }: { key: string }) => (charged.push(`${name}:${key}`), { success: true }) }) as RateLimit;
+    await call(post("/api/rpc", batch(10), { "cf-connecting-ip": "1.2.3.4" }), env({ RPC_LIMIT: count("ip"), RPC_GLOBAL_LIMIT: count("all") }));
+    expect(charged).toEqual([...Array(10).fill("ip:1.2.3.4"), ...Array(10).fill("all:global")]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("allows getProgramAccounts only for the registry, the pool and PROGRAM_ID", async () => {
+    mockFetch(() => Response.json({}));
+    const gpa = (program: string) => post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getProgramAccounts", params: [program, { encoding: "base64" }] });
+    const PROGRAM = "F4hjigFfc2G6ubbR2ZsVLL4y5WmXTTXP9nLV4f4pLx1F";
+    for (const p of ["regy3WAeRXMYuMYxr5iK3Bf9Arr3PcxGxyzAddbiqDQ", "ring1GaLCuJnkUMVkX2JeZLTTX17wKsV4fZmPVzXANW", PROGRAM]) {
+      expect((await call(gpa(p), env({ PROGRAM_ID: PROGRAM }))).body.error).toBeUndefined();
+    }
+    expect(calls).toHaveLength(3);
+    expect((await call(gpa("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), env({ PROGRAM_ID: PROGRAM }))).body.error.code).toBe(-32602);
+    expect((await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getProgramAccounts" }))).body.error.code).toBe(-32602);
+    expect(calls).toHaveLength(3);
   });
 
   it("refuses a disallowed method without calling upstream", async () => {
@@ -86,7 +126,7 @@ describe("/api/rpc", () => {
       { jsonrpc: "2.0", id: 2, method: "getProgramAccounts" },
       { jsonrpc: "2.0", id: 3, method: "getLargestAccounts" },
     ]));
-    expect(body.map((r: { id: number; error: { code: number } }) => [r.id, r.error.code])).toEqual([[1, -32600], [2, -32600], [3, -32601]]);
+    expect(body.map((r: { id: number; error: { code: number } }) => [r.id, r.error.code])).toEqual([[1, -32600], [2, -32602], [3, -32601]]);
     expect(calls).toHaveLength(0);
     await call(post("/api/rpc", [{ jsonrpc: "2.0", id: 1, method: "getSlot" }, { jsonrpc: "2.0", id: 2, method: "sendTransaction" }]));
     expect(calls).toHaveLength(1);
@@ -116,18 +156,49 @@ describe("/api/rpc", () => {
     mockFetch(() => Response.json({}));
     await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" }), env({ NETWORK: "local", HELIUS_API_KEY: undefined }));
     expect(calls[0]!.url).toBe("http://127.0.0.1:8899");
-    await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" }), env({ UPSTREAM_RPC: "http://10.0.0.1:8899" }));
-    expect(calls[1]!.url).toBe(`http://10.0.0.1:8899?api-key=${KEY}`);
+    // An override host never gets the Helius key, on any route.
+    const e = env({ UPSTREAM_RPC: "http://10.0.0.1:8899", UPSTREAM_SPR: "https://spr.example/v1/spr" });
+    await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" }), e);
+    await call(post("/v1/spr/getUserRecords", {}), e);
+    await call(req("/v1/spr/attestation?nonce=1"), e);
+    expect(calls.slice(1).map((c) => c.url)).toEqual(["http://10.0.0.1:8899", "https://spr.example/v1/spr/getUserRecords", "https://spr.example/v1/spr/attestation?nonce=1"]);
+    for (const c of calls) expect(c.url).not.toContain(KEY);
   });
 
-  it("rate limits per client IP", async () => {
+  it("rate limits per client: IPv4 as is, IPv6 by /64", async () => {
     mockFetch(() => Response.json({}));
     const keys: string[] = [];
     const deny = { limit: async ({ key }: { key: string }) => (keys.push(key), { success: false }) } as RateLimit;
-    const { res } = await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" }, { "cf-connecting-ip": "1.2.3.4" }), env({ RPC_LIMIT: deny }));
-    expect(res.status).toBe(429);
-    expect(keys).toEqual(["1.2.3.4"]);
+    for (const ip of ["1.2.3.4", "2001:db8:a:b:1:2:3:4", "2001:DB8:a:b::99", "2001:db8::1", "::ffff:5.6.7.8"]) {
+      const { res } = await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" }, { "cf-connecting-ip": ip }), env({ RPC_LIMIT: deny }));
+      expect(res.status).toBe(429);
+    }
+    expect(keys).toEqual(["1.2.3.4", "2001:db8:a:b::/64", "2001:db8:a:b::/64", "2001:db8:0:0::/64", "5.6.7.8"]);
     expect(calls).toHaveLength(0);
+  });
+
+  it("the global limiter stops everyone", async () => {
+    mockFetch(() => Response.json({}));
+    const full = { limit: async () => ({ success: false }) } as RateLimit;
+    const { res, body } = await call(post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" }), env({ RPC_GLOBAL_LIMIT: full }));
+    expect(res.status).toBe(429);
+    expect(body.error).toContain("busy");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("fails closed without a limiter binding off local, and allows it on local", async () => {
+    mockFetch(() => Response.json({}));
+    const rpcCall = () => post("/api/rpc", { jsonrpc: "2.0", id: 1, method: "getSlot" });
+    for (const missing of ["RPC_LIMIT", "RPC_GLOBAL_LIMIT"] as const) {
+      const { res, body } = await call(rpcCall(), env({ [missing]: undefined }));
+      expect(res.status).toBe(503);
+      expect(body.error).toContain("Rate limiting");
+    }
+    expect((await call(post("/v1/spr/prove/merge_8_1", {}), env({ PROVE_GLOBAL_LIMIT: undefined }))).res.status).toBe(503);
+    expect((await call(post("/api/quotes", {}), env({ QUOTE_LIMIT: undefined }))).res.status).toBe(503);
+    expect(calls).toHaveLength(0);
+    const local = env({ NETWORK: "local", RPC_LIMIT: undefined, RPC_GLOBAL_LIMIT: undefined });
+    expect((await call(rpcCall(), local)).res.status).toBe(200);
   });
 });
 
@@ -141,6 +212,9 @@ describe("/v1/spr/*", () => {
     expect(res.status).toBe(200);
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
     expect(res.headers.get("spr-tee")).toBe("v1");
+    expect(res.headers.get("content-type")).toBe("application/octet-stream");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toBe("default-src 'none'");
     expect(res.headers.get("set-cookie")).toBeNull();
     expect(res.headers.get("x-upstream")).toBeNull();
     const { url, init } = calls[0]!;
@@ -399,9 +473,10 @@ describe("/api/prices", () => {
   });
 
   // A 134-byte PriceUpdateV2 account, Full verification.
-  type Fields = { feed?: string; level?: number; price?: bigint; conf?: bigint; expo?: number; published?: bigint; owner?: string };
+  type Fields = { disc?: number[]; feed?: string; level?: number; price?: bigint; conf?: bigint; expo?: number; published?: bigint; owner?: string };
   function account(f: Fields = {}) {
     const data = new Uint8Array(134);
+    data.set(f.disc ?? PRICE_UPDATE_V2);
     const v = new DataView(data.buffer);
     data[40] = f.level ?? 1;
     const feed = f.feed ?? FEED_A;
@@ -419,7 +494,12 @@ describe("/api/prices", () => {
   it("returns REFERENCE values stamped now when no accounts are set", async () => {
     at(NOW);
     const { body } = await call(req("/api/prices"));
-    expect(body).toEqual({ [MINT_A]: { price: "150", expo: -2, publishTime: NOW } });
+    expect(body).toEqual({ [MINT_A]: { price: "150", expo: -2, publishTime: NOW, fixed: true } });
+  });
+
+  it("hard-codes the right PriceUpdateV2 discriminator", async () => {
+    const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("account:PriceUpdateV2")));
+    expect([...hash.subarray(0, 8)]).toEqual(PRICE_UPDATE_V2);
   });
 
   it("refuses mainnet without an account for every asset", async () => {
@@ -441,7 +521,7 @@ describe("/api/prices", () => {
       [MINT_B]: { price: "100000000", expo: -8, publishTime: NOW - 25 },
     });
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.url).toBe(`https://rpc${n}.example/?api-key=${KEY}`);
+    expect(calls[0]!.url).toBe(`https://rpc${n}.example/`); // override host: no Helius key
     expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
       jsonrpc: "2.0", id: 1, method: "getMultipleAccounts", params: [[ACC_A, ACC_B], { encoding: "base64", commitment: "confirmed" }],
     });
@@ -460,6 +540,7 @@ describe("/api/prices", () => {
       ["SOL", rpcReply(account({ price: 0n }), goodB())],
       ["SOL", rpcReply(account({ price: -5n }), goodB())],
       ["SOL", rpcReply({ ...account(), data: ["AAAA", "base64"] }, goodB())], // too short
+      ["SOL", rpcReply(account({ disc: [0, 0, 0, 0, 0, 0, 0, 0] }), goodB())], // another account type
       ["", rpcReply(account())], // fewer accounts than asked
       ["", () => new Response("down", { status: 500 })],
       ["", () => { throw new Error(`fetch failed ${KEY}`); }],

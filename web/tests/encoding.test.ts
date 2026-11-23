@@ -1,6 +1,6 @@
 // The make and cancel encoders against piece A's golden fixtures, built by
 // the swap SDK's own Rust instruction builders (cli/tests/fixtures.rs).
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { address, isSignerRole, isWritableRole, type Address } from "@solana/kit";
 import { nullifierPdaAccounts } from "@heliuslabs/spr/internal";
 import { describe, expect, it } from "vitest";
@@ -19,10 +19,8 @@ type Fixture = {
   instruction: { program_id: string; data_hex: string; accounts: { pubkey: string; is_signer: boolean; is_writable: boolean }[] };
 };
 
-const load = (name: string): Fixture | undefined => {
-  const url = new URL(`./fixtures/${name}`, import.meta.url);
-  return existsSync(url) ? (JSON.parse(readFileSync(url, "utf8")) as Fixture) : undefined;
-};
+// Required: a missing fixture fails here instead of skipping the golden tests.
+const load = (name: string): Fixture => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8")) as Fixture;
 
 const proof = (p: unknown) => {
   const { a, b, c } = p as { a: string; b: string; c: string };
@@ -38,8 +36,8 @@ const pdas = async (f: Fixture) =>
 const make = load("make-ix.json");
 const cancel = load("cancel-ix.json");
 
-describe.skipIf(!make)("make instruction (golden)", () => {
-  const f = make!;
+describe("make instruction (golden)", () => {
+  const f = make;
   it("derives the order authority and bump", async () => {
     const a = await orderAuthority(address(f.inputs.payer), PROGRAM);
     expect([a.pda, a.bump]).toEqual([f.derived.order_authority, f.derived.authority_bump]);
@@ -55,8 +53,8 @@ describe.skipIf(!make)("make instruction (golden)", () => {
   });
 });
 
-describe.skipIf(!cancel)("cancel instruction (golden)", () => {
-  const f = cancel!;
+describe("cancel instruction (golden)", () => {
+  const f = cancel;
   it("encodes the data byte for byte", () => {
     const data = ixData(TAG.cancel, proof(f.inputs.cancel_proof), cancelArgs(BigInt(f.inputs.order_expiry as number), f.derived.authority_bump), hex(f.inputs.transact.wincode_hex));
     expect(toHex(data)).toBe(f.instruction.data_hex);

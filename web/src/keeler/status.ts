@@ -1,0 +1,51 @@
+// An order record's next status, from chain evidence only. A read that fails throws, so a
+// failed RPC or indexer call never turns an order terminal; the record stays as it was.
+import type { ChainStatus } from "./swap";
+import type { OrderRecord } from "./storage";
+
+export type SignatureState = { err: unknown; confirmationStatus?: string | null } | null;
+
+export type ChainReads = {
+  /** `getSignatureStatuses` with history search: null when the cluster has no record of it. */
+  signatureStatus(signature: string): Promise<SignatureState>;
+  blockHeight(): Promise<bigint>;
+  /** What spent the order's nullifier, if anything. */
+  spend(r: OrderRecord): Promise<ChainStatus>;
+};
+
+export const NEVER_SENT = "This order was never sent (the wallet did not sign it); nothing is locked.";
+export const NEVER_LANDED = "The order transaction expired before it reached the chain; nothing is locked.";
+export const FAILED_ON_CHAIN = "The order transaction failed on chain; nothing is locked.";
+export const TAKEN_UNMATCHED =
+  "The dealer took this order, but its payment to you could not be matched to your keys. Check your private balance; if the amount is missing, report it.";
+
+const final = (r: OrderRecord) => r.status === "settled" || r.status === "refunded" || r.status === "failed";
+
+/** The record with its status read from the chain at chain time `now`; the same object when nothing changed. */
+export async function nextRecord(r: OrderRecord, now: number, chain: ChainReads): Promise<OrderRecord> {
+  if (final(r)) return r;
+  if (r.status === "pending") {
+    // The make is sent only after `tx` is saved, so a record without it was never sent.
+    if (!r.tx) return now > r.expiry ? { ...r, status: "failed", error: NEVER_SENT } : r;
+    // Height first: a signature still unknown once the height passed its last valid one can never land.
+    const height = await chain.blockHeight();
+    const s = await chain.signatureStatus(r.tx.signature);
+    if (s === null) return height > r.tx.lastValidBlockHeight ? { ...r, status: "failed", error: NEVER_LANDED } : r;
+    if (s.err !== null && s.err !== undefined) return { ...r, status: "failed", error: FAILED_ON_CHAIN };
+    if (s.confirmationStatus !== "confirmed" && s.confirmationStatus !== "finalized") return r;
+  }
+  const spend = await chain.spend(r);
+  const status = spend === "settled" || spend === "taken-unmatched" ? "settled" : spend === "cancelled" ? "refunded" : now > r.expiry ? "refundable" : "locked";
+  const error = spend === "taken-unmatched" ? TAKEN_UNMATCHED : undefined;
+  if (status === r.status && error === r.error) return r;
+  const { error: _old, ...rest } = r;
+  return { ...rest, status, ...(error ? { error } : {}) };
+}
+
+/** Why `r` cannot be refunded now, or undefined when it can. */
+export function refundRefusal(r: OrderRecord): string | undefined {
+  if (r.status === "refundable") return undefined;
+  if (r.status === "locked") return `The order can be refunded after its expiry, ${new Date(r.expiry * 1000).toLocaleTimeString()} (chain time).`;
+  if (r.status === "pending") return "The order has not been seen on chain yet. Try again in a minute.";
+  return `The order is ${r.status}; there is nothing to refund.`;
+}
