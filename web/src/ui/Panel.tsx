@@ -114,7 +114,7 @@ export function Panel(p: Props) {
                   <span className="muted">{act.busy === w.name ? "Connecting…" : "Connect"}</span>
                 </button>
                 {/* shortcut: recognised by name; importing the client's constant would pull the client into the first bundle. */}
-                {/browser test wallet|in-page/i.test(w.name) && (
+                {/browser test wallet/i.test(w.name) && (
                   <p className="muted small wallet-note">A test key kept in this browser. Good for trying Keeler; clearing site data removes it.</p>
                 )}
               </li>
