@@ -46,6 +46,11 @@ cargo check -p keeler
   `swap/xark/.tools/`. The upstream scripts check each of these release
   downloads against a pinned SHA-256. The SBF platform tools are whatever
   Agave's `cargo build-sbf` fetches; Keeler adds no check of its own;
+- applies `patches/swap.patch` (a `wasm` feature and its `Cargo.lock` lines),
+  sets the program's `declare_id!` to `KEELER_SWAP_PROGRAM_ID` (default: the
+  example's ID), and builds the single-threaded web package into
+  `web/public/swap` with the make and cancel `pk.bin`, `vk.bin` and
+  `circuit.xbc` beside it;
 - writes `.tools/env` with `ZOLANA_CLI_BIN`, `SHIELDED_POOL_PROGRAM_PATH`,
   `PROVER_BIN`, `ZOLANA_PHOTON_BIN`, `SURFPOOL_BIN`,
   `USER_REGISTRY_PROGRAM_PATH`, `SWAP_KEYS_DIR` and `KEELER_SWAP_PROGRAM_SO`.
@@ -85,7 +90,44 @@ Amounts are in base units. Mints are base58; SOL is
 `11111111111111111111111111111111`. Run with `source .tools/env` so the
 binary finds the proving keys (`SWAP_KEYS_DIR`).
 
+## Web app support
+
+- `scripts/localnet.sh start|stop <offset>` (offset 100 to 4900, a multiple of
+  100): a local stack for the web app. Network on RPC `8899+offset`, Photon
+  `8784+offset`, prover `3001+offset/100`; tUSD (6 decimals) and tSOL (9);
+  a dealer with one private note of each, TCP quotes on `47000+offset`, HTTP
+  on `47500+offset` with `x-keeler-key: keeler-localnet-dealer-key`, faucet
+  on. Prints and writes `target/localnet/keeler-web.json` (and
+  `keeler-web-<offset>.json`). Fixture test keys only.
+- `scripts/deploy-devnet.sh`, `scripts/run-dealer.sh`: devnet deployment and
+  the dealer behind a quick tunnel. Not run until the owner approves
+  publishing the example's code.
+- Dealer HTTP (loopback only, every request carries `x-keeler-key`, 4 KiB
+  body cap), amounts as decimal strings:
+  `POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` ->
+  `{"quote":{"buy_amount","expiry"}}` or `{"error":"no quote"}`;
+  `POST /faucet` `{"wallet"}` -> `{"ok":true}` or `{"error"}` (404 off,
+  429 over a limit, 502 transfer failed); `GET /health` ->
+  `{"ok":true,"now":<chain time>}`. 401 bad key, 403 not loopback, 413 body
+  too large, 400 bad request.
+- `web/tests/fixtures/{make,cancel}-ix.json`: golden instruction bytes for
+  the web client; `KEELER_WRITE_FIXTURES=1 cargo test -p keeler --test
+  fixtures` regenerates them (needed after a program ID change).
+
 ## Configuration
+
+`network.prover` is `"local"` (the local prover at `ZOLANA_PROVER_URL`, proof
+data from our indexer) or `{"helius": {"keychain": "<name>"}}`: Helius's
+attested prover at `indexer_url`, with the API key read from that Keychain
+item (a bare key, or a Helius URL with an `api-key` parameter) and added to
+the RPC and indexer URLs at run time. Logs and errors redact `api-key`
+values.
+
+The dealer also takes, all optional: `"http": {"listen", "key": <key
+source>}` for the HTTP API; `"poll_secs"` (default 1 with the local prover,
+else 5); and `"faucet": {"key", "tokens": [{"mint", "amount"}], "lamports",
+"per_wallet_daily", "daily_cap"}`, where `key` is the tokens' mint authority
+and pays the fee SOL, and the limits count claims per UTC day.
 
 `key` is `{"file": "<keypair.json>"}` for local test keys or
 `{"keychain": "<name>"}`, read with `security find-generic-password -s <name>
@@ -98,8 +140,7 @@ Trader:
 
 ```json
 {
-  "rpc_url": "http://127.0.0.1:8899",
-  "indexer_url": "http://127.0.0.1:8784",
+  "network": {"rpc_url": "http://127.0.0.1:8899", "indexer_url": "http://127.0.0.1:8784", "prover": "local"},
   "key": {"keychain": "keeler-trader"},
   "assets": [
     {"mint": "<spl mint>", "price": {"price": 2, "expo": 0}},
@@ -124,8 +165,7 @@ Dealer:
 
 ```json
 {
-  "rpc_url": "http://127.0.0.1:8899",
-  "indexer_url": "http://127.0.0.1:8784",
+  "network": {"rpc_url": "http://127.0.0.1:8899", "indexer_url": "http://127.0.0.1:8784", "prover": "local"},
   "key": {"file": "dealer.json"},
   "assets": [
     {"mint": "<spl mint>", "price": {"price": 2, "expo": 0}},
@@ -142,6 +182,7 @@ Dealer:
 
 ```bash
 cargo test -p keeler-core
+cargo test -p keeler --lib --test fixtures
 source .tools/env && cargo test --release -p keeler --test e2e -- --nocapture
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p keeler-core -p keeler -- --check

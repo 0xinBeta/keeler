@@ -633,7 +633,9 @@ mod tests {
         };
         assert!(net("https://devnet.helius-rpc.com").check().is_ok());
         assert!(net("http://devnet.helius-rpc.com").check().is_err());
-        assert!(net("https://devnet.helius-rpc.com/?api-key=x").check().is_err());
+        assert!(net("https://devnet.helius-rpc.com/?api-key=x")
+            .check()
+            .is_err());
     }
 
     #[test]

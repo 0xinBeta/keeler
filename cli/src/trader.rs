@@ -112,7 +112,8 @@ pub fn swap(
         .map_err(may_be_locked)?;
     log!(
         "locked {sell_amount} for {} from dealer {best}, chain expiry {}",
-        quote.buy_amount, quote.expiry
+        quote.buy_amount,
+        quote.expiry
     );
     let settled = Outcome::Settled {
         buy_amount: quote.buy_amount,

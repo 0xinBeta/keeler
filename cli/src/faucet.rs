@@ -188,6 +188,9 @@ mod tests {
         );
         assert_eq!(ixs[1].data, [&[7][..], &5u64.to_le_bytes()].concat());
         assert!(ixs[1].accounts[2].is_signer);
-        assert_eq!(ixs[2].data, [&[2, 0, 0, 0][..], &9u64.to_le_bytes()].concat());
+        assert_eq!(
+            ixs[2].data,
+            [&[2, 0, 0, 0][..], &9u64.to_le_bytes()].concat()
+        );
     }
 }

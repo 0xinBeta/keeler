@@ -15,8 +15,7 @@ use std::{
 use keeler::{
     chain::{hex, shielded, Chain, Status},
     config::{
-        Asset, Common, DealerConfig, DealerRef, Http, KeySource, Network, PriceSource,
-        TraderConfig,
+        Asset, Common, DealerConfig, DealerRef, Http, KeySource, Network, PriceSource, TraderConfig,
     },
     dealer,
     trader::{self, fair_amount, Outcome},
@@ -451,7 +450,10 @@ fn http_quote_settles() {
         .parse()
         .unwrap();
     let expiry = reply["quote"]["expiry"].as_u64().unwrap();
-    assert_eq!(buy_amount, expected_quote(&net, &chain, amount, HONEST.spread_bps));
+    assert_eq!(
+        buy_amount,
+        expected_quote(&net, &chain, amount, HONEST.spread_bps)
+    );
     let health: serde_json::Value = web
         .get(format!("http://{http}/health"))
         .header("x-keeler-key", KEY)
@@ -474,7 +476,13 @@ fn http_quote_settles() {
         taker: Some(identity(&dealer_pk).unwrap()),
     };
     let order = chain
-        .lock(&kp, terms, amount, source, chain.resolve(dealer_pk).unwrap())
+        .lock(
+            &kp,
+            terms,
+            amount,
+            source,
+            chain.resolve(dealer_pk).unwrap(),
+        )
         .unwrap();
     while chain.status(&order).unwrap() != Status::Settled {
         assert!(chain.now().unwrap() <= expiry, "not settled before expiry");

@@ -78,8 +78,12 @@ impl Chain {
                 };
                 let prover = ProverClient::new(indexer_url.clone())
                     .with_signed_tee(SignedTeePolicy::for_network(tee));
-                SprClient::new(SolanaRpc::new(rpc_url), SprIndexer::new(&indexer_url), prover)
-                    .with_proof_data_source(ProofDataSource::Prover)
+                SprClient::new(
+                    SolanaRpc::new(rpc_url),
+                    SprIndexer::new(&indexer_url),
+                    prover,
+                )
+                .with_proof_data_source(ProofDataSource::Prover)
             }
         };
         let tree = spr_interface::pda::tree(TREE_ID);
@@ -274,10 +278,7 @@ impl Chain {
             payer: kp.pubkey(),
             tree: self.tree,
             order_expiry: order.terms.expiry,
-            spp_proof: self.prove_spp(
-                cancel.spp_proof_inputs,
-                &ProgramOwner::nullifier_key(),
-            )?,
+            spp_proof: self.prove_spp(cancel.spp_proof_inputs, &ProgramOwner::nullifier_key())?,
             cancel_proof: proof::prove(CircuitId::Cancel, &cancel.proof_inputs)?,
         }
         .instruction()?;

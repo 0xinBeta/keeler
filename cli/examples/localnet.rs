@@ -29,9 +29,24 @@ use spr_program_test::{
 const HTTP_KEY: &str = "keeler-localnet-dealer-key";
 const MINT_LEN: usize = 82;
 /// (symbol, decimals, seed, dealer inventory, faucet amount, USD price)
-const TOKENS: [(&str, u8, [u8; 32], u64, u64, i64); 2] = [
-    ("tUSD", 6, *b"keeler localnet tUSD mint\0\0\0\0\0\0\0", 1_000_000_000_000, 1_000_000_000, 1),
-    ("tSOL", 9, *b"keeler localnet tSOL mint\0\0\0\0\0\0\0", 10_000_000_000_000, 10_000_000_000, 150),
+type Token = (&'static str, u8, [u8; 32], u64, u64, i64);
+const TOKENS: [Token; 2] = [
+    (
+        "tUSD",
+        6,
+        *b"keeler localnet tUSD mint\0\0\0\0\0\0\0",
+        1_000_000_000_000,
+        1_000_000_000,
+        1,
+    ),
+    (
+        "tSOL",
+        9,
+        *b"keeler localnet tSOL mint\0\0\0\0\0\0\0",
+        10_000_000_000_000,
+        10_000_000_000,
+        150,
+    ),
 ];
 
 fn paths(dir: &std::path::Path) -> Result<LocalnetPaths> {
@@ -48,7 +63,12 @@ fn env_path(name: &str) -> Result<PathBuf> {
         .with_context(|| format!("{name} is not set; source .tools/env"))
 }
 
-fn send(net: &FixtureLocalnet, ixs: &[Instruction], payer: &Keypair, signers: &[&dyn Signer]) -> Result<()> {
+fn send(
+    net: &FixtureLocalnet,
+    ixs: &[Instruction],
+    payer: &Keypair,
+    signers: &[&dyn Signer],
+) -> Result<()> {
     net.client
         .rpc()
         .create_and_send_transaction(
@@ -63,7 +83,13 @@ fn send(net: &FixtureLocalnet, ixs: &[Instruction], payer: &Keypair, signers: &[
 
 /// A system `CreateAccount` and an SPL `InitializeMint2` with no freeze
 /// authority, by their fixed layouts.
-fn create_mint(payer: &Address, mint: &Address, authority: &Address, decimals: u8, rent: u64) -> [Instruction; 2] {
+fn create_mint(
+    payer: &Address,
+    mint: &Address,
+    authority: &Address,
+    decimals: u8,
+    rent: u64,
+) -> [Instruction; 2] {
     let mut create = vec![0, 0, 0, 0];
     create.extend_from_slice(&rent.to_le_bytes());
     create.extend_from_slice(&(MINT_LEN as u64).to_le_bytes());
@@ -73,8 +99,12 @@ fn create_mint(payer: &Address, mint: &Address, authority: &Address, decimals: u
     init.push(0);
     [
         Instruction {
-            program_id: Address::from_str("11111111111111111111111111111111").expect("valid address"),
-            accounts: vec![AccountMeta::new(*payer, true), AccountMeta::new(*mint, true)],
+            program_id: Address::from_str("11111111111111111111111111111111")
+                .expect("valid address"),
+            accounts: vec![
+                AccountMeta::new(*payer, true),
+                AccountMeta::new(*mint, true),
+            ],
             data: create,
         },
         Instruction {
@@ -113,10 +143,22 @@ fn start(offset: u16, dir: PathBuf) -> Result<()> {
     let mut assets = Vec::new();
     for (symbol, decimals, seed, inventory, _, _) in TOKENS {
         let mint = Keypair::new_from_array(seed);
-        let mut ixs = create_mint(&payer.pubkey(), &mint.pubkey(), &faucet_key.pubkey(), decimals, rent).to_vec();
+        let mut ixs = create_mint(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            &faucet_key.pubkey(),
+            decimals,
+            rent,
+        )
+        .to_vec();
         // The protocol authority pays the asset registry's rent and the
         // fixture leaves it empty.
-        ixs.extend(faucet::instructions(&payer.pubkey(), &fixture::protocol_authority().pubkey(), &[], 1_000_000_000));
+        ixs.extend(faucet::instructions(
+            &payer.pubkey(),
+            &fixture::protocol_authority().pubkey(),
+            &[],
+            1_000_000_000,
+        ));
         ixs.push(
             CreateSplInterface {
                 authority: fixture::protocol_authority().pubkey(),
@@ -125,23 +167,43 @@ fn start(offset: u16, dir: PathBuf) -> Result<()> {
             }
             .instruction(),
         );
-        send(&net, &ixs, &payer, &[&payer, &mint, &fixture::protocol_authority()])
-            .with_context(|| format!("create {symbol}"))?;
+        send(
+            &net,
+            &ixs,
+            &payer,
+            &[&payer, &mint, &fixture::protocol_authority()],
+        )
+        .with_context(|| format!("create {symbol}"))?;
         // The dealer's inventory: minted to its token account, then one
         // private note of it.
-        let ixs = faucet::instructions(&faucet_key.pubkey(), &dealer.pubkey(), &[(mint.pubkey(), inventory)], 0);
+        let ixs = faucet::instructions(
+            &faucet_key.pubkey(),
+            &dealer.pubkey(),
+            &[(mint.pubkey(), inventory)],
+            0,
+        );
         send(&net, &ixs, &faucet_key, &[&faucet_key])?;
         let token = pda::associated_token_address(&dealer.pubkey(), &mint.pubkey());
         let deposit = Deposit {
             tree: net.tree,
             depositor: dealer.pubkey(),
-            deposits: vec![SprProgramTest::wallet_spl_shield_data(inventory, &dealer_address, &mint.pubkey(), &token)?],
+            deposits: vec![SprProgramTest::wallet_spl_shield_data(
+                inventory,
+                &dealer_address,
+                &mint.pubkey(),
+                &token,
+            )?],
         }
         .instruction()?;
         let sig = net
             .client
             .rpc()
-            .create_and_send_transaction(&[deposit], dealer.pubkey(), &[&dealer], ComputeBudgetConfig::for_instruction_count(1))
+            .create_and_send_transaction(
+                &[deposit],
+                dealer.pubkey(),
+                &[&dealer],
+                ComputeBudgetConfig::for_instruction_count(1),
+            )
             .map_err(|e| anyhow::anyhow!("deposit {symbol}: {e:?}"))?;
         net.client
             .confirm_private_transaction_sync(sig)
@@ -159,7 +221,8 @@ fn start(offset: u16, dir: PathBuf) -> Result<()> {
     let http_key = dir.join("http-key");
     std::fs::write(&http_key, HTTP_KEY)?;
     let http = format!("127.0.0.1:{}", 47_500 + offset);
-    let prover = std::env::var("ZOLANA_PROVER_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".into());
+    let prover =
+        std::env::var("ZOLANA_PROVER_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".into());
     let config = json!({
         "network": {"rpc_url": ports.rpc_url(), "indexer_url": ports.photon_url(), "prover": "local"},
         "key": {"file": dealer_key},
@@ -181,7 +244,10 @@ fn start(offset: u16, dir: PathBuf) -> Result<()> {
             "daily_cap": 1000,
         },
     });
-    std::fs::write(dir.join("dealer-config.json"), serde_json::to_string_pretty(&config)?)?;
+    std::fs::write(
+        dir.join("dealer-config.json"),
+        serde_json::to_string_pretty(&config)?,
+    )?;
     let web = json!({
         "network": "localnet",
         "rpcUrl": ports.rpc_url(),
@@ -195,7 +261,10 @@ fn start(offset: u16, dir: PathBuf) -> Result<()> {
         "dealer": {"pubkey": dealer.pubkey().to_string(), "url": format!("http://{http}"), "key": HTTP_KEY},
         "faucet": true,
     });
-    std::fs::write(dir.join("keeler-web.json"), serde_json::to_string_pretty(&web)? + "\n")?;
+    std::fs::write(
+        dir.join("keeler-web.json"),
+        serde_json::to_string_pretty(&web)? + "\n",
+    )?;
     // The validator and Photon outlive this process; `stop` ends them.
     std::mem::forget(net);
     Ok(())

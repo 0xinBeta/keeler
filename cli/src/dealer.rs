@@ -78,7 +78,10 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
     let http = match &cfg.http {
         Some(h) => {
             let key = h.key.secret()?;
-            ensure!(key.len() >= 16, "the HTTP key must be at least 16 characters");
+            ensure!(
+                key.len() >= 16,
+                "the HTTP key must be at least 16 characters"
+            );
             let server = tiny_http::Server::http(h.listen)
                 .map_err(|e| anyhow!("listen on {}: {e}", h.listen))?;
             Some((server, key))
@@ -147,8 +150,14 @@ impl Api for DealerApi<'_> {
         let day = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() / 86_400);
-        let lock = || limits.lock().map_err(|_| (500, "faucet poisoned".to_string()));
-        lock()?.take(wallet, day).map_err(|m| (429, m.to_string()))?;
+        let lock = || {
+            limits
+                .lock()
+                .map_err(|_| (500, "faucet poisoned".to_string()))
+        };
+        lock()?
+            .take(wallet, day)
+            .map_err(|m| (429, m.to_string()))?;
         faucet.pay(self.chain, wallet).map_err(|e| {
             log!("dealer: faucet for {wallet}: {e:#}");
             if let Ok(mut l) = lock() {
@@ -276,17 +285,14 @@ fn handle(
             Err(e) => error(503, &e),
         },
         ("POST", "/quote") => {
-            let Some(rfq) = serde_json::from_slice::<HttpRfq>(&buf)
-                .ok()
-                .and_then(|r| {
-                    Some(Rfq {
-                        sell_amount: parse_amount(&r.sell_amount)?,
-                        sell_mint: r.sell_mint,
-                        buy_mint: r.buy_mint,
-                        trader: r.trader,
-                    })
+            let Some(rfq) = serde_json::from_slice::<HttpRfq>(&buf).ok().and_then(|r| {
+                Some(Rfq {
+                    sell_amount: parse_amount(&r.sell_amount)?,
+                    sell_mint: r.sell_mint,
+                    buy_mint: r.buy_mint,
+                    trader: r.trader,
                 })
-            else {
+            }) else {
                 return error(400, "bad request");
             };
             match api.quote(rfq) {
@@ -581,7 +587,13 @@ mod tests {
     #[test]
     fn http_quote_uses_string_amounts() {
         assert_eq!(
-            call(LOCAL, "POST", "/quote", Some(KEY), &rfq_json(r#""18446744073709551614""#)),
+            call(
+                LOCAL,
+                "POST",
+                "/quote",
+                Some(KEY),
+                &rfq_json(r#""18446744073709551614""#)
+            ),
             (
                 200,
                 r#"{"quote":{"buy_amount":"9223372036854775807","expiry":1000}}"#.into()
@@ -591,7 +603,13 @@ mod tests {
             call(LOCAL, "POST", "/quote", Some(KEY), &rfq_json(r#""1""#)),
             (200, r#"{"error":"no quote"}"#.into())
         );
-        for bad in [r#"100"#, r#""+100""#, r#""""#, r#""1e3""#, r#""18446744073709551616""#] {
+        for bad in [
+            r#"100"#,
+            r#""+100""#,
+            r#""""#,
+            r#""1e3""#,
+            r#""18446744073709551616""#,
+        ] {
             assert_eq!(
                 call(LOCAL, "POST", "/quote", Some(KEY), &rfq_json(bad)).0,
                 400,
@@ -609,9 +627,15 @@ mod tests {
     fn http_refuses_bad_key_oversize_and_non_loopback() {
         let body = rfq_json(r#""100""#);
         assert_eq!(call(LOCAL, "POST", "/quote", None, &body).0, 401);
-        assert_eq!(call(LOCAL, "POST", "/quote", Some("0123456789abcdeX"), &body).0, 401);
+        assert_eq!(
+            call(LOCAL, "POST", "/quote", Some("0123456789abcdeX"), &body).0,
+            401
+        );
         assert_eq!(call(LOCAL, "POST", "/quote", Some("short"), &body).0, 401);
-        assert_eq!(call("10.0.0.1:5000", "POST", "/quote", Some(KEY), &body).0, 403);
+        assert_eq!(
+            call("10.0.0.1:5000", "POST", "/quote", Some(KEY), &body).0,
+            403
+        );
         let big = format!("{body}{}", " ".repeat(MAX_BODY));
         assert_eq!(call(LOCAL, "POST", "/quote", Some(KEY), &big).0, 413);
         // A body longer than its declared length is still capped.
@@ -645,7 +669,15 @@ mod tests {
         assert_eq!(ask(2).0, 200);
         assert_eq!(ask(3).0, 429);
         assert_eq!(
-            call_on(&api, LOCAL, "POST", "/faucet", Some(KEY), r#"{"wallet":"nope"}"#).0,
+            call_on(
+                &api,
+                LOCAL,
+                "POST",
+                "/faucet",
+                Some(KEY),
+                r#"{"wallet":"nope"}"#
+            )
+            .0,
             400
         );
     }
