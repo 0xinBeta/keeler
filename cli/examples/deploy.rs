@@ -16,7 +16,6 @@ use keeler::{
     config::{parse_address, redact},
     deploy::{self, Plan},
 };
-use spr_client::SolanaRpc;
 
 fn plan(path: &str) -> Result<Plan> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
@@ -38,6 +37,7 @@ fn run() -> Result<()> {
         }
         ["set-authority", path, program, new] => {
             let plan = plan(path)?;
+            let rpc = plan.rpc()?;
             let (program, new) = (parse_address(program)?, parse_address(new)?);
             eprintln!(
                 "This hands the upgrade authority of {program} to {new}. The deploy key \
@@ -46,8 +46,6 @@ fn run() -> Result<()> {
             let mut typed = String::new();
             std::io::stdin().lock().read_line(&mut typed)?;
             ensure!(typed.trim() == new.to_string(), "not confirmed; nothing sent");
-            let (rpc_url, _) = plan.network.urls()?;
-            let rpc = SolanaRpc::new(rpc_url);
             deploy::set_upgrade_authority(&rpc, &plan.deploy_key.keypair()?, &program, &new)?;
             eprintln!("{program}'s upgrade authority is now {new}");
             Ok(())

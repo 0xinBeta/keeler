@@ -45,11 +45,18 @@ have keeler-devnet-deploy || { echo "no Keychain item keeler-devnet-deploy; fund
 build
 for item in program buffer dealer faucet tusd-mint tsol-mint; do
     if ! have "keeler-devnet-$item"; then
-        store "keeler-devnet-$item" "$("$tool" keygen)"
+        json=$("$tool" keygen)
+        # An empty or broken item would block every rerun.
+        [[ $json =~ ^\[([0-9]{1,3},){63}[0-9]{1,3}\]$ ]] || { echo "keygen gave no keypair" >&2; exit 1; }
+        store "keeler-devnet-$item" "$json"
         echo "created Keychain item keeler-devnet-$item" >&2
     fi
 done
-have keeler-devnet-dealer-http-key || store keeler-devnet-dealer-http-key "$(openssl rand -hex 24)"
+if ! have keeler-devnet-dealer-http-key; then
+    http_key=$(openssl rand -hex 24)
+    [[ $http_key =~ ^[0-9a-f]{48}$ ]] || { echo "openssl gave no HTTP key" >&2; exit 1; }
+    store keeler-devnet-dealer-http-key "$http_key"
+fi
 
 # The public key is bytes 32..64 of the keypair array, read from a pipe.
 program_id=$(key keeler-devnet-program | python3 -c '
@@ -69,7 +76,10 @@ KEELER_SWAP_PROGRAM_ID=$program_id "$root/scripts/setup.sh"
 . "$root/.tools/env"
 build
 
-python3 - "$out/deploy-plan.json" "$KEELER_SWAP_PROGRAM_SO" <<'EOF'
+# Deploy the first build's bytes on every rerun: a rebuild that is not
+# byte-identical would otherwise fail the deployed-bytes check.
+[[ -f $out/swap_program.so ]] || cp "$KEELER_SWAP_PROGRAM_SO" "$out/swap_program.so"
+python3 - "$out/deploy-plan.json" "$out/swap_program.so" <<'EOF'
 import json, sys
 k = lambda name: {"keychain": f"keeler-devnet-{name}"}
 plan = {
@@ -128,7 +138,7 @@ cfg = {
         "tokens": [{"mint": tusd, "amount": 1_000_000_000}, {"mint": tsol, "amount": 10_000_000_000}],
         "lamports": 10_000_000,
         "per_wallet_daily": 1,
-        "daily_cap": 100,
+        "daily_cap": 60,
     },
     "pause_file": f"{out}/PAUSE",
     "settle_tolerance_bps": 0,
