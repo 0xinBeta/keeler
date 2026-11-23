@@ -3,3 +3,30 @@ name = "keeler"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+# swap-sdk and swap-program come from the pinned examples checkout that
+# scripts/setup.sh creates; run it before building. The spr-* and solana-*
+# versions match that checkout's swap/xark/Cargo.toml.
+[dependencies]
+keeler-core = { path = "../core" }
+swap-sdk = { path = "../.tools/privacy-ring-examples/swap/xark/sdk" }
+swap-program = { path = "../.tools/privacy-ring-examples/swap/xark/program", features = ["circuits"] }
+spr-client = { version = "0.10.0", features = ["reqwest", "solana-rpc"] }
+spr-interface = "0.10.0"
+spr-keypair = "0.10.0"
+spr-program = { version = "0.10.0", features = ["client"] }
+spr-transaction = "0.10.0"
+spr-user-registry-interface = { version = "0.10.0", features = ["solana"] }
+solana-address = { version = "2.7", features = ["atomic", "borsh", "bytemuck", "copy", "decode", "wincode"] }
+solana-instruction = "3.4"
+solana-keypair = "3.1.2"
+solana-pubkey = { version = "4.2", features = ["curve25519"] }
+solana-signature = "3.4"
+solana-signer = "3.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0"
+
+[dev-dependencies]
+spr-program-test = { version = "0.10.0", features = ["localnet"] }
