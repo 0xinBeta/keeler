@@ -1,3 +1,10 @@
 target/
 .tools/
 .worktrees/
+node_modules/
+web/dist/
+web/public/swap/
+web/test-results/
+web/playwright-report/
+.wrangler/
+.dev.vars
