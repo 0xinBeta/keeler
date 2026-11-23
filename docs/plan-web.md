@@ -31,6 +31,17 @@ gates at the end.
 - A make needs the pool's transact proof (hosted or local prover) and the make
   circuit proof (ours). Make is about 8.8k constraints and 1,373 bytes as a v1
   transaction.
+- Research (2026-11-23): the Default Ring is live and permissionless on
+  mainnet since 2026-11-10; a third-party program needs no registration to call
+  the pool; the hosted prover proves only the pool's own circuits, so program
+  circuits are proved by the client; Helius charges 1,000 credits per proof and
+  10 per indexer read (the free plan is about 1,000 proofs); `zk setup` is
+  single-party and a production setup is `xark ceremony` phase 2;
+  `privacy-ring-examples` has no licence, while a different swap implementation
+  sits under Apache-2.0 in `helius-labs/privacy-rings/sdk-tests/zk-program-swap`;
+  an official browser wallet example exists in
+  `helius-labs/privacy-ring-web-sdk/examples/wallet`. Not confirmed: that
+  Phantom signs the derivation message bytes verbatim, or v1 transactions.
 - Tooling here: Wrangler 4.152 logged in, `cloudflared`, `solana` CLI, pnpm,
   Node 25, wasm-pack 0.15.1. No Docker.
 
