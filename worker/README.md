@@ -72,8 +72,13 @@ prices), `SPR_LIMIT` 600/min (indexer calls and prover GETs, including proof sta
 
 ## Run locally against a local network
 
-Start the local network (`scripts/localnet.sh`), build the site (`cd ../web && pnpm build`),
-then put this in `worker/.dev.vars` (git-ignored; placeholder values):
+`scripts/dev.sh [offset] [port]` does all of this in one command: it starts the local network,
+builds the site with `VITE_DEALERS`, writes `worker/.dev.vars` from the network's
+`target/localnet/keeler-web-<offset>.json` and runs `wrangler dev`; Ctrl-C stops it all.
+
+By hand: start the local network (`scripts/localnet.sh`), build the site
+(`cd ../web && VITE_DEALERS='["<dealer pubkey>"]' pnpm build`), then put this in
+`worker/.dev.vars` (git-ignored; placeholder values):
 
 ```sh
 NETWORK=local

@@ -104,8 +104,15 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   } catch {
     throw err("network", `Could not reach ${path}. Check your connection and try again.`);
   }
-  if (res.status === 429) throw err("rate-limited", "Too many requests. Wait a minute and try again.");
-  if (!res.ok) throw err("network", `${path} answered HTTP ${res.status}. Try again shortly.`);
+  if (!res.ok) {
+    // The Worker answers errors as `{error}` with a sentence meant for people.
+    const said = await res
+      .json()
+      .then((b: { error?: unknown }) => (typeof b?.error === "string" ? b.error.slice(0, 200) : ""))
+      .catch(() => "");
+    if (res.status === 429) throw err("rate-limited", `${said || "Too many requests."} Wait a minute and try again.`);
+    throw err("network", `${path} answered HTTP ${res.status}${said ? `: ${said}` : ""}. Try again shortly.`);
+  }
   return (await res.json()) as T;
 }
 
@@ -443,6 +450,10 @@ export function createKeeler(): Keeler {
 
     async register() {
       const c = await client();
+      const lamports = await as("network", "Reading your SOL balance", async () => (await c.solanaRpc.getBalance(owner()).send()).value);
+      if (lamports === 0n) {
+        throw err("network", "This wallet has no SOL to pay the registration fee. Add a little SOL to it (on a test network, use Get test tokens), then register.");
+      }
       const tx = await as("network", "Building the registration", () =>
         buildRegistrationTransaction({ client: c, owner: owner(), address: keys().keys.address() }),
       );
@@ -523,8 +534,11 @@ export function createKeeler(): Keeler {
       const quotes = signed
         .map((s) => s?.quote)
         .filter((q): q is Quote => q !== undefined && ttlOk(q.expiry, now, c.minTtlSecs, c.maxTtlSecs));
+      if (replies.every((r) => !r.quote)) {
+        throw err("dealer-offline", "No dealer answered. They may be offline or out of inventory for this pair; try again later.");
+      }
       if (quotes.length === 0) {
-        throw err("no-quotes", "No dealer quoted this swap. The dealers may be offline or out of inventory; try again later.");
+        throw err("no-quotes", "No usable quote: every answer was unsigned, from an unknown dealer, or outside the allowed lock time. Try again later.");
       }
       // Best first: in band before out of band, then the larger amount; dealer order breaks ties.
       quotes.sort((a, b) => Number(b.inBand) - Number(a.inBand) || (b.buyAmount > a.buyAmount ? 1 : b.buyAmount < a.buyAmount ? -1 : 0));

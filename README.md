@@ -95,6 +95,13 @@ binary finds the proving keys (`SWAP_KEYS_DIR`).
 
 ## Web app support
 
+- `scripts/dev.sh [offset] [port]` (defaults 900, 8787): the whole web app
+  on a local network in one command. Starts `scripts/localnet.sh start
+  <offset>`, builds `web/dist` with `VITE_DEALERS` from the stack's
+  `keeler-web-<offset>.json`, writes `worker/.dev.vars` from it, and runs the
+  real Worker under `wrangler dev` at `http://127.0.0.1:<port>`. Ctrl-C (or
+  SIGTERM) stops everything it started. `cd web && pnpm e2e` starts it (or
+  reuses a running one) and drives the built page through the Worker.
 - `scripts/localnet.sh start|stop <offset>` (offset 100 to 4900, a multiple of
   100): a local stack for the web app. Network on RPC `8899+offset`, Photon
   `8784+offset`, prover `3001+offset/100`; tUSD (6 decimals) and tSOL (9);

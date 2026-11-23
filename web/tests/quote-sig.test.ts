@@ -54,17 +54,20 @@ const vector = new URL("./fixtures/quote-sig.json", import.meta.url);
 describe.skipIf(!existsSync(vector))("piece A's quote signature vector", () => {
   it("verifies and reproduces the message", async () => {
     const v = JSON.parse(readFileSync(vector, "utf8"));
-    // shortcut: field names guessed from the plan; adjust when the vector lands.
+    const i = v.inputs;
     const t: SignedTerms = {
-      programId: address(v.program_id),
-      sellMint: address(v.sell_mint),
-      buyMint: address(v.buy_mint),
-      trader: address(v.trader),
-      sellAmount: BigInt(v.sell_amount),
-      buyAmount: BigInt(v.buy_amount),
-      expiry: BigInt(v.expiry),
+      programId: address(i.program_id),
+      sellMint: address(i.sell_mint),
+      buyMint: address(i.buy_mint),
+      trader: address(i.trader),
+      sellAmount: BigInt(i.sell_amount),
+      buyAmount: BigInt(i.buy_amount),
+      expiry: BigInt(i.expiry),
     };
-    if (v.message_hex) expect(toHex(quoteMessage(t))).toBe(v.message_hex);
-    expect(await verifyQuote(address(v.dealer), v.signature, t)).toBe(true);
+    expect(toHex(quoteMessage(t))).toBe(v.message_hex);
+    expect(await verifyQuote(address(v.pubkey), v.signature_hex, t)).toBe(true);
+    // The dealer's HTTP reply carries the same signature, as the Worker passes it through.
+    expect(v.http_reply.quote).toEqual({ buy_amount: i.buy_amount, expiry: i.expiry, signature: v.signature_hex });
+    expect(await verifyQuote(address(v.pubkey), v.signature_hex, { ...t, expiry: t.expiry + 1n })).toBe(false);
   });
 });

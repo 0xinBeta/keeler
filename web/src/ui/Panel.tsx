@@ -85,6 +85,13 @@ export function Panel(p: Props) {
       setPhase("ready");
       p.onReady();
     });
+  // A new wallet has no SOL for the registration fee; on a test network the faucet sends some.
+  const [funded, setFunded] = useState(false);
+  const faucet = () =>
+    act.run("faucet", async () => {
+      await keeler.faucet();
+      setFunded(true);
+    });
 
   if (phase === "wallet") {
     const wallets = keeler.wallets();
@@ -135,8 +142,19 @@ export function Panel(p: Props) {
           disabled={!!act.busy}
           aria-busy={!!act.busy}
         >
-          {act.busy ? (unlocking ? "Waiting for your wallet…" : "Registering…") : unlocking ? "Sign to unlock" : "Register"}
+          {act.busy === "unlock" ? "Waiting for your wallet…" : act.busy === "register" ? "Registering…" : unlocking ? "Sign to unlock" : "Register"}
         </button>
+        {!unlocking && config.faucet && (
+          <div className="faucet">
+            <p className="muted small">Registering costs a small network fee in SOL. On this test network you can get some here.</p>
+            <button className="btn btn-ghost" onClick={faucet} disabled={!!act.busy} aria-busy={act.busy === "faucet"}>
+              {act.busy === "faucet" ? "Sending test tokens…" : "Get test tokens"}
+            </button>
+          </div>
+        )}
+        <p className="status" aria-live="polite">
+          {funded ? "Test tokens sent to your public balance." : ""}
+        </p>
         <ErrorNote text={act.error} />
       </div>
     );
