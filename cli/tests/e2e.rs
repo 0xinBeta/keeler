@@ -14,13 +14,15 @@ use std::{
 
 use keeler::{
     chain::{hex, shielded, Chain, Status},
-    config::{Asset, Common, DealerConfig, DealerRef, KeySource, PriceSource, TraderConfig},
+    config::{
+        Asset, Common, DealerConfig, DealerRef, Http, KeySource, Network, PriceSource, TraderConfig,
+    },
     dealer,
-    trader::{self, fair_amount, Outcome},
+    trader::{self, fair_amount, sign_quote, signed_by, Outcome},
 };
 use keeler_core::{
     price::apply_spread,
-    rfq::{serve, Quote},
+    rfq::{serve, Rfq},
 };
 use solana_address::Address;
 use solana_keypair::Keypair;
@@ -106,6 +108,8 @@ fn start(test: u16) -> Net {
     .unwrap();
     assert_eq!(localnet.tree_id, 0);
     let keys = target.join(format!("localnet/keeler-keys-{test}"));
+    // Dealer state from an earlier run names orders of another chain.
+    let _ = std::fs::remove_dir_all(&keys);
     std::fs::create_dir_all(&keys).unwrap();
     let spl = fixture::spl_mint();
     for i in 0..fixture::ACTOR_COUNT {
@@ -148,21 +152,19 @@ impl Net {
             price: PriceSource::Fixed { price, expo: 0 },
         };
         Common {
-            rpc_url: self.ports.rpc_url(),
-            indexer_url: self.ports.photon_url(),
+            network: self.network(),
             key: KeySource::File(self.keys.join(format!("{actor}.json"))),
             assets: vec![asset(self.spl, spl_price), asset(SOL_MINT, 100)],
             pyth: None,
         }
     }
 
+    fn network(&self) -> Network {
+        Network::local(self.ports.rpc_url(), self.ports.photon_url())
+    }
+
     fn chain(&self) -> Chain {
-        Chain::connect(
-            &self.ports.rpc_url(),
-            &self.ports.photon_url(),
-            &[self.spl, SOL_MINT],
-        )
-        .unwrap()
+        Chain::connect(&self.network(), &[self.spl, SOL_MINT]).unwrap()
     }
 
     fn balances(&self, chain: &Chain, actor: u8) -> (u64, u64) {
@@ -199,12 +201,23 @@ const HONEST: Terms = Terms {
 };
 
 fn spawn_dealer(net: &Net, test: u16, actor: u8, t: Terms) -> Dealer {
+    spawn_dealer_with(net, test, actor, t, None)
+}
+
+fn spawn_dealer_with(net: &Net, test: u16, actor: u8, t: Terms, http: Option<Http>) -> Dealer {
     let cfg = DealerConfig {
         common: net.priced(actor, t.spl_price),
         listen: dealer_addr(test, actor),
         spread_bps: t.spread_bps,
         quote_ttl_secs: t.quote_ttl_secs,
         settle_margin_secs: t.settle_margin_secs,
+        http,
+        poll_secs: None,
+        faucet: None,
+        state_file: Some(net.keys.join(format!("dealer-state-{actor}.json"))),
+        pause_file: None,
+        settle_tolerance_bps: 0,
+        limits: Vec::new(),
     };
     cfg.check().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -321,14 +334,16 @@ fn unsettled_order_is_refunded_once() {
     chain
         .register(&shielded(&fixture::actor(1)).unwrap())
         .unwrap();
-    let quote = Quote {
-        buy_amount: expected_quote(&net, &chain, amount, HONEST.spread_bps),
-        expiry: chain.now().unwrap() + 20,
-    };
+    let buy_amount = expected_quote(&net, &chain, amount, HONEST.spread_bps);
+    let expiry = chain.now().unwrap() + 20;
     let listener = TcpListener::bind(dealer_addr(6, 1)).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
-    let server = thread::spawn(move || serve(listener, &flag, |_| Ok(quote)));
+    let server = thread::spawn(move || {
+        serve(listener, &flag, |rfq: Rfq| {
+            sign_quote(&fixture::actor(1), &rfq, buy_amount, expiry).map_err(|e| e.to_string())
+        })
+    });
     let cfg = TraderConfig {
         dealers: vec![DealerRef {
             address: dealer_addr(6, 1),
@@ -395,6 +410,122 @@ fn unquoted_order_is_not_settled() {
     assert_eq!(
         refunded,
         vec![(hex(&order.hash(0).unwrap()), Status::Cancelled)]
+    );
+    d1.stop();
+}
+
+#[test]
+fn http_quote_settles() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let net = start(8);
+    let chain = net.chain();
+    const KEY: &str = "e2e-http-key-0123456789";
+    let key_file = net.keys.join("http-key");
+    std::fs::write(&key_file, KEY).unwrap();
+    let http = SocketAddr::from(([127, 0, 0, 1], 47_100 + 8));
+    let d1 = spawn_dealer_with(
+        &net,
+        8,
+        1,
+        HONEST,
+        Some(Http {
+            listen: http,
+            key: KeySource::File(key_file),
+        }),
+    );
+    let kp = shielded(&fixture::actor(0)).unwrap();
+    chain.register(&kp).unwrap();
+    let amount: u64 = 400_000_000;
+    let web = reqwest::blocking::Client::new();
+    let body = serde_json::json!({
+        "sell_mint": net.spl.to_string(),
+        "buy_mint": SOL_MINT.to_string(),
+        "sell_amount": amount.to_string(),
+        "trader": kp.pubkey().to_string(),
+    });
+    let post = |key: &str| {
+        web.post(format!("http://{http}/quote"))
+            .header("x-keeler-key", key)
+            .json(&body)
+            .send()
+            .unwrap()
+    };
+    assert_eq!(post("wrong-key").status(), 401);
+    let reply: serde_json::Value = post(KEY).json().unwrap();
+    let buy_amount: u64 = reply["quote"]["buy_amount"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expiry = reply["quote"]["expiry"].as_u64().unwrap();
+    assert_eq!(
+        buy_amount,
+        expected_quote(&net, &chain, amount, HONEST.spread_bps)
+    );
+    let rfq = Rfq {
+        sell_mint: net.spl.to_string(),
+        buy_mint: SOL_MINT.to_string(),
+        sell_amount: amount,
+        trader: kp.pubkey().to_string(),
+    };
+    let signed = serde_json::from_value(serde_json::json!({
+        "buy_amount": buy_amount,
+        "expiry": expiry,
+        "signature": reply["quote"]["signature"],
+    }))
+    .unwrap();
+    assert!(signed_by(&fixture::actor(1).pubkey(), &rfq, &signed));
+    let health: serde_json::Value = web
+        .get(format!("http://{http}/health"))
+        .header("x-keeler-key", KEY)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(health["ok"], true);
+    assert!(health["now"].as_u64().unwrap() < expiry);
+
+    // A restart between quote and lock: the quote comes back from the state
+    // file, so the order still settles.
+    d1.stop();
+    let d1 = spawn_dealer_with(
+        &net,
+        8,
+        1,
+        HONEST,
+        Some(Http {
+            listen: http,
+            key: KeySource::File(net.keys.join("http-key")),
+        }),
+    );
+
+    // Lock against the HTTP quote, as the browser does.
+    let before = net.balances(&chain, 0);
+    let dealer_pk = fixture::actor(1).pubkey();
+    let source = chain.notes(&kp, net.spl).unwrap().remove(0);
+    let terms = OrderTerms {
+        destination_mint: chain.mint(SOL_MINT).unwrap(),
+        destination_amount: buy_amount,
+        maker: kp.shielded_address().unwrap(),
+        expiry,
+        taker: Some(identity(&dealer_pk).unwrap()),
+    };
+    let order = chain
+        .lock(
+            &kp,
+            terms,
+            amount,
+            source,
+            chain.resolve(dealer_pk).unwrap(),
+        )
+        .unwrap();
+    while chain.status(&order).unwrap() != Status::Settled {
+        assert!(chain.now().unwrap() <= expiry, "not settled before expiry");
+        sleep(Duration::from_secs(1));
+    }
+    assert_eq!(
+        net.balances(&chain, 0),
+        (before.0 - amount, before.1 + buy_amount)
     );
     d1.stop();
 }

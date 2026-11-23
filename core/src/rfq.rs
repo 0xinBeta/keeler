@@ -18,11 +18,72 @@ pub struct Rfq {
     pub trader: String,
 }
 
-/// `expiry` is chain time (unix seconds from the Clock sysvar).
+/// `expiry` is chain time (unix seconds from the Clock sysvar). `signature`
+/// is the dealer's Ed25519 signature over [`quote_message`], 128 hex
+/// characters on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quote {
     pub buy_amount: u64,
     pub expiry: u64,
+    #[serde(with = "hex64")]
+    pub signature: [u8; 64],
+}
+
+pub const QUOTE_DOMAIN: &[u8; 15] = b"keeler-quote-v1";
+pub const QUOTE_MESSAGE_LEN: usize = 167;
+
+/// What a dealer signs: the domain, then the program ID, sell mint, buy mint
+/// and trader (32 bytes each), then the sell amount, buy amount and expiry
+/// (u64 little-endian each).
+pub fn quote_message(
+    program_id: &[u8; 32],
+    sell_mint: &[u8; 32],
+    buy_mint: &[u8; 32],
+    trader: &[u8; 32],
+    sell_amount: u64,
+    buy_amount: u64,
+    expiry: u64,
+) -> [u8; QUOTE_MESSAGE_LEN] {
+    let mut m = [0u8; QUOTE_MESSAGE_LEN];
+    let parts: [&[u8]; 8] = [
+        QUOTE_DOMAIN,
+        program_id,
+        sell_mint,
+        buy_mint,
+        trader,
+        &sell_amount.to_le_bytes(),
+        &buy_amount.to_le_bytes(),
+        &expiry.to_le_bytes(),
+    ];
+    let mut at = 0;
+    for part in parts {
+        m[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    debug_assert_eq!(at, QUOTE_MESSAGE_LEN);
+    m
+}
+
+/// A 64-byte array as exactly 128 hex characters.
+mod hex64 {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let text = String::deserialize(d)?;
+        let bad = || D::Error::custom("signature must be 128 hex characters");
+        if text.len() != 128 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad());
+        }
+        let mut out = [0u8; 64];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+        }
+        Ok(out)
+    }
 }
 
 /// `{"quote":{...}}` or `{"error":"..."}`.
@@ -183,7 +244,11 @@ mod tests {
     }
 
     fn q(buy_amount: u64, expiry: u64) -> Option<Quote> {
-        Some(Quote { buy_amount, expiry })
+        Some(Quote {
+            buy_amount,
+            expiry,
+            signature: [0; 64],
+        })
     }
 
     /// Runs `serve` on 127.0.0.1 with `handler` while `f` runs, then stops it.
@@ -237,11 +302,15 @@ mod tests {
         let quote = Quote {
             buy_amount: u64::MAX,
             expiry: 1_763_900_030,
+            signature: [0xab; 64],
         };
         let json = serde_json::to_string(&Reply::Quote(quote)).unwrap();
         assert_eq!(
             json,
-            r#"{"quote":{"buy_amount":18446744073709551615,"expiry":1763900030}}"#
+            format!(
+                r#"{{"quote":{{"buy_amount":18446744073709551615,"expiry":1763900030,"signature":"{}"}}}}"#,
+                "ab".repeat(64)
+            )
         );
         match serde_json::from_str(&json).unwrap() {
             Reply::Quote(back) => assert_eq!(back, quote),
@@ -258,6 +327,36 @@ mod tests {
     }
 
     #[test]
+    fn signature_must_be_128_hex_characters() {
+        let parse = |sig: &str| {
+            serde_json::from_str::<Quote>(&format!(
+                r#"{{"buy_amount":1,"expiry":2,"signature":"{sig}"}}"#
+            ))
+        };
+        assert_eq!(parse(&"0F".repeat(64)).unwrap().signature, [0x0f; 64]);
+        // Owned input too, as from a serde_json::Value.
+        let v = serde_json::json!({"buy_amount": 1, "expiry": 2, "signature": "ab".repeat(64)});
+        assert_eq!(
+            serde_json::from_value::<Quote>(v).unwrap().signature,
+            [0xab; 64]
+        );
+        assert!(parse(&"0f".repeat(63)).is_err());
+        assert!(parse(&"0g".repeat(64)).is_err());
+        assert!(serde_json::from_str::<Quote>(r#"{"buy_amount":1,"expiry":2}"#).is_err());
+    }
+
+    #[test]
+    fn quote_message_layout() {
+        let m = quote_message(&[1; 32], &[2; 32], &[3; 32], &[4; 32], 5, 6, 7);
+        assert_eq!(&m[..15], b"keeler-quote-v1");
+        assert_eq!(&m[15..47], &[1; 32]);
+        assert_eq!(&m[111..143], &[4; 32]);
+        assert_eq!(&m[143..151], &5u64.to_le_bytes());
+        assert_eq!(&m[151..159], &6u64.to_le_bytes());
+        assert_eq!(&m[159..167], &7u64.to_le_bytes());
+    }
+
+    #[test]
     fn protocol_good_and_error_replies() {
         let mut seen = Vec::new();
         with_server(
@@ -269,6 +368,7 @@ mod tests {
                     Ok(Quote {
                         buy_amount: 299_100_000,
                         expiry: 1_763_900_030,
+                        signature: [0; 64],
                     })
                 }
             },
@@ -290,14 +390,18 @@ mod tests {
 
     #[test]
     fn client_rejects_bad_dealers() {
-        let quote = br#"{"quote":{"buy_amount":1,"expiry":2}}"#;
+        let quote = format!(
+            r#"{{"quote":{{"buy_amount":1,"expiry":2,"signature":"{}"}}}}"#,
+            "00".repeat(64)
+        );
+        let quote = quote.as_bytes();
         // Valid JSON padded past the cap, so only the cap can reject it.
         let mut oversized = quote.to_vec();
         oversized.extend(std::iter::repeat_n(b' ', MAX_LINE));
         oversized.push(b'\n');
         let dealers = [
-            raw_dealer([&quote[..], b"\n"].concat(), Duration::ZERO),
-            raw_dealer([&quote[..], b"\n"].concat(), Duration::from_secs(1)), // slow
+            raw_dealer([quote, b"\n"].concat(), Duration::ZERO),
+            raw_dealer([quote, b"\n"].concat(), Duration::from_secs(1)), // slow
             raw_dealer(oversized, Duration::ZERO),
             raw_dealer(b"hello\n".to_vec(), Duration::ZERO),
             raw_dealer(quote.to_vec(), Duration::ZERO), // closes without newline
@@ -320,6 +424,7 @@ mod tests {
                 Ok(Quote {
                     buy_amount: 7,
                     expiry: 9,
+                    signature: [0; 64],
                 })
             },
             |addr| {
