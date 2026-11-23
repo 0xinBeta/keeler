@@ -1,5 +1,5 @@
-// Keeler's in-page wallet: an Ed25519 key in localStorage, exposed as a Wallet
-// Standard wallet so the client treats it like any extension. For test tokens.
+// The browser test wallet: an Ed25519 key in localStorage, exposed as a Wallet Standard
+// wallet so the client treats it like any extension. Test networks only (see network.ts).
 import {
   createKeyPairSignerFromPrivateKeyBytes,
   getTransactionDecoder,
@@ -17,7 +17,7 @@ import type {
 } from "@solana/wallet-standard-features";
 import type { StandardConnectFeature, StandardEventsFeature } from "@wallet-standard/features";
 
-export const IN_PAGE_WALLET_NAME = "Keeler in-page wallet";
+export const IN_PAGE_WALLET_NAME = "Browser test wallet";
 const STORAGE_KEY = "keeler:in-page-wallet:v1";
 const CHAINS = ["solana:localnet", "solana:devnet"] as const;
 const ICON =
@@ -67,6 +67,9 @@ export function createInPageWallet(): Wallet {
     return Promise.all(
       inputs.map(async (i) => {
         mine(i.account);
+        if (!CHAINS.includes(i.chain as (typeof CHAINS)[number])) {
+          throw new Error(`the browser test wallet signs only for ${CHAINS.join(" and ")}, not ${i.chain ?? "an unnamed chain"}`);
+        }
         const tx = getTransactionDecoder().decode(i.transaction);
         const signed = await partiallySignTransaction([s.keyPair], tx);
         return { signedTransaction: new Uint8Array(getTransactionEncoder().encode(signed)) };

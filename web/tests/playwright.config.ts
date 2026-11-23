@@ -35,7 +35,7 @@ export default defineConfig({
     },
     {
       // The harness needs the dev server; it proxies /api and /v1/spr to the Worker above.
-      command: `VITE_DEALERS="$(node -p 'JSON.stringify([require(process.argv[1]).dealer.pubkey])' ${STACK}.json)" npx vite --host 127.0.0.1 --port 5180 --strictPort`,
+      command: `VITE_NETWORK=local VITE_DEALERS="$(node -p 'JSON.stringify([require(process.argv[1]).dealer.pubkey])' ${STACK}.json)" npx vite --host 127.0.0.1 --port 5180 --strictPort`,
       cwd: web,
       url: "http://127.0.0.1:5180/tests/harness/index.html",
       timeout: 120_000,

@@ -29,6 +29,8 @@ bash "$root/scripts/localnet.sh" start "$offset" >/dev/null
 # What a deploy sets at build time (plan G1): the site's own copy of the dealer keys.
 VITE_DEALERS=$(node -e 'const w = require(process.argv[1]); console.log(JSON.stringify([w.dealer.pubkey]))' "$json")
 export VITE_DEALERS
+# The client refuses a service on another network than the one it was built for.
+export VITE_NETWORK=local
 (cd "$root/web" && pnpm build)
 
 # Values for worker/.dev.vars (git-ignored), from the stack. maxSell caps tUSD at 1,000 per order.

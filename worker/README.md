@@ -77,7 +77,8 @@ builds the site with `VITE_DEALERS`, writes `worker/.dev.vars` from the network'
 `target/localnet/keeler-web-<offset>.json` and runs `wrangler dev`; Ctrl-C stops it all.
 
 By hand: start the local network (`scripts/localnet.sh`), build the site
-(`cd ../web && VITE_DEALERS='["<dealer pubkey>"]' pnpm build`), then put this in
+(`cd ../web && VITE_NETWORK=local VITE_DEALERS='["<dealer pubkey>"]' pnpm build`; the site refuses a
+service whose `NETWORK` differs from `VITE_NETWORK`), then put this in
 `worker/.dev.vars` (git-ignored; placeholder values):
 
 ```sh
