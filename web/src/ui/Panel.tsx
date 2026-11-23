@@ -23,7 +23,7 @@ type Props = {
 type Phase = "wallet" | "unlock" | "register" | "ready";
 type View =
   | { kind: "form" }
-  | { kind: "quotes"; fair: bigint; quotes: Quote[]; selected: string | null }
+  | { kind: "quotes"; fair: bigint; priceTime: number; quotes: Quote[]; selected: string | null }
   | { kind: "progress"; quote: Quote; step: SwapStep | null; orderId: string | null; failed: string | null };
 
 /** Runs one action at a time, keeping its label for the busy button and its error for the panel. */
@@ -185,9 +185,21 @@ function SwapTab(p: Props & { toBalances: () => void }) {
   const buyAsset = config.assets.find((a) => a.mint === buy)!;
   const bal = balances?.find((b) => b.asset.mint === sell);
   const parsed = parseUnits(text, sellAsset.decimals, sellAsset.symbol);
+  // The maximum is the smaller of the per-swap cap and the largest note; the message names whichever applies.
+  const capped = bal !== undefined && sellAsset.maxSell !== undefined && sellAsset.maxSell < bal.largestNote;
+  const max = bal ? (capped ? sellAsset.maxSell! : bal.largestNote) : 0n;
+  const maxText = `${formatUnits(max, sellAsset.decimals)} ${sellAsset.symbol}`;
   let invalid = typeof parsed === "string" ? parsed : null;
-  if (!invalid && bal && typeof parsed === "bigint" && parsed > bal.largestNote)
-    invalid = `One swap spends one private note, and your largest is ${formatUnits(bal.largestNote, sellAsset.decimals)} ${sellAsset.symbol}. Enter that or less.`;
+  if (!invalid && bal && typeof parsed === "bigint" && parsed > max)
+    invalid = capped
+      ? `One swap can sell at most ${maxText}. Enter that or less.`
+      : `One swap spends one private note, and your largest is ${maxText}. Enter that or less.`;
+  const paused = config.paused;
+  const pauseNote = paused && (
+    <p className="note note-warn" role="status">
+      <strong>Swaps are paused.</strong> Balances, withdrawals and taking funds back still work.
+    </p>
+  );
 
   const pick = (which: "sell" | "buy", mint: string) => {
     const other = config.assets.find((a) => a.mint !== mint)?.mint ?? mint;
@@ -202,7 +214,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
 
   const getQuotes = () => {
     setShown(true);
-    if (invalid || typeof parsed !== "bigint") return;
+    if (paused || invalid || typeof parsed !== "bigint") return;
     p.setLights(config.dealers.map(() => "waiting"));
     return act.run("quotes", async () => {
       try {
@@ -216,7 +228,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
           ),
         );
         const usable = res.quotes.find((q) => q.inBand);
-        setView({ kind: "quotes", fair: res.fair, quotes: res.quotes, selected: usable?.dealer ?? null });
+        setView({ kind: "quotes", fair: res.fair, priceTime: res.priceTime, quotes: res.quotes, selected: usable?.dealer ?? null });
       } catch (e) {
         p.setLights(null);
         throw e;
@@ -253,11 +265,14 @@ function SwapTab(p: Props & { toBalances: () => void }) {
     const usable = (q: Quote) => q.inBand && (now === null || q.expiry - now >= config.minTtlSecs);
     const chosen = view.quotes.find((q) => q.dealer === view.selected && usable(q)) ?? null;
     const band = (config.bandBps / 100).toFixed(2);
+    const age = now === null ? null : Math.max(0, Math.round(now - view.priceTime));
     return (
       <div className="stack">
+        {pauseNote}
         <p className="muted">
           For <Amount value={view.quotes[0]?.sellAmount ?? 0n} asset={sellAsset} />, the reference price gives{" "}
           <Amount value={view.fair} asset={buyAsset} />.
+          {age !== null && <span className="num"> Reference price from {age < 60 ? `${age} s` : `${Math.floor(age / 60)} min ${age % 60} s`} ago.</span>}
         </p>
         <fieldset className="quotes">
           <legend className="sr-only">Choose a quote</legend>
@@ -288,6 +303,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
                   <span className="muted">
                     Dealer <span className="mono">{short(q.dealer)}</span>
                   </span>
+                  <span className="muted verified">Signature verified</span>
                 </span>
                 <span className="quote-side">
                   <span className={q.vsFairBps >= 0 ? "good" : "muted"}>{bps(q.vsFairBps)}</span>
@@ -303,11 +319,12 @@ function SwapTab(p: Props & { toBalances: () => void }) {
           })}
         </fieldset>
         {!chosen && <p className="note">No quote can be used right now. Get new quotes to try again.</p>}
-        <button className="btn btn-primary" disabled={!chosen} onClick={() => chosen && swap(chosen)}>
+        <p className="muted small">{"The dealer may decline if the price moves before it settles. Your funds stay locked until the quote expires, then you can take them back."}</p>
+        <button className="btn btn-primary" disabled={!chosen || paused} onClick={() => chosen && swap(chosen)}>
           Swap privately
         </button>
         <div className="row">
-          <button className="btn btn-ghost" onClick={getQuotes} disabled={!!act.busy}>
+          <button className="btn btn-ghost" onClick={getQuotes} disabled={!!act.busy || paused}>
             {act.busy ? "Getting quotes…" : "Get new quotes"}
           </button>
           <button className="btn btn-ghost" onClick={back}>
@@ -329,6 +346,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
         getQuotes();
       }}
     >
+      {pauseNote}
       <div className="field">
         <label htmlFor="sell-amt">You sell</label>
         <div className="combo">
@@ -355,13 +373,14 @@ function SwapTab(p: Props & { toBalances: () => void }) {
             <span className="bad">{invalid}</span>
           ) : bal ? (
             <span>
-              Largest private note <Amount value={bal.largestNote} asset={sellAsset} />
+              Maximum <Amount value={max} asset={sellAsset} />{" "}
+              <span className="muted">{capped ? "(per-swap limit)" : "(largest private note)"}</span>
             </span>
           ) : (
             <span>Reading your private balance…</span>
           )}
-          {bal && bal.largestNote > 0n && (
-            <button type="button" className="link" onClick={() => setText(formatUnits(bal.largestNote, sellAsset.decimals).replace(/,/g, ""))}>
+          {max > 0n && (
+            <button type="button" className="link" onClick={() => setText(formatUnits(max, sellAsset.decimals).replace(/,/g, ""))}>
               Use maximum
             </button>
           )}
@@ -395,7 +414,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
           </button>
         </div>
       ) : (
-        <button className="btn btn-primary" type="submit" disabled={!!act.busy} aria-busy={!!act.busy}>
+        <button className="btn btn-primary" type="submit" disabled={!!act.busy || paused} aria-busy={!!act.busy}>
           {act.busy ? "Asking dealers…" : "Get quotes"}
         </button>
       )}
@@ -459,6 +478,9 @@ function Progress(
                   <span className="muted step-sub num">
                     {left > 0 ? `Dealer has ${countdown(left)} to settle` : "Quote expired, checking…"}
                   </span>
+                )}
+                {s.key === "locked" && state === "now" && status === "locked" && (
+                  <span className="muted step-sub">{"The dealer may decline if the price moves before it settles. Your funds stay locked until the quote expires, then you can take them back."}</span>
                 )}
               </span>
             </li>

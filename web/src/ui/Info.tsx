@@ -95,8 +95,8 @@ export function Info() {
             <strong>One dealer.</strong> A single dealer runs on one machine, so quotes may be missing at times.
           </li>
           <li>
-            <strong>Orders are remembered by this browser only.</strong> If you clear site data before an order
-            expires, this page can no longer take your funds back.
+            <strong>Orders can be found again from the chain.</strong> This browser keeps a list of your orders; if it
+            is lost, connect the same wallet and use "Find my orders" to read them back from the chain.
           </li>
           <li>
             <strong>Prices and order status come through Keeler's server.</strong> You trust it for the reference price

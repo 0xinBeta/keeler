@@ -147,7 +147,20 @@ export function App({ keeler }: { keeler: Keeler }) {
             </section>
         </section>
         {ready && (
-          <Orders keeler={keeler} orders={orders} chainOffset={chainOffset} refresh={refreshOrders} refreshBalances={refreshBalances} />
+          <Orders
+            keeler={keeler}
+            orders={orders}
+            chainOffset={chainOffset}
+            refresh={refreshOrders}
+            refreshBalances={refreshBalances}
+            rescan={() =>
+              keeler.rescanOrders().then((list) => {
+                for (const o of list) seen.current.set(o.id, o.status);
+                setOrders(list);
+                return list;
+              })
+            }
+          />
         )}
         <Info />
       </main>
@@ -157,7 +170,7 @@ export function App({ keeler }: { keeler: Keeler }) {
           Named after the Keeler Gap, a thin dark lane in Saturn's A ring. The small moon Daphnis keeps it open and
           raises waves on its edges as it passes.
         </p>
-        <p className="muted">Unaudited test software. Orders are remembered by this browser only.</p>
+        <p className="muted">Unaudited test software, running with test tokens.</p>
       </footer>
     </>
   );

@@ -1,12 +1,13 @@
 // In-memory Keeler for building the interface without a chain. `?mock=<scenario>` makes one error reachable:
-// dealer-offline, no-quotes, wallet-rejected, storage, rate-limited.
+// dealer-offline, no-quotes, wallet-rejected, storage, rate-limited, paused.
 import type { Wallet } from "@wallet-standard/base";
 import { KeelerError } from "./index";
 import type { Asset, Balance, Config, Keeler, Order, Quote, SwapStep } from "./index";
 
-type Scenario = "dealer-offline" | "no-quotes" | "wallet-rejected" | "storage" | "rate-limited" | null;
+type Scenario = "dealer-offline" | "no-quotes" | "wallet-rejected" | "storage" | "rate-limited" | "paused" | null;
 
-const tUSD: Asset = { mint: "tUSDm1nt5Y7oQqP2xG8dVt4bKcWfz3LrHn6aJe9sMpU", symbol: "tUSD", decimals: 6 };
+// tUSD has a per-swap cap below what the faucet gives, so both maximum rules are reachable.
+const tUSD: Asset = { mint: "tUSDm1nt5Y7oQqP2xG8dVt4bKcWfz3LrHn6aJe9sMpU", symbol: "tUSD", decimals: 6, maxSell: 250_000000n };
 const tSOL: Asset = { mint: "tSoLm1ntR4wQ8nZ2vY6kHc3dPx9fTb7GjEu5LsAaNoV", symbol: "tSOL", decimals: 9 };
 
 // Reference price: 1 tSOL = 142.37 tUSD, kept as a fraction so amounts stay exact.
@@ -47,6 +48,7 @@ export function createMockKeeler(): Keeler {
     minTtlSecs: 20,
     maxTtlSecs: 120,
     faucet: true,
+    paused: scenario === "paused",
   };
 
   const wallet: Wallet = {
@@ -91,6 +93,9 @@ export function createMockKeeler(): Keeler {
       o.status = "settled";
       addNote(o.buy, o.buyAmount);
     } else if (now() > o.expiry) o.status = "refundable";
+  };
+  const paused = () => {
+    if (config.paused) throw new KeelerError("paused", "Swaps are paused right now. Your balances, withdrawals and refunds still work.");
   };
   const strip = ({ settlesAt: _, ...o }: (typeof orders)[number]): Order => ({ ...o });
 
@@ -153,6 +158,7 @@ export function createMockKeeler(): Keeler {
     },
     async quotes(sell, buy, sellAmount) {
       need("unlock");
+      paused();
       await sleep(1400);
       if (scenario === "rate-limited")
         throw new KeelerError("rate-limited", "Too many quote requests from this connection. Wait a minute, then try again.");
@@ -173,11 +179,12 @@ export function createMockKeeler(): Keeler {
         vsFairBps: d.bps,
       }));
       quotes.sort((a, b) => Number(b.inBand) - Number(a.inBand) || b.vsFairBps - a.vsFairBps);
-      return { fair: f, quotes };
+      return { fair: f, priceTime: t - 4, quotes };
     },
     async swap(quote, on: (step: SwapStep) => void) {
       need("unlock");
       if (busy) throw new KeelerError("busy", "A swap is already in progress. Wait for it to finish.");
+      paused();
       busy = true;
       try {
         on("checking");
@@ -215,6 +222,12 @@ export function createMockKeeler(): Keeler {
     },
     async orders() {
       await sleep(150);
+      orders.forEach(refresh);
+      return orders.map(strip);
+    },
+    async rescanOrders() {
+      need("unlock");
+      await sleep(2200);
       orders.forEach(refresh);
       return orders.map(strip);
     },

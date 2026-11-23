@@ -490,6 +490,9 @@ select.wide {
   background: var(--void);
   font-size: 15px;
 }
+.note-warn {
+  border-color: rgb(233 184 114 / 0.55);
+}
 .note-error {
   border-color: rgb(255 106 61 / 0.55);
 }
@@ -559,6 +562,9 @@ select.wide {
 .quote-amt {
   font-size: 17px;
   font-weight: 500;
+}
+.verified {
+  font-size: 13px;
 }
 .quote-off {
   cursor: not-allowed;
@@ -820,6 +826,21 @@ select.wide {
 }
 .order:last-child {
   border-bottom: 0;
+}
+.order-note {
+  flex-basis: 100%;
+  font-size: 14px;
+}
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+.section-head h2 {
+  margin: 0;
 }
 .order-pair {
   font-weight: 500;
