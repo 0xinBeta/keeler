@@ -31,8 +31,9 @@ export async function nextRecord(r: OrderRecord, now: number, chain: ChainReads)
     const height = await chain.blockHeight();
     const s = await chain.signatureStatus(r.tx.signature);
     if (s === null) return height > r.tx.lastValidBlockHeight ? { ...r, status: "failed", error: NEVER_LANDED } : r;
-    if (s.err !== null && s.err !== undefined) return { ...r, status: "failed", error: FAILED_ON_CHAIN };
+    // Confirmation first: an error seen only at processed level may be from a fork that is dropped.
     if (s.confirmationStatus !== "confirmed" && s.confirmationStatus !== "finalized") return r;
+    if (s.err !== null && s.err !== undefined) return { ...r, status: "failed", error: FAILED_ON_CHAIN };
   }
   const spend = await chain.spend(r);
   const status = spend === "settled" || spend === "taken-unmatched" ? "settled" : spend === "cancelled" ? "refunded" : now > r.expiry ? "refundable" : "locked";
@@ -40,6 +41,21 @@ export async function nextRecord(r: OrderRecord, now: number, chain: ChainReads)
   if (status === r.status && error === r.error) return r;
   const { error: _old, ...rest } = r;
   return { ...rest, status, ...(error ? { error } : {}) };
+}
+
+/**
+ * Every record refreshed at chain time; never rejects. If chain time cannot be read the stored
+ * records come back unchanged, and a record whose own read fails keeps its stored status, so a
+ * failed read never hides an order (or its refund button) that may hold locked funds.
+ */
+export async function refreshAll(records: OrderRecord[], chainNow: () => Promise<number>, refresh: (r: OrderRecord, now: number) => Promise<OrderRecord>): Promise<OrderRecord[]> {
+  let now: number;
+  try {
+    now = await chainNow();
+  } catch {
+    return records;
+  }
+  return Promise.all(records.map((r) => refresh(r, now).catch(() => r)));
 }
 
 /** Why `r` cannot be refunded now, or undefined when it can. */

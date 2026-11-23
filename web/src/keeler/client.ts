@@ -40,7 +40,7 @@ import {
 import { BUILD_NETWORK, testWalletAllowed, walletChain } from "./network";
 import { fairBuyAmount, ttlOk, vsFairBps, withinBand, type Price } from "./price";
 import { verifyQuote } from "./quote-sig";
-import { nextRecord, refundRefusal, type ChainReads } from "./status";
+import { nextRecord, refreshAll, refundRefusal, type ChainReads } from "./status";
 import { orderStore, type OrderRecord } from "./storage";
 import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
 import { createInPageWallet, IN_PAGE_WALLET_NAME } from "./wallet";
@@ -674,9 +674,8 @@ export function createKeeler(): Keeler {
       }),
 
     async orders() {
-      const now = await chainNow();
-      const all = (await store()).all();
-      return Promise.all(all.map(async (r) => toOrder(await refresh(r, now).catch(() => r))));
+      // shortcut: a failed status read is not surfaced (index.ts has no place for it); the stored orders show instead.
+      return (await refreshAll((await store()).all(), chainNow, refresh)).map(toOrder);
     },
 
     async rescanOrders() {
