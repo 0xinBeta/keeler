@@ -464,7 +464,7 @@ function SwapTab(p: Props & { toBalances: () => void }) {
 
 const STEPS: { key: SwapStep | "settled"; label: string }[] = [
   { key: "checking", label: "Checking the quote" },
-  { key: "proving", label: "Proving in your browser" },
+  { key: "proving", label: "Proving your order" },
   { key: "signing", label: "Sign in your wallet" },
   { key: "locked", label: "Locked, waiting for the dealer" },
   { key: "settled", label: "Settled" },
@@ -484,6 +484,8 @@ function Progress(
 
   let line: string;
   if (view.failed) line = "The swap stopped.";
+  // The client flags a settled order whose payout it could not match to the quote; show that, not an amount.
+  else if (status === "settled" && order?.error) line = order.error;
   else if (status === "settled") line = `Settled. You received ${formatUnits(q.buyAmount, q.buy.decimals)} ${q.buy.symbol} privately.`;
   else if (status === "refunded") line = `Done. Your ${formatUnits(q.sellAmount, q.sell.decimals)} ${q.sell.symbol} is back in your private balance.`;
   else if (status === "refundable")

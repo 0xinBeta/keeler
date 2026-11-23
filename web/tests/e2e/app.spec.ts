@@ -49,7 +49,7 @@ async function startSwap(page: Page, amount: string, onProving?: () => void) {
   const quoted = await p.locator(".quote .quote-amt").first().innerText();
   await p.getByRole("button", { name: "Swap privately" }).click();
   if (onProving) {
-    await expect(p.locator(".step-now", { hasText: "Proving in your browser" })).toBeVisible({ timeout: 30_000 });
+    await expect(p.locator(".step-now", { hasText: "Proving your order" })).toBeVisible({ timeout: 30_000 });
     onProving();
   }
   await expect(p.getByText(/^(Locked\. Waiting for the dealer|Settled\.)/)).toBeVisible({ timeout: 120_000 });
