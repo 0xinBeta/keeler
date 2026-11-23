@@ -6,6 +6,7 @@ import {
   getSignatureFromTransaction,
   getTransactionDecoder,
   getTransactionEncoder,
+  signature as toSignature,
   type Address,
   type Transaction,
 } from "@solana/kit";
@@ -34,14 +35,14 @@ import {
   type Config,
   type Keeler,
   type Order,
-  type OrderStatus,
   type Quote,
-  type SwapStep,
 } from "./index";
+import { BUILD_NETWORK, testWalletAllowed, walletChain } from "./network";
 import { fairBuyAmount, ttlOk, vsFairBps, withinBand, type Price } from "./price";
 import { verifyQuote } from "./quote-sig";
+import { nextRecord, refundRefusal, type ChainReads } from "./status";
 import { orderStore, type OrderRecord } from "./storage";
-import { buildCancel, buildMake, leafIndex, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
+import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
 import { createInPageWallet, IN_PAGE_WALLET_NAME } from "./wallet";
 
 type ServerConfig = Config & { rpcPath: string; sprPath: string };
@@ -61,9 +62,13 @@ function compiledDealers(): string[] | undefined {
   }
 }
 
-/** `/api/config` as served, with `maxSell` decimal strings. */
-function parseConfig(raw: Record<string, unknown>): ServerConfig {
+/** `/api/config` as served, with `maxSell` decimal strings; refused unless it is for the network this site was built for. */
+export function parseConfig(raw: Record<string, unknown>, built = BUILD_NETWORK): ServerConfig {
   const c = raw as unknown as ServerConfig & { assets: (Config["assets"][number] & { maxSell?: unknown })[] };
+  if (!built) throw err("network", "This site was built without VITE_NETWORK, so it cannot tell which network it is for. It will not start; rebuild it with VITE_NETWORK set.");
+  if (c.network !== built) {
+    throw err("network", `This site was built for ${built}, but the service runs ${String(c.network)}. Do not use it; reload, and report it if this persists.`);
+  }
   return {
     ...c,
     paused: c.paused === true,
@@ -80,6 +85,21 @@ const TEE_POLICY_ORIGIN = "https://d3gbdb0egjwcw9.cloudfront.net";
 const REQUIRED = ["standard:connect", "solana:signMessage", "solana:signTransaction"] as const;
 
 const err = (code: KeelerError["code"], message: string) => new KeelerError(code, message);
+
+/** How long a wallet prompt may stay open before the client gives up on it. */
+export const WALLET_TIMEOUT_MS = 120_000;
+
+/** `call`, or a `wallet-rejected` error once `ms` pass without an answer. */
+export function walletAnswer<T>(call: Promise<T>, what: string, ms = WALLET_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(err("wallet-rejected", `Your wallet did not answer within ${Math.round(ms / 1000)} s, so ${what}. Open your wallet and try again.`)), ms);
+  });
+  return Promise.race([call, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Where to send people whose wallet cannot sign: the browser test wallet, on test networks only. */
+const otherWallet = () => (testWalletAllowed() ? ` Use the ${IN_PAGE_WALLET_NAME} on this test network.` : "");
 
 function isRejection(e: unknown): boolean {
   const text = String((e as { message?: unknown })?.message ?? e).toLowerCase();
@@ -123,7 +143,8 @@ export function createKeeler(): Keeler {
   let wallet: Wallet | undefined;
   let account: WalletAccount | undefined;
   let unlocked: { keys: LocalKeys; spr: SprWallet } | undefined;
-  let busy = false;
+  /** "swap", or "refund:<order id>": a stuck swap prompt never blocks a refund. */
+  const running = new Set<string>();
 
   const config = () =>
     (cfg ??= getJson<Record<string, unknown>>("/api/config").then(parseConfig).catch((e) => {
@@ -171,28 +192,33 @@ export function createKeeler(): Keeler {
     return Number(new DataView(acc.data.buffer, acc.data.byteOffset).getBigInt64(32, true));
   };
 
-  /** Has the wallet sign `tx`, sends it, and waits for confirmation; returns the slot. */
-  const signAndSend = async (tx: Transaction): Promise<bigint> => {
+  /** Has the wallet sign `tx` for this network's chain; gives up after WALLET_TIMEOUT_MS. */
+  const signTx = async (tx: Transaction): Promise<Transaction> => {
     const feature = (wallet!.features as SolanaSignTransactionFeature)["solana:signTransaction"];
     const net = (await config()).network;
-    let signed: Transaction;
     try {
-      const [out] = await feature.signTransaction({
-        account: account!,
-        transaction: new Uint8Array(getTransactionEncoder().encode(tx)),
-        chain: `solana:${net}`,
-      });
-      signed = getTransactionDecoder().decode(out!.signedTransaction);
+      const [out] = await walletAnswer(
+        feature.signTransaction({ account: account!, transaction: new Uint8Array(getTransactionEncoder().encode(tx)), chain: walletChain(net) }),
+        "nothing was sent",
+      );
+      return getTransactionDecoder().decode(out!.signedTransaction);
     } catch (e) {
+      if (e instanceof KeelerError) throw e;
       if (isRejection(e)) throw err("wallet-rejected", "You declined the transaction in your wallet. Nothing was sent.");
-      throw err("wallet-unsupported", `The wallet could not sign this transaction (${String(e)}). Try Keeler's in-page wallet.`);
+      throw err("wallet-unsupported", `Your wallet cannot sign this transaction type yet (${String(e)}). Nothing was sent.${otherWallet()}`);
     }
+  };
+
+  /** Sends a signed transaction and waits for confirmation; returns the slot. */
+  const send = async (signed: Transaction): Promise<bigint> => {
     const c = await client();
     return as("network", "Sending the transaction", async () => {
       await c.solanaRpc.sendTransaction(getBase64EncodedWireTransaction(signed), { encoding: "base64" }).send();
       return c.confirmTransaction(getSignatureFromTransaction(signed));
     });
   };
+
+  const signAndSend = async (tx: Transaction) => send(await signTx(tx));
 
   const ctx = async (): Promise<SwapContext> => {
     const k = keys();
@@ -320,21 +346,24 @@ export function createKeeler(): Keeler {
     ...(r.error ? { error: r.error } : {}),
   });
 
-  /** Reads one record's status from its nullifier and chain time; saves a change. */
-  const refresh = async (r: OrderRecord, now: number): Promise<OrderRecord> => {
-    if (r.status === "settled" || r.status === "refunded" || r.status === "failed") return r;
+  /** The make this page is signing or sending right now: its record is not refreshed meanwhile. */
+  let inFlight: string | undefined;
+
+  const reads = async (): Promise<ChainReads> => {
     const c = await ctx();
-    let status: OrderStatus = r.status;
-    if ((await leafIndex(c, r.opening)) === undefined) {
-      // Never landed, or not indexed yet: a pending order past expiry is not on chain.
-      if (r.status === "pending" && now > r.expiry) status = "failed";
-    } else {
-      const s = await orderStatus(c, r.opening, { mint: address(r.buy.mint), amount: r.buyAmount });
-      status = s === "settled" ? "settled" : s === "cancelled" ? "refunded" : now > r.expiry ? "refundable" : "locked";
-    }
-    if (status === r.status) return r;
-    const next = { ...r, status, ...(status === "failed" ? { error: "The order never reached the chain; nothing is locked." } : {}) };
-    (await store()).put(next);
+    const rpc = c.client.solanaRpc;
+    return {
+      signatureStatus: async (sig) => (await rpc.getSignatureStatuses([toSignature(sig)], { searchTransactionHistory: true }).send()).value[0] ?? null,
+      blockHeight: () => rpc.getBlockHeight().send(),
+      spend: (r) => orderStatus(c, r.opening, { mint: address(r.buy.mint), amount: r.buyAmount }),
+    };
+  };
+
+  /** Reads one record's status from the chain at chain time `now`; saves a change. A failed read throws and changes nothing. */
+  const refresh = async (r: OrderRecord, now: number): Promise<OrderRecord> => {
+    if (r.id === inFlight) return r;
+    const next = await nextRecord(r, now, await reads());
+    if (next !== r) (await store()).put(next);
     return next;
   };
 
@@ -349,13 +378,15 @@ export function createKeeler(): Keeler {
     return out;
   };
 
-  const exclusive = async <T>(run: () => Promise<T>): Promise<T> => {
-    if (busy) throw err("busy", "Another swap or refund is in progress. Wait for it to finish.");
-    busy = true;
+  const exclusive = async <T>(key: string, run: () => Promise<T>): Promise<T> => {
+    if (running.has(key)) {
+      throw err("busy", key === "swap" ? "Another swap is in progress. Wait for it to finish." : "This order's refund is already in progress. Wait for it to finish.");
+    }
+    running.add(key);
     try {
       return await run();
     } finally {
-      busy = false;
+      running.delete(key);
     }
   };
 
@@ -366,10 +397,11 @@ export function createKeeler(): Keeler {
     },
 
     wallets() {
-      inPage ??= createInPageWallet();
       const installed = getWallets()
         .get()
         .filter((w) => w.name !== IN_PAGE_WALLET_NAME && REQUIRED.every((f) => f in w.features));
+      if (!testWalletAllowed()) return installed;
+      inPage ??= createInPageWallet();
       return [...installed, inPage];
     },
 
@@ -379,7 +411,7 @@ export function createKeeler(): Keeler {
       }
       const versions = (w.features as SolanaSignTransactionFeature)["solana:signTransaction"].supportedTransactionVersions;
       if (!versions.includes(1)) {
-        throw err("wallet-unsupported", `${w.name} cannot sign version 1 transactions, which private swaps need. Use Keeler's in-page wallet.`);
+        throw err("wallet-unsupported", `${w.name} cannot sign this transaction type yet (Solana version 1 transactions, which private swaps need).${otherWallet()}`);
       }
       let accounts: readonly WalletAccount[];
       try {
@@ -401,12 +433,16 @@ export function createKeeler(): Keeler {
     async unlock() {
       const me = owner();
       const sign = (wallet!.features as SolanaSignMessageFeature)["solana:signMessage"];
+      // Mainnet readiness (not built yet): this is the SDK's shared key-derivation message, the
+      // same text every SPR app asks to sign; a Keeler-specific domain would stop another site
+      // from obtaining the same keys by asking for the same signature.
       const message = ed25519DerivationMessage(new Uint8Array(account!.publicKey) as never);
       const once = async () => {
         try {
-          const [out] = await sign.signMessage({ account: account!, message });
+          const [out] = await walletAnswer(sign.signMessage({ account: account!, message }), "your private keys were not derived");
           return new Uint8Array(out!.signature);
         } catch (e) {
+          if (e instanceof KeelerError) throw e;
           if (isRejection(e)) throw err("wallet-rejected", "You declined the signature. Your private keys were not derived.");
           throw err("wallet-unsupported", `The wallet could not sign the key message (${String(e)}).`);
         }
@@ -471,11 +507,9 @@ export function createKeeler(): Keeler {
           const pub = await as("network", "Reading your public balance", async () => {
             if (mint === SOL_MINT) return (await c.solanaRpc.getBalance(me).send()).value;
             const ata = await getAssociatedTokenAddress(me, mint);
-            try {
-              return BigInt((await c.solanaRpc.getTokenAccountBalance(ata).send()).value.amount);
-            } catch {
-              return 0n; // No token account yet.
-            }
+            // Only a missing account means 0; any read error surfaces instead of showing 0.
+            if (!(await c.solanaRpc.getAccountInfo(ata, { encoding: "base64" }).send()).value) return 0n;
+            return BigInt((await c.solanaRpc.getTokenAccountBalance(ata).send()).value.amount);
           });
           const amounts = notes(mint).map((u) => u.utxo.amount);
           return {
@@ -546,7 +580,7 @@ export function createKeeler(): Keeler {
     },
 
     swap: (shown, on) =>
-      exclusive(async () => {
+      exclusive("swap", async () => {
         on("checking");
         const c = await quotingConfig();
         owner();
@@ -600,27 +634,43 @@ export function createKeeler(): Keeler {
         };
         const orders = await store();
         // Without this record the browser could never refund the order: no record, no send.
+        const save = (r: OrderRecord) => {
+          try {
+            orders.put(r);
+          } catch (e) {
+            throw err("storage", `Could not save the order in this browser (${String(e)}), so it was not sent. Free some site storage and try again.`);
+          }
+        };
+        inFlight = record.id;
         try {
-          orders.put(record);
-        } catch (e) {
-          throw err("storage", `Could not save the order in this browser (${String(e)}), so it was not sent. Free some site storage and try again.`);
-        }
-        on("signing");
-        try {
-          await signAndSend(built.transaction);
-        } catch (e) {
-          if (e instanceof KeelerError && (e.code === "wallet-rejected" || e.code === "wallet-unsupported")) {
-            orders.put({ ...record, status: "failed", error: e.message });
+          save(record);
+          on("signing");
+          let signed: Transaction;
+          try {
+            signed = await signTx(built.transaction);
+          } catch (e) {
+            // Not signed, so never sent: nothing can be locked.
+            orders.put({ ...record, status: "failed", error: e instanceof Error ? e.message : String(e) });
             throw e;
           }
-          const message = `${e instanceof Error ? e.message : String(e)} The order may be locked; refund it after ${new Date(q.expiry * 1000).toLocaleTimeString()}.`;
-          orders.put({ ...record, error: message });
-          throw err("network", message);
+          // The signature and lifetime are saved before the send, so the status can be decided
+          // later from the chain even if this page gives up waiting or closes.
+          const sent = { ...record, tx: { signature: getSignatureFromTransaction(signed), lastValidBlockHeight: built.lastValidBlockHeight } };
+          save(sent);
+          try {
+            await send(signed);
+          } catch (e) {
+            const message = `${e instanceof Error ? e.message : String(e)} The order may still reach the chain; its status will update here, and if it locked your funds you can take them back after ${new Date(q.expiry * 1000).toLocaleTimeString()}.`;
+            orders.put({ ...sent, error: message });
+            throw err("network", message);
+          }
+          const locked = { ...sent, status: "locked" as const };
+          orders.put(locked);
+          on("locked");
+          return toOrder(locked);
+        } finally {
+          inFlight = undefined;
         }
-        const locked = { ...record, status: "locked" as const };
-        orders.put(locked);
-        on("locked");
-        return toOrder(locked);
       }),
 
     async orders() {
@@ -661,7 +711,7 @@ export function createKeeler(): Keeler {
     },
 
     refund: (orderId) =>
-      exclusive(async () => {
+      exclusive(`refund:${orderId}`, async () => {
         const orders = await store();
         let found = orders.get(orderId);
         if (!found) {
@@ -670,10 +720,9 @@ export function createKeeler(): Keeler {
         }
         if (!found) throw err("storage", "No order with that id was found in this browser or on chain.");
         const now = await chainNow();
-        const r = await refresh(found, now);
-        if (r.status !== "refundable") {
-          throw err("quote-expired", r.status === "locked" ? `The order can be refunded after its expiry, ${new Date(r.expiry * 1000).toLocaleTimeString()}.` : `The order is ${r.status}; there is nothing to refund.`);
-        }
+        const r = await as("network", "Reading the order's status", () => refresh(found, now));
+        const refused = refundRefusal(r);
+        if (refused) throw err("quote-expired", refused);
         const tx = await as("proof", "Proving the refund", async () => buildCancel(await ctx(), r.opening, () => {}));
         try {
           await signAndSend(tx);

@@ -19,13 +19,13 @@ const SELL = 20_000_000n; // 20 tUSD
 test.describe.configure({ mode: "serial" });
 let page: Page;
 
-/** Opens the harness, connects and unlocks the in-page wallet (config is read once per page load). */
+/** Opens the harness, connects and unlocks the browser test wallet (config is read once per page load). */
 async function open() {
   await page.goto("/tests/harness/index.html");
   await page.waitForFunction(() => window.ready);
   await page.evaluate(async () => {
     const k = window.keeler;
-    await k.connect(k.wallets().find((w) => w.name.includes("in-page"))!);
+    await k.connect(k.wallets().find((w) => w.name === "Browser test wallet")!);
     await k.unlock();
   });
 }
@@ -122,6 +122,26 @@ test("above the per-order limit: refused before asking", async () => {
 test("a config listing other dealers than VITE_DEALERS: refused", async () => {
   await withConfig((c) => (c.dealers = [{ pubkey: "11111111111111111111111111111112" }]));
   expect(await codeOf(quote)).toMatch(/^no-quotes: The service lists different dealers/);
+});
+
+test("a service on another network than VITE_NETWORK: the client refuses to start", async () => {
+  await page.route("**/api/config", async (route) => {
+    const res = await route.fetch();
+    await route.fulfill({ response: res, json: { ...(await res.json()), network: "devnet" } });
+  });
+  await page.goto("/tests/harness/index.html");
+  await page.waitForFunction(() => window.ready);
+  expect(await codeOf("await k.config();")).toMatch(/^network: This site was built for local, but the service runs devnet/);
+});
+
+test("a token balance read that fails is an error, not 0", async () => {
+  await open();
+  await page.route("**/api/rpc", async (route) => {
+    const body = route.request().postDataJSON() as { method?: string; id?: unknown };
+    if (body?.method !== "getAccountInfo") return route.continue();
+    await route.fulfill({ status: 200, json: { jsonrpc: "2.0", id: body.id, error: { code: -32005, message: "node is behind" } } });
+  });
+  expect(await codeOf("await k.balances();")).toMatch(/^network: Reading your public balance failed/);
 });
 
 test("the dealer's 180 s quote under a 200 s minimum lock time: no usable quote", async () => {

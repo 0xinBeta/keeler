@@ -1,7 +1,7 @@
 // The page side of prover.worker.ts. Served layout under /swap/ (built by
 // scripts/setup.sh, git-ignored):
 //   swap_program.js, swap_program_bg.wasm      the swap program's WASM package
-//   make/{circuit.xbc,pk.bin}, cancel/{circuit.xbc,pk.bin}
+//   make/{circuit.xbc,pk.bin,vk.bin}, cancel/{circuit.xbc,pk.bin,vk.bin}
 //   proving-keys.json                          also bundled: the pins below
 export type Circuit = "make" | "cancel";
 
@@ -9,25 +9,42 @@ export type Circuit = "make" | "cancel";
 // swapped on the server later fails `checkProvingKey`.
 import provingKeys from "../../public/swap/proving-keys.json";
 
-type Pin = { sha256: Uint8Array; insecureTestSetup: boolean };
+/** Lowercase hex SHA-256 of `circuit.xbc` and `vk.bin` per circuit, hashed by vite.config.ts at build time. */
+declare const __KEELER_SWAP_ARTIFACTS__: Record<string, { xbc: string; vk: string }> | undefined;
+const bundledArtifacts = () => (typeof __KEELER_SWAP_ARTIFACTS__ === "undefined" ? {} : __KEELER_SWAP_ARTIFACTS__);
 
-export function pinnedKey(c: Circuit, keys: Record<string, { provingKeySha256: number[]; insecureTestSetup: boolean }> = provingKeys): Pin {
+type Pin = { sha256: Uint8Array; insecureTestSetup?: boolean };
+type KeyPins = Record<string, { provingKeySha256: number[]; insecureTestSetup?: boolean }>;
+
+export function pinnedKey(c: Circuit, keys: KeyPins = provingKeys): Pin {
   const k = keys[c];
   if (!k || k.provingKeySha256.length !== 32) throw new Error(`the build has no proving-key pin for ${c}`);
-  return { sha256: Uint8Array.from(k.provingKeySha256), insecureTestSetup: k.insecureTestSetup };
+  return { sha256: Uint8Array.from(k.provingKeySha256), ...(k.insecureTestSetup === undefined ? {} : { insecureTestSetup: k.insecureTestSetup }) };
 }
 
-/** On mainnet only a key from a real setup ceremony may prove. */
-export function checkPinForNetwork(c: Circuit, pin: Pin, network: string) {
-  if (network === "mainnet" && pin.insecureTestSetup) {
-    throw new Error(`the ${c} proving key comes from an insecure test setup; it may not be used on mainnet`);
+/** The circuit and verifying-key digests this build pinned for `c`. */
+export function pinnedArtifacts(c: Circuit, artifacts: Record<string, { xbc: string; vk: string }> = bundledArtifacts()) {
+  const a = artifacts[c];
+  const hex64 = (s: unknown) => typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
+  if (!a || !hex64(a.xbc) || !hex64(a.vk)) throw new Error(`the build has no circuit and verifying-key pins for ${c}`);
+  return a;
+}
+
+/**
+ * Proving refuses a build without a network, and on mainnet any key not marked
+ * `insecureTestSetup: false` (a missing flag fails): only a real ceremony's key may prove there.
+ */
+export function checkPinForNetwork(c: Circuit, pin: Pin, network: string | undefined) {
+  if (!network) throw new Error("this site was built without VITE_NETWORK, so it will not prove");
+  if (network === "mainnet" && pin.insecureTestSetup !== false) {
+    throw new Error(`the ${c} proving key is not marked as coming from a real setup ceremony; it may not be used on mainnet`);
   }
 }
 
 export type WorkerRequest =
   | { op: "make" | "cancel"; inputs: unknown; sender: Uint8Array; payer: string }
   | { op: "orderTerms"; utxo: unknown }
-  | { op: "prove"; circuit: Circuit; network: string; proofInputs: unknown; publicHash: Uint8Array };
+  | { op: "prove"; circuit: Circuit; proofInputs: unknown; publicHash: Uint8Array };
 
 export type WorkerReply = { id: number; ok: true; value: unknown } | { id: number; ok: false; error: string };
 

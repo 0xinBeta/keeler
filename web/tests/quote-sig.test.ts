@@ -1,6 +1,6 @@
 // Quote signatures (plan G1). Uses piece A's vector when it exists
 // (tests/fixtures/quote-sig.json); otherwise only our own keypair.
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { address, createKeyPairFromPrivateKeyBytes, getAddressFromPublicKey, signBytes } from "@solana/kit";
 import { describe, expect, it } from "vitest";
 import { QUOTE_MESSAGE_LEN, quoteMessage, verifyQuote, type SignedTerms } from "../src/keeler/quote-sig";
@@ -51,7 +51,7 @@ describe("verifyQuote", async () => {
 });
 
 const vector = new URL("./fixtures/quote-sig.json", import.meta.url);
-describe.skipIf(!existsSync(vector))("piece A's quote signature vector", () => {
+describe("piece A's quote signature vector", () => {
   it("verifies and reproduces the message", async () => {
     const v = JSON.parse(readFileSync(vector, "utf8"));
     const i = v.inputs;

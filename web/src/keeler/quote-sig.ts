@@ -14,6 +14,8 @@ export type SignedTerms = {
   expiry: bigint;
 };
 
+// Mainnet readiness (not built yet): the message carries no network id, so a quote signed for one
+// network verifies on another that reuses the same program ID, mints and keys. Add one (v2) before mainnet.
 /** `"keeler-quote-v1"` ‖ program ‖ sell mint ‖ buy mint ‖ trader ‖ sell u64 LE ‖ buy u64 LE ‖ expiry u64 LE. */
 export function quoteMessage(t: SignedTerms): Uint8Array {
   const out = new Uint8Array(QUOTE_MESSAGE_LEN);
