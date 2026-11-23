@@ -1,6 +1,11 @@
 //! Thin calls into `swap-sdk` and `spr-client`. Every "now" here is chain
 //! time from the Clock sysvar.
-use std::{str::FromStr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+    sync::Mutex,
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use solana_address::Address;
@@ -21,7 +26,7 @@ use spr_transaction::{
     AssetRegistry, Mint, WalletUtxo, SOL_MINT,
 };
 use swap_sdk::{
-    index::{index_maker, index_taker, MakerOrder, TakerOrder},
+    index::{index_maker, scan_taker, MakerOrder, TakerOrder},
     instructions::{
         cancel::{Cancel, CancelTransactionParams},
         make::{Make, MakeTransactionParams},
@@ -44,6 +49,8 @@ pub struct Chain {
     pub client: SprClient<SolanaRpc>,
     pub tree: Address,
     pub registry: AssetRegistry,
+    /// Mint decimals never change.
+    decimals: Mutex<HashMap<Address, u8>>,
 }
 
 /// Unix time from the Clock sysvar's data.
@@ -116,6 +123,7 @@ impl Chain {
             client,
             tree,
             registry,
+            decimals: Mutex::default(),
         })
     }
 
@@ -135,6 +143,14 @@ impl Chain {
         if mint == SOL_MINT {
             return Ok(9);
         }
+        if let Some(d) = self
+            .decimals
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&mint).copied())
+        {
+            return Ok(d);
+        }
         let account = self
             .client
             .rpc()
@@ -142,7 +158,15 @@ impl Chain {
             .ok_or_else(|| anyhow!("mint {mint} not found"))?;
         // SPL mint layout: authority option (36), supply (8), then decimals.
         ensure!(account.data.len() >= 82, "{mint} is not a mint account");
+        if let Ok(mut c) = self.decimals.lock() {
+            c.insert(mint, account.data[44]);
+        }
         Ok(account.data[44])
+    }
+
+    /// Public SOL of `address`, in lamports.
+    pub fn lamports(&self, address: Address) -> Result<u64> {
+        Ok(self.client.rpc().get_balance(address)?)
     }
 
     pub fn mint(&self, mint: Address) -> Result<Mint> {
@@ -386,15 +410,71 @@ impl Chain {
         })
     }
 
-    /// Every order ever designated to `kp`; none found in `wait` is empty.
-    pub fn taker_orders(&self, kp: &ShieldedKeypair, wait: Duration) -> Result<Vec<TakerOrder>> {
-        empty_on_timeout(index_taker(
-            kp,
-            &self.registry,
-            self.client.indexer(),
-            self.client.rpc(),
-            wait,
-        ))
+    /// Orders designated to `kp` whose order hash is not in `skip`. The
+    /// SDK's `index_taker` resolves every order's maker on every call; this
+    /// skips known orders before that, so a poll costs one indexer scan plus
+    /// lookups for new orders only.
+    // shortcut: still pages through every tagged transaction each call;
+    // keep the last cursor if order history grows large.
+    pub fn taker_orders(
+        &self,
+        kp: &ShieldedKeypair,
+        skip: &HashSet<[u8; 32]>,
+    ) -> Result<Vec<TakerOrder>> {
+        let tag = kp
+            .signing_pubkey()
+            .confidential_view_tag()
+            .map_err(|e| anyhow!("view tag: {e:?}"))?;
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.client.indexer().get_shielded_transactions_by_tags(
+                vec![tag],
+                cursor,
+                None,
+                HistoryFilters::default(),
+                None,
+            )?;
+            for tx in page.data.iter().flat_map(|group| &group.events) {
+                let Some(candidate) = scan_taker(tx, kp, &self.registry)? else {
+                    continue;
+                };
+                if skip.contains(&candidate.order_utxo_hash) {
+                    continue;
+                }
+                // As the SDK does: a maker without a registry record, or an
+                // order that does not rebuild to its leaf, is skipped.
+                let Some(maker) = self.registered_maker(candidate.maker_pubkey)? else {
+                    continue;
+                };
+                if let Ok(order) = candidate.into_order(maker, &self.registry) {
+                    found.push(order);
+                }
+            }
+            cursor = page
+                .continuation(cursor)
+                .map_err(|e| anyhow!("indexer page: {e:?}"))?;
+            if cursor.is_none() {
+                return Ok(found);
+            }
+        }
+    }
+
+    /// The SDK's `resolve_maker`: only a record the user registry owns counts.
+    fn registered_maker(&self, maker: Address) -> Result<Option<ShieldedAddress>> {
+        let (record, _) = spr_user_registry_interface::user_record_pda(&maker);
+        let owned =
+            self.client.rpc().get_account(record)?.is_some_and(|a| {
+                a.owner == spr_user_registry_interface::user_registry_program_id()
+            });
+        if !owned {
+            return Ok(None);
+        }
+        match user_registry::try_resolve_registered_address(self.client.rpc(), maker) {
+            Ok(r) => Ok(r.map(|r| r.address)),
+            Err(spr_client::ClientError::AddressResolution(_)) => Ok(None),
+            Err(e) => Err(anyhow!("resolve maker {maker}: {e:?}")),
+        }
     }
 
     /// Every order `kp` ever made; none found in `wait` is empty.

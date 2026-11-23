@@ -8,5 +8,6 @@ macro_rules! log {
 pub mod chain;
 pub mod config;
 pub mod dealer;
+pub mod deploy;
 pub mod faucet;
 pub mod trader;

@@ -4,6 +4,7 @@
 use std::{collections::HashMap, str::FromStr};
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use solana_address::Address;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
@@ -17,14 +18,22 @@ use crate::{
 };
 
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
+const TOKEN_ACCOUNT_LEN: usize = 165;
+
+/// Today's claims, kept in the dealer's state file.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Claims {
+    day: u64,
+    total: u32,
+    /// By base58 wallet address.
+    wallets: HashMap<String, u32>,
+}
 
 /// Claims per wallet and in total, per UTC day.
 pub struct Limits {
     per_wallet: u32,
     cap: u32,
-    day: u64,
-    total: u32,
-    wallets: HashMap<Address, u32>,
+    pub claims: Claims,
 }
 
 impl Limits {
@@ -32,38 +41,46 @@ impl Limits {
         Self {
             per_wallet,
             cap,
-            day: 0,
-            total: 0,
-            wallets: HashMap::new(),
+            claims: Claims::default(),
         }
     }
 
     /// Counts one claim by `wallet` on `day`, or says which limit stops it.
     pub fn take(&mut self, wallet: Address, day: u64) -> Result<(), &'static str> {
-        if day != self.day {
-            self.day = day;
-            self.total = 0;
-            self.wallets.clear();
+        let c = &mut self.claims;
+        if day != c.day {
+            *c = Claims {
+                day,
+                ..Claims::default()
+            };
         }
-        if self.total >= self.cap {
+        if c.total >= self.cap {
             return Err("faucet daily cap reached");
         }
-        let used = self.wallets.entry(wallet).or_default();
+        let used = c.wallets.entry(wallet.to_string()).or_default();
         if *used >= self.per_wallet {
             return Err("this wallet has had its faucet claims for today");
         }
         *used += 1;
-        self.total += 1;
+        c.total += 1;
         Ok(())
     }
 
     /// Gives back a claim whose transfer failed.
     pub fn undo(&mut self, wallet: Address) {
-        if let Some(used) = self.wallets.get_mut(&wallet) {
+        let c = &mut self.claims;
+        if let Some(used) = c.wallets.get_mut(&wallet.to_string()) {
             *used = used.saturating_sub(1);
-            self.total = self.total.saturating_sub(1);
+            c.total = c.total.saturating_sub(1);
         }
     }
+}
+
+/// Lamports one claim can cost the faucet: the SOL it sends, rent for each
+/// token account it may create, and a fee allowance.
+pub fn claim_cost(lamports: u64, tokens: usize, token_account_rent: u64) -> u64 {
+    const FEE_ALLOWANCE: u64 = 100_000;
+    lamports + tokens as u64 * token_account_rent + FEE_ALLOWANCE
 }
 
 pub struct Faucet {
@@ -83,6 +100,16 @@ impl Faucet {
                 .collect::<Result<_>>()?,
             lamports: cfg.lamports,
         })
+    }
+
+    /// Whether the faucet key can pay one more claim.
+    pub fn check_funds(&self, chain: &Chain) -> Result<bool> {
+        let rpc = chain.client.rpc();
+        let rent = rpc
+            .get_minimum_balance_for_rent_exemption(TOKEN_ACCOUNT_LEN)
+            .map_err(|e| anyhow!("rent: {e:?}"))?;
+        let have = chain.lamports(self.key.pubkey())?;
+        Ok(have >= claim_cost(self.lamports, self.tokens.len(), rent))
     }
 
     /// Mints every token to `wallet`'s associated token account and sends
@@ -175,6 +202,16 @@ mod tests {
         // A failed transfer gives its claim back.
         l.undo(addr(1));
         assert!(l.take(addr(1), 11).is_ok());
+        // The counts survive a restart through the state file.
+        let saved = serde_json::to_string(&l.claims).unwrap();
+        let mut again = Limits::new(1, 2);
+        again.claims = serde_json::from_str(&saved).unwrap();
+        assert!(again.take(addr(1), 11).is_err());
+    }
+
+    #[test]
+    fn claim_cost_covers_sol_rent_and_fees() {
+        assert_eq!(claim_cost(10_000_000, 2, 2_039_280), 14_178_560);
     }
 
     #[test]

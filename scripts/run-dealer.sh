@@ -6,9 +6,13 @@
 #
 #   scripts/run-dealer.sh [dealer-config]   (default target/devnet/dealer-config.json)
 #
-# Needs cloudflared, wrangler logged in, and the config from deploy-devnet.sh.
+# Needs cloudflared, wrangler logged in, the config from deploy-devnet.sh and
+# the .tools build for the config's program_id.
 # Pause quoting without stopping settlement: touch the config's pause_file.
 set -euo pipefail
+
+redact() { perl -pe 'BEGIN { $| = 1 } s/api-key=[^&"\s]+/api-key=REDACTED/g'; }
+exec > >(redact) 2> >(redact >&2)
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cfg=${1:-$root/target/devnet/dealer-config.json}
@@ -18,9 +22,23 @@ mkdir -p "$logs"
 # shellcheck source=/dev/null
 . "$root/.tools/env"
 
-http=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["http"]["listen"])' "$cfg" || true)
-[[ -n $http ]] || { echo "$cfg has no http.listen" >&2; exit 1; }
-dealer=$(solana-keygen pubkey <(security find-generic-password -s keeler-devnet-dealer -w))
+field() { python3 -c 'import json, sys; c = json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, {"c": c}))' "$cfg" "$1"; }
+http=$(field 'c["http"]["listen"]') || { echo "$cfg has no http.listen" >&2; exit 1; }
+dealer=$(field 'c["pubkey"]') || { echo "$cfg has no pubkey" >&2; exit 1; }
+program_id=$(field 'c["program_id"]') || { echo "$cfg has no program_id" >&2; exit 1; }
+for a in "$dealer" "$program_id"; do
+    [[ $a =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || { echo "$cfg: '$a' is not a base58 address" >&2; exit 1; }
+done
+
+# Build only against the program the config is for, never whatever .tools
+# happens to hold.
+lib=$(cd "$root/.tools" && pwd -P)/privacy-ring-examples/swap/xark/program/src/lib.rs
+built=$(sed -nE 's/.*declare_id!\("([^"]+)"\).*/\1/p' "$lib")
+if [[ $built != "$program_id" ]]; then
+    echo ".tools is built for '$built', the config for $program_id; run:" >&2
+    echo "  KEELER_SWAP_PROGRAM_ID=$program_id scripts/setup.sh" >&2
+    exit 1
+fi
 
 cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
 bin=$target/release/keeler
@@ -47,7 +65,7 @@ publish() {
 # Doubles up to 60 s; a process that stayed up a minute starts again at 1 s.
 next_delay() { if (($2 >= 60)); then echo 1; else echo $(($1 * 2 > 60 ? 60 : $1 * 2)); fi; }
 
-dealer_delay=1 tunnel_delay=1 url=""
+dealer_delay=1 tunnel_delay=1 url="" publish_delay=2 publish_at=0
 start_dealer
 start_tunnel
 while true; do
@@ -65,12 +83,18 @@ while true; do
         sleep "$tunnel_delay"
         start_tunnel
     fi
-    new=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$logs/cloudflared.log" | head -1 || true)
-    if [[ -n $new && $new != "$url" ]]; then
-        # On failure url stays old, so the next pass tries again.
+    # Quick tunnel hosts are hyphenated words; anything else in the log is
+    # not this tunnel's URL.
+    new=$(grep -oE 'https://[a-z0-9]+(-[a-z0-9]+)+\.trycloudflare\.com' "$logs/cloudflared.log" | head -1 || true)
+    if [[ -n $new && $new != "$url" ]] && ((SECONDS >= publish_at)); then
         if publish "$new"; then
-            url=$new
+            url=$new publish_delay=2
             echo "dealer $dealer at $url" >&2
+        else
+            # url stays old, so a later pass tries again, backing off to 5 min.
+            publish_at=$((SECONDS + publish_delay))
+            echo "publishing $new failed; retry in ${publish_delay}s" >&2
+            publish_delay=$((publish_delay * 2 > 300 ? 300 : publish_delay * 2))
         fi
     fi
     sleep 2
