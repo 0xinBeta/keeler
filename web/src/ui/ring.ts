@@ -261,6 +261,8 @@ export class Ring {
   constructor(
     private canvas: HTMLCanvasElement,
     private still: boolean,
+    /** Fraction of the full particle count; the closing section's arc needs fewer. */
+    scale = 1,
   ) {
     const gl = canvas.getContext("webgl2", { alpha: false, antialias: false, powerPreference: "high-performance" });
     if (!gl) throw new Error("no webgl2");
@@ -279,7 +281,7 @@ export class Ring {
     this.hdr = !!gl.getExtension("EXT_color_buffer_float");
 
     const small = Math.min(innerWidth, innerHeight) < 700 || (navigator.hardwareConcurrency ?? 8) <= 4;
-    this.count = small ? 38_000 : 72_000;
+    this.count = Math.round((small ? 38_000 : 72_000) * scale);
     this.vao = gl.createVertexArray()!;
     gl.bindVertexArray(this.vao);
     const buf = gl.createBuffer();

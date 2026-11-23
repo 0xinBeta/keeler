@@ -53,7 +53,7 @@ export function createMockKeeler(): Keeler {
 
   const wallet: Wallet = {
     version: "1.0.0",
-    name: "Keeler test wallet",
+    name: "Browser test wallet",
     icon,
     chains: ["solana:devnet"],
     features: {},
