@@ -2681,8 +2681,6 @@ dependencies = [
  "solana-address 2.7.0",
  "solana-instruction 3.5.1",
  "solana-keypair",
- "solana-pubkey 4.3.0",
- "solana-signature",
  "solana-signer",
  "spr-client",
  "spr-interface",

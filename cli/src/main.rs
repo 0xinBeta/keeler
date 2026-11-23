@@ -38,10 +38,15 @@ fn run(args: &[String]) -> Result<()> {
         }
         [cmd, cfg] if cmd == "refund" => {
             let done = trader::refund(&TraderConfig::load(cfg)?.common)?;
-            if done.is_empty() {
-                println!("nothing to refund");
+            if done.found == 0 {
+                println!("no orders found for the configured assets");
+            } else if done.acted.is_empty() {
+                println!(
+                    "nothing to refund ({} orders, none expired and unspent)",
+                    done.found
+                );
             }
-            for (order, status) in done {
+            for (order, status) in done.acted {
                 println!("order {order}: {status:?}");
             }
         }

@@ -16,10 +16,10 @@ pub enum KeySource {
     Keychain(String),
 }
 
+/// The Hermes API key, read from the Keychain item `keychain`.
 #[derive(Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApiKey {
-    Keychain(String),
+pub struct ApiKey {
+    pub keychain: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -84,31 +84,68 @@ pub struct DealerConfig {
 
 impl TraderConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let cfg: Self = read_json(path)?;
-        ensure!(cfg.band_bps <= 10_000, "band_bps above 10000");
+        Self::from_json(&read(path)?).with_context(|| format!("config {path}"))
+    }
+
+    pub fn from_json(text: &str) -> Result<Self> {
+        let cfg: Self = parse_json(text)?;
+        cfg.check()?;
+        Ok(cfg)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        // A band of 10,000 bps would accept a quote of 0.
+        ensure!(self.band_bps < 10_000, "band_bps must be below 10000");
         ensure!(
-            cfg.min_ttl_secs <= cfg.max_ttl_secs,
+            self.min_ttl_secs <= self.max_ttl_secs,
             "min_ttl_secs above max_ttl_secs"
         );
-        ensure!(!cfg.dealers.is_empty(), "no dealers configured");
-        cfg.common.check()?;
-        Ok(cfg)
+        ensure!(!self.dealers.is_empty(), "no dealers configured");
+        self.common.check()
     }
 }
 
 impl DealerConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let cfg: Self = read_json(path)?;
-        ensure!(cfg.spread_bps <= 10_000, "spread_bps above 10000");
-        cfg.common.check()?;
+        Self::from_json(&read(path)?).with_context(|| format!("config {path}"))
+    }
+
+    pub fn from_json(text: &str) -> Result<Self> {
+        let cfg: Self = parse_json(text)?;
+        cfg.check()?;
         Ok(cfg)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        ensure!(self.spread_bps <= 10_000, "spread_bps above 10000");
+        ensure!(
+            self.settle_margin_secs < self.quote_ttl_secs,
+            "settle_margin_secs must be below quote_ttl_secs"
+        );
+        // The quote protocol is plain text.
+        ensure!(
+            self.listen.ip().is_loopback(),
+            "listen must be a loopback address"
+        );
+        self.common.check()
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read config {path}"))?;
-    // serde's message names the field, not the value, so no secret leaks.
-    serde_json::from_str(&text).with_context(|| format!("parse config {path}"))
+fn read(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("read config {path}"))
+}
+
+/// serde's messages can echo the offending value, which may be a secret, so
+/// only the error category and position are reported.
+fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
+    serde_json::from_str(text).map_err(|e| {
+        anyhow!(
+            "invalid config ({:?} error at line {} column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        )
+    })
 }
 
 impl Common {
@@ -121,6 +158,9 @@ impl Common {
                     asset.mint
                 );
             }
+        }
+        if let Some(pyth) = &self.pyth {
+            ensure!(pyth.url.starts_with("https://"), "pyth.url must be https");
         }
         Ok(())
     }
@@ -140,16 +180,24 @@ impl Common {
         self.assets.iter().map(|a| parse_address(&a.mint)).collect()
     }
 
-    /// The USD price of every configured asset. Pyth prices are checked
-    /// against wall time, as Hermes publishes in wall time.
-    pub fn prices(&self) -> Result<HashMap<Address, Price>> {
-        let mut prices = HashMap::new();
-        let mut feeds = Vec::new();
+    /// Fails unless every mint in `mints` is a configured asset.
+    pub fn require(&self, mints: &[Address]) -> Result<()> {
+        let configured = self.mints()?;
+        for m in mints {
+            ensure!(configured.contains(m), "no price configured for {m}");
+        }
+        Ok(())
+    }
+
+    /// The price source, with the Hermes key and HTTP client set up once.
+    pub fn pricer(&self) -> Result<Pricer> {
+        let mut fixed = HashMap::new();
+        let mut feeds = HashMap::new();
         for asset in &self.assets {
             let mint = parse_address(&asset.mint)?;
             match &asset.price {
                 PriceSource::Fixed { price, expo } => {
-                    prices.insert(
+                    fixed.insert(
                         mint,
                         Price {
                             price: *price,
@@ -157,35 +205,88 @@ impl Common {
                         },
                     );
                 }
-                PriceSource::Pyth { pyth } => feeds.push((mint, feed_id(pyth))),
+                PriceSource::Pyth { pyth } => {
+                    feeds.insert(mint, feed_id(pyth));
+                }
             }
         }
-        if feeds.is_empty() {
-            return Ok(prices);
+        let hermes = match (&self.pyth, feeds.is_empty()) {
+            (Some(pyth), false) => Some(Hermes {
+                pyth: pyth.clone(),
+                key: keychain_secret(&pyth.api_key.keychain)?,
+                http: reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()?,
+            }),
+            _ => None,
+        };
+        Ok(Pricer {
+            fixed,
+            feeds,
+            hermes,
+        })
+    }
+}
+
+struct Hermes {
+    pyth: Pyth,
+    key: String,
+    http: reqwest::blocking::Client,
+}
+
+/// USD prices of the configured assets.
+pub struct Pricer {
+    fixed: HashMap<Address, Price>,
+    feeds: HashMap<Address, String>,
+    hermes: Option<Hermes>,
+}
+
+impl Pricer {
+    /// The prices of `mints`, each of which must be configured; that is
+    /// checked before any network call. Pyth prices are checked against wall
+    /// time, as Hermes publishes in wall time.
+    pub fn prices(&self, mints: &[Address]) -> Result<Vec<Price>> {
+        let mut wanted = Vec::new();
+        for m in mints {
+            if !self.fixed.contains_key(m) {
+                let id = self
+                    .feeds
+                    .get(m)
+                    .ok_or_else(|| anyhow!("no price configured for {m}"))?;
+                wanted.push((*m, id.clone()));
+            }
         }
-        let pyth = self
-            .pyth
-            .as_ref()
-            .ok_or_else(|| anyhow!("no pyth section"))?;
-        let ids: Vec<String> = feeds.iter().map(|(_, id)| id.clone()).collect();
-        let ApiKey::Keychain(name) = &pyth.api_key;
-        let json = reqwest::blocking::Client::new()
-            .get(hermes_url(&pyth.url, &ids))
-            .bearer_auth(keychain_secret(name)?)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.text())
-            .context("Hermes request")?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
-        for (mint, price) in
-            hermes_prices(&json, &feeds, now, pyth.max_age_secs, pyth.max_conf_bps)?
-        {
-            prices.insert(mint, price);
+        let mut pyth = HashMap::new();
+        if !wanted.is_empty() {
+            let h = self
+                .hermes
+                .as_ref()
+                .ok_or_else(|| anyhow!("no pyth section"))?;
+            let ids: Vec<String> = wanted.iter().map(|(_, id)| id.clone()).collect();
+            let json = h
+                .http
+                .get(hermes_url(&h.pyth.url, &ids))
+                .bearer_auth(&h.key)
+                .send()
+                .and_then(|r| r.error_for_status())
+                .and_then(|r| r.text())
+                .context("Hermes request")?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            pyth.extend(hermes_prices(
+                &json,
+                &wanted,
+                now,
+                h.pyth.max_age_secs,
+                h.pyth.max_conf_bps,
+            )?);
         }
-        Ok(prices)
+        mints
+            .iter()
+            .map(|m| self.fixed.get(m).or_else(|| pyth.get(m)).copied())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow!("price missing"))
     }
 }
 
@@ -277,6 +378,63 @@ mod tests {
             ),
             (Address::new_from_array([2; 32]), feed_id(B)),
         ]
+    }
+
+    fn dealer_json(extra: &str) -> String {
+        format!(
+            r#"{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784",
+            "key":{{"file":"k.json"}},"assets":[{{"mint":"11111111111111111111111111111111","price":{{"price":1,"expo":0}}}}],
+            "listen":"127.0.0.1:47001","spread_bps":10,{extra}}}"#
+        )
+    }
+
+    fn trader_json(band: u16, pyth_url: &str) -> String {
+        format!(
+            r#"{{"rpc_url":"http://127.0.0.1:8899","indexer_url":"http://127.0.0.1:8784",
+            "key":{{"file":"k.json"}},"assets":[{{"mint":"11111111111111111111111111111111","price":{{"pyth":"aa"}}}}],
+            "pyth":{{"url":"{pyth_url}","api_key":{{"keychain":"x"}},"max_age_secs":60,"max_conf_bps":100}},
+            "dealers":[{{"address":"127.0.0.1:47001","pubkey":"11111111111111111111111111111111"}}],
+            "band_bps":{band},"min_ttl_secs":5,"max_ttl_secs":60}}"#
+        )
+    }
+
+    #[test]
+    fn settle_margin_must_be_below_quote_ttl() {
+        let ok = r#""quote_ttl_secs":30,"settle_margin_secs":29"#;
+        let bad = r#""quote_ttl_secs":30,"settle_margin_secs":30"#;
+        assert!(DealerConfig::from_json(&dealer_json(ok)).is_ok());
+        assert!(DealerConfig::from_json(&dealer_json(bad)).is_err());
+    }
+
+    #[test]
+    fn non_loopback_listen_is_rejected() {
+        let cfg = dealer_json(r#""quote_ttl_secs":30,"settle_margin_secs":5"#)
+            .replace("127.0.0.1:47001", "0.0.0.0:47001");
+        assert!(DealerConfig::from_json(&cfg).is_err());
+    }
+
+    #[test]
+    fn band_must_be_below_10000() {
+        assert!(TraderConfig::from_json(&trader_json(9_999, "https://h.example")).is_ok());
+        assert!(TraderConfig::from_json(&trader_json(10_000, "https://h.example")).is_err());
+    }
+
+    #[test]
+    fn pyth_url_must_be_https() {
+        assert!(TraderConfig::from_json(&trader_json(50, "http://h.example")).is_err());
+    }
+
+    #[test]
+    fn parse_error_does_not_echo_values() {
+        let cfg = dealer_json(r#""quote_ttl_secs":30,"settle_margin_secs":5"#).replace(
+            r#"{"file":"k.json"}"#,
+            r#""SECRET-5Kd3NBUAdUnhyzenEwVLy9pBKxSwXvE9FMPyR4UKZvpe6E3AgLr""#,
+        );
+        let err = format!("{:#}", DealerConfig::from_json(&cfg).err().unwrap());
+        assert!(!err.contains("SECRET"), "{err}");
+        let cfg = dealer_json(r#""quote_ttl_secs":"SECRET-ttl","settle_margin_secs":5"#);
+        let err = format!("{:#}", DealerConfig::from_json(&cfg).err().unwrap());
+        assert!(!err.contains("SECRET"), "{err}");
     }
 
     #[test]

@@ -43,8 +43,9 @@ cargo check -p keeler
   builds `swap_program.so` with SBF platform tools v1.54, and fetches the
   localnet artifacts (shielded-pool program, prover, Photon, surfpool) into
   `~/.config/zolana/cache` and the user-registry program into
-  `swap/xark/.tools/`. Every download is the upstream scripts' own and is
-  checked against a pinned SHA-256;
+  `swap/xark/.tools/`. The upstream scripts check each of these release
+  downloads against a pinned SHA-256. The SBF platform tools are whatever
+  Agave's `cargo build-sbf` fetches; Keeler adds no check of its own;
 - writes `.tools/env` with `ZOLANA_CLI_BIN`, `SHIELDED_POOL_PROGRAM_PATH`,
   `PROVER_BIN`, `ZOLANA_PHOTON_BIN`, `SURFPOOL_BIN`,
   `USER_REGISTRY_PROGRAM_PATH`, `SWAP_KEYS_DIR` and `KEELER_SWAP_PROGRAM_SO`.
@@ -77,6 +78,8 @@ on the wall clock.
   first when it has none.
 - `keeler refund <config>` (trader config): cancels every unspent order of
   this trader whose expiry has passed. Running it again is a no-op.
+  It only sees orders in the assets the config lists: an order in any other
+  mint is skipped by the SDK and needs a config that lists that mint.
 
 Amounts are in base units. Mints are base58; SOL is
 `11111111111111111111111111111111`. Run with `source .tools/env` so the

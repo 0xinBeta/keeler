@@ -37,21 +37,35 @@ fi
 
 # The upstream steps run from swap/xark/, which pins its own Rust toolchain.
 cd "$xark"
+# Upstream scripts print NAME=value lines; export them without eval.
+export_vars() {
+    local name value
+    while IFS='=' read -r name value; do
+        [[ $name =~ ^[A-Z_][A-Z0-9_]*$ ]] || { echo "unexpected upstream line: $name" >&2; exit 1; }
+        export "$name=$value"
+    done <<<"$1"
+}
 vars=$(scripts/setup-zk-tools.sh)
-eval "$(sed 's/^/export /' <<<"$vars")"
+export_vars "$vars"
 "$ZOLANA_CLI_BIN" zk compile --test --skip-wasm --manifest-path program/Cargo.toml
 scripts/check-keys.sh
 cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 -- --locked --features bpf-entrypoint
-vars+=$'\n'$(scripts/build-localnet.sh)
+localnet_vars=$(scripts/build-localnet.sh)
+export_vars "$localnet_vars"
+vars+=$'\n'$localnet_vars
 mkdir -p ~/.config/zolana/proving-keys
 
 so=$xark/target/deploy/swap_program.so
 [[ -f $so ]] || { echo "build-sbf left no $so" >&2; exit 1; }
 {
     # build-localnet.sh prints ZOLANA_CLI_BIN again; keep each name once.
-    awk -F= '!seen[$1]++ { print "export " $0 }' <<<"$vars"
-    echo "export SWAP_KEYS_DIR=$xark/target/zk/swap-program"
-    echo "export KEELER_SWAP_PROGRAM_SO=$so"
+    # %q quotes each value so a path with spaces still sources.
+    awk -F= '!seen[$1]++' <<<"$vars" | while IFS='=' read -r name value; do
+        printf 'export %s=%q\n' "$name" "$value"
+    done
+    printf 'export %s=%q\n' \
+        SWAP_KEYS_DIR "$xark/target/zk/swap-program" \
+        KEELER_SWAP_PROGRAM_SO "$so"
 } >"$env_file.tmp"
 mv "$env_file.tmp" "$env_file"
 echo "Wrote $env_file" >&2

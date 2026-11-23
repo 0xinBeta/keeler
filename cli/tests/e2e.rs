@@ -135,6 +135,11 @@ fn start(test: u16) -> Net {
 
 impl Net {
     fn common(&self, actor: u8) -> Common {
+        self.priced(actor, 2)
+    }
+
+    /// `spl_price` USD per SPL token; SOL is 100 USD.
+    fn priced(&self, actor: u8, spl_price: i64) -> Common {
         let asset = |mint: Address, price| Asset {
             mint: mint.to_string(),
             price: PriceSource::Fixed { price, expo: 0 },
@@ -143,7 +148,7 @@ impl Net {
             rpc_url: self.ports.rpc_url(),
             indexer_url: self.ports.photon_url(),
             key: KeySource::File(self.keys.join(format!("{actor}.json"))),
-            assets: vec![asset(self.spl, 2), asset(SOL_MINT, 100)],
+            assets: vec![asset(self.spl, spl_price), asset(SOL_MINT, 100)],
             pyth: None,
         }
     }
@@ -176,20 +181,29 @@ fn dealer_addr(test: u16, actor: u8) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 47_000 + test * 10 + actor as u16))
 }
 
-fn spawn_dealer(
-    net: &Net,
-    test: u16,
-    actor: u8,
+struct Terms {
     spread_bps: u16,
+    quote_ttl_secs: u64,
     settle_margin_secs: u64,
-) -> Dealer {
+    spl_price: i64,
+}
+
+const HONEST: Terms = Terms {
+    spread_bps: 10,
+    quote_ttl_secs: 30,
+    settle_margin_secs: 5,
+    spl_price: 2,
+};
+
+fn spawn_dealer(net: &Net, test: u16, actor: u8, t: Terms) -> Dealer {
     let cfg = DealerConfig {
-        common: net.common(actor),
+        common: net.priced(actor, t.spl_price),
         listen: dealer_addr(test, actor),
-        spread_bps,
-        quote_ttl_secs: 30,
-        settle_margin_secs,
+        spread_bps: t.spread_bps,
+        quote_ttl_secs: t.quote_ttl_secs,
+        settle_margin_secs: t.settle_margin_secs,
     };
+    cfg.check().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let handle = thread::spawn(move || dealer::run(&cfg, &flag));
@@ -237,7 +251,8 @@ fn trader_cfg(net: &Net, dealers: &[&Dealer]) -> TraderConfig {
 }
 
 fn expected_quote(net: &Net, chain: &Chain, amount: u64, spread_bps: u16) -> u64 {
-    let fair = fair_amount(&net.common(0), chain, net.spl, SOL_MINT, amount).unwrap();
+    let pricer = net.common(0).pricer().unwrap();
+    let fair = fair_amount(&pricer, chain, net.spl, SOL_MINT, amount).unwrap();
     apply_spread(fair, spread_bps).unwrap()
 }
 
@@ -246,9 +261,26 @@ fn best_dealer_settles_twice() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let net = start(5);
     let chain = net.chain();
-    let d1 = spawn_dealer(&net, 5, 1, 10, 5);
-    let d2 = spawn_dealer(&net, 5, 2, 30, 5);
-    let d3 = spawn_dealer(&net, 5, 3, 2_000, 5);
+    let d1 = spawn_dealer(&net, 5, 1, HONEST);
+    let d2 = spawn_dealer(
+        &net,
+        5,
+        2,
+        Terms {
+            spread_bps: 30,
+            ..HONEST
+        },
+    );
+    // Prices SPL at 3 USD: the highest quote, 50% above fair, outside the band.
+    let d3 = spawn_dealer(
+        &net,
+        5,
+        3,
+        Terms {
+            spl_price: 3,
+            ..HONEST
+        },
+    );
     let cfg = trader_cfg(&net, &[&d1, &d2, &d3]);
 
     for amount in [400_000_000, 200_000_000] {
@@ -268,7 +300,7 @@ fn best_dealer_settles_twice() {
             "10 bps dealer"
         );
         assert_eq!(after[2], before[2], "30 bps dealer");
-        assert_eq!(after[3], before[3], "off-market dealer");
+        assert_eq!(after[3], before[3], "out-of-band dealer");
     }
     for d in [d1, d2, d3] {
         d.stop();
@@ -280,8 +312,18 @@ fn unsettled_order_is_refunded_once() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let net = start(6);
     let chain = net.chain();
-    // A settle margin longer than any quote: it quotes and never settles.
-    let lazy = spawn_dealer(&net, 6, 1, 10, 1_000);
+    // The margin leaves under a second after quoting, less than a lock
+    // takes: it quotes and never settles.
+    let lazy = spawn_dealer(
+        &net,
+        6,
+        1,
+        Terms {
+            quote_ttl_secs: 20,
+            settle_margin_secs: 19,
+            ..HONEST
+        },
+    );
     let cfg = trader_cfg(&net, &[&lazy]);
     let before = net.balances(&chain, 0);
 
@@ -290,7 +332,7 @@ fn unsettled_order_is_refunded_once() {
     assert_eq!(net.balances(&chain, 0), before);
     assert_eq!(net.balances(&chain, 1), (0, DEALER_SOL));
     assert!(
-        trader::refund(&cfg.common).unwrap().is_empty(),
+        trader::refund(&cfg.common).unwrap().acted.is_empty(),
         "second refund must be a no-op"
     );
     lazy.stop();
@@ -301,7 +343,7 @@ fn unquoted_order_is_not_settled() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let net = start(7);
     let chain = net.chain();
-    let d1 = spawn_dealer(&net, 7, 1, 10, 5);
+    let d1 = spawn_dealer(&net, 7, 1, HONEST);
     let trader_kp: Keypair = fixture::actor(0);
     let kp = shielded(&trader_kp).unwrap();
     chain.register(&kp).unwrap();
@@ -337,7 +379,7 @@ fn unquoted_order_is_not_settled() {
         sleep(Duration::from_secs(1));
     }
     assert_eq!(chain.status(&order).unwrap(), Status::Open);
-    let refunded = trader::refund(&cfg.common).unwrap();
+    let refunded = trader::refund(&cfg.common).unwrap().acted;
     assert_eq!(
         refunded,
         vec![(hex(&order.hash(0).unwrap()), Status::Cancelled)]

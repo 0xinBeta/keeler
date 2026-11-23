@@ -10,11 +10,14 @@ use keeler_core::{
 use solana_address::Address;
 use solana_signer::Signer;
 use spr_keypair::ShieldedKeypair;
-use swap_sdk::{shared::identity, state::OrderTerms};
+use swap_sdk::{
+    shared::identity,
+    state::{OrderTerms, OrderUtxo},
+};
 
 use crate::{
     chain::{hex, shielded, Chain, Status},
-    config::{parse_address, Common, TraderConfig},
+    config::{parse_address, Common, Pricer, TraderConfig},
 };
 
 const RFQ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,27 +35,26 @@ pub enum Outcome {
 /// The fair amount of `buy_mint` for `sell_amount` of `sell_mint` at the
 /// configured reference prices.
 pub fn fair_amount(
-    c: &Common,
+    pricer: &Pricer,
     chain: &Chain,
     sell: Address,
     buy: Address,
     amount: u64,
 ) -> Result<u64> {
-    let prices = c.prices()?;
-    let price = |m: Address| {
-        prices
-            .get(&m)
-            .copied()
-            .ok_or_else(|| anyhow!("no price for {m}"))
-    };
+    let p = pricer.prices(&[sell, buy])?;
     fair_buy_amount(
         amount,
-        price(sell)?,
-        price(buy)?,
+        p[0],
+        p[1],
         chain.mint_decimals(sell)?,
         chain.mint_decimals(buy)?,
     )
     .ok_or_else(|| anyhow!("no fair amount for {amount} of {sell} in {buy}"))
+}
+
+/// Context for every error once a make may have been sent.
+fn may_be_locked(e: anyhow::Error) -> anyhow::Error {
+    e.context("the order may be locked; run `keeler refund <config>` after its expiry")
 }
 
 pub fn swap(
@@ -62,9 +64,11 @@ pub fn swap(
     sell_amount: u64,
 ) -> Result<Outcome> {
     let c = &cfg.common;
+    c.require(&[sell_mint, buy_mint])?;
+    let pricer = c.pricer()?;
     let chain = Chain::connect(&c.rpc_url, &c.indexer_url, &c.mints()?)?;
     let kp = shielded(&c.keypair()?)?;
-    let fair = fair_amount(c, &chain, sell_mint, buy_mint, sell_amount)?;
+    let fair = fair_amount(&pricer, &chain, sell_mint, buy_mint, sell_amount)?;
     // `make` spends one source note, so one note must cover the whole amount.
     let source = chain
         .notes(&kp, sell_mint)?
@@ -103,71 +107,108 @@ pub fn swap(
         expiry: quote.expiry,
         taker: Some(identity(&dealer_pk)?),
     };
-    let order = chain.lock(&kp, terms, sell_amount, source, dealer)?;
+    let order = chain
+        .lock(&kp, terms, sell_amount, source, dealer)
+        .map_err(may_be_locked)?;
     eprintln!(
         "locked {sell_amount} for {} from dealer {best}, chain expiry {}",
         quote.buy_amount, quote.expiry
     );
+    let settled = Outcome::Settled {
+        buy_amount: quote.buy_amount,
+    };
 
+    // Funds are locked now: a transient error must not end the wait.
     loop {
-        match chain.status(&order)? {
-            Status::Settled => {
-                return Ok(Outcome::Settled {
-                    buy_amount: quote.buy_amount,
-                })
-            }
-            Status::Cancelled => return Ok(Outcome::Refunded),
-            Status::Open if chain.now()? > quote.expiry => break,
-            Status::Open => sleep(POLL),
+        match chain.status(&order).and_then(|s| Ok((s, chain.now()?))) {
+            Ok((Status::Settled, _)) => return Ok(settled),
+            Ok((Status::Cancelled, _)) => return Ok(Outcome::Refunded),
+            Ok((Status::Open, now)) if now > quote.expiry => break,
+            Ok(_) => {}
+            Err(e) => eprintln!("trader: waiting on the order: {e:#}; retrying"),
         }
+        sleep(POLL);
     }
-    refund_with(&chain, &kp)?;
-    match chain.status(&order)? {
-        Status::Settled => Ok(Outcome::Settled {
-            buy_amount: quote.buy_amount,
-        }),
+    refund_with(&chain, &kp).map_err(may_be_locked)?;
+    let hash = hex(&order.hash(0)?);
+    match chain.status(&order).map_err(may_be_locked)? {
+        Status::Settled => Ok(settled),
         Status::Cancelled => Ok(Outcome::Refunded),
-        Status::Open => bail!("order {} is still open after refund", hex(&order.hash(0)?)),
+        Status::Open => Err(may_be_locked(anyhow!(
+            "order {hash} is still open after refund"
+        ))),
     }
 }
 
+/// What a refund pass found and did.
+pub struct Refund {
+    /// Orders of this trader in the configured assets.
+    pub found: usize,
+    /// Each order it cancelled (hex hash) with the status the nullifier
+    /// check showed afterwards.
+    pub acted: Vec<(String, Status)>,
+}
+
 /// Cancels every unspent order of this trader whose expiry has passed.
-/// Returns each order it acted on (hex hash) with the status the nullifier
-/// check showed afterwards; an empty list means nothing was due.
-pub fn refund(c: &Common) -> Result<Vec<(String, Status)>> {
+pub fn refund(c: &Common) -> Result<Refund> {
     let chain = Chain::connect(&c.rpc_url, &c.indexer_url, &c.mints()?)?;
     refund_with(&chain, &shielded(&c.keypair()?)?)
 }
 
-fn refund_with(chain: &Chain, kp: &ShieldedKeypair) -> Result<Vec<(String, Status)>> {
+fn refund_with(chain: &Chain, kp: &ShieldedKeypair) -> Result<Refund> {
     let now = chain.now()?;
+    let orders = chain.maker_orders(kp, DISCOVER_WAIT)?;
     let mut acted = Vec::new();
-    for found in chain.maker_orders(kp, DISCOVER_WAIT)? {
-        let order = found.order_utxo;
-        if order.terms.expiry >= now || chain.status(&order)? != Status::Open {
-            continue;
-        }
-        let hash = hex(&order.hash(0)?);
-        let mut last = None;
-        let mut status = Status::Open;
-        for _ in 0..CANCEL_ATTEMPTS {
-            if let Err(e) = chain.cancel(kp, &order) {
-                last = Some(e);
-            }
-            // The nullifier, not the cancel result, says what happened: a
-            // dealer may have settled first.
-            status = chain.status(&order)?;
-            if status != Status::Open {
-                break;
+    let mut failed = Vec::new();
+    for found in &orders {
+        let order = &found.order_utxo;
+        match refund_one(chain, kp, order, now) {
+            Ok(Some(done)) => acted.push(done),
+            Ok(None) => {}
+            Err(e) => {
+                let hash = order.hash(0).map(|h| hex(&h)).unwrap_or_default();
+                eprintln!("refund: order {hash}: {e:#}");
+                failed.push(hash);
             }
         }
-        if status == Status::Open {
-            bail!(
-                "cancel of order {hash} failed: {:#}",
-                last.unwrap_or_else(|| anyhow!("order still unspent"))
-            );
-        }
-        acted.push((hash, status));
     }
-    Ok(acted)
+    if !failed.is_empty() {
+        bail!(
+            "refund failed for orders {}; cancelled {:?}",
+            failed.join(", "),
+            acted
+        );
+    }
+    Ok(Refund {
+        found: orders.len(),
+        acted,
+    })
+}
+
+fn refund_one(
+    chain: &Chain,
+    kp: &ShieldedKeypair,
+    order: &OrderUtxo,
+    now: u64,
+) -> Result<Option<(String, Status)>> {
+    if order.terms.expiry >= now || chain.status(order)? != Status::Open {
+        return Ok(None);
+    }
+    let hash = hex(&order.hash(0)?);
+    let mut last = None;
+    for _ in 0..CANCEL_ATTEMPTS {
+        if let Err(e) = chain.cancel(kp, order) {
+            last = Some(e);
+        }
+        // The nullifier, not the cancel result, says what happened: a dealer
+        // may have settled first.
+        let status = chain.status(order)?;
+        if status != Status::Open {
+            return Ok(Some((hash, status)));
+        }
+    }
+    bail!(
+        "cancel failed: {:#}",
+        last.unwrap_or_else(|| anyhow!("order still unspent"))
+    )
 }
