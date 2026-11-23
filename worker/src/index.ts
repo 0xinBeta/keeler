@@ -19,9 +19,7 @@ export interface Env {
   REFERENCE?: unknown;
   FAUCET?: string;
   PAUSED?: string;
-  PYTH_API_KEY?: string;
-  PYTH_URL?: string;
-  PYTH_FEEDS?: unknown;
+  PYTH_ACCOUNTS?: unknown;
   PYTH_MAX_AGE_SECS?: string | number;
   PYTH_MAX_CONF_BPS?: string | number;
   RPC_LIMIT?: RateLimit;
@@ -37,7 +35,7 @@ const SPR_CAP = 1024 * 1024 + 64;
 // The SDK's own indexer limit (dist/api/index.js MAX_BODY_BYTES).
 const INDEXER_RESPONSE_CAP = 10 * 1024 * 1024;
 const PRICE_CACHE_MS = 5000;
-const HERMES_TIMEOUT_MS = 5000;
+const PRICE_TIMEOUT_MS = 5000;
 const SMALL_BODY_CAP = 4 * 1024;
 const DEALER_TIMEOUT_MS = 3000;
 const FAUCET_TIMEOUT_MS = 15000;
@@ -199,25 +197,33 @@ function assets(env: Env): Asset[] {
 type Quoted = { price: string; expo: number; publishTime: number };
 let priceCache: { key: string; at: number; prices: Record<string, Quoted> } | undefined;
 
+// Pyth's Solana receiver program; it owns every PriceUpdateV2 account.
+const PYTH_RECEIVER = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
+
 function limitVar(value: string | number | undefined, name: string): number {
   const n = Number(value);
   if (value === undefined || value === "" || !Number.isSafeInteger(n) || n < 0) throw new Fail(500, `The server setting ${name} is missing or not a whole number.`);
   return n;
 }
 
+type PythAccount = { account: string; feedId: string };
+
 async function prices(env: Env): Promise<Record<string, Quoted>> {
   const now = Math.floor(Date.now() / 1000);
-  const feedsRaw = parsed(env.PYTH_FEEDS ?? {}, "PYTH_FEEDS");
-  if (typeof feedsRaw !== "object" || feedsRaw === null || Array.isArray(feedsRaw)) throw new Fail(500, "The server setting PYTH_FEEDS is malformed.");
-  const feeds: Record<string, string> = {};
-  for (const [mint, id] of Object.entries(feedsRaw)) {
-    const norm = typeof id === "string" ? id.replace(/^0x/, "").toLowerCase() : "";
-    if (!isAddress(mint) || !/^[0-9a-f]{64}$/.test(norm)) throw new Fail(500, "The server setting PYTH_FEEDS is malformed.");
-    feeds[mint] = norm;
+  const raw = parsed(env.PYTH_ACCOUNTS ?? {}, "PYTH_ACCOUNTS");
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Fail(500, "The server setting PYTH_ACCOUNTS is malformed.");
+  const feeds: Record<string, PythAccount> = {};
+  for (const [mint, v] of Object.entries(raw as Record<string, Partial<PythAccount>>)) {
+    const feedId = typeof v?.feedId === "string" ? v.feedId.replace(/^0x/, "").toLowerCase() : "";
+    if (!isAddress(mint) || !isAddress(v?.account) || !/^[0-9a-f]{64}$/.test(feedId)) {
+      throw new Fail(500, "The server setting PYTH_ACCOUNTS is malformed.");
+    }
+    feeds[mint] = { account: v.account, feedId };
   }
+  const list = assets(env);
   if (env.NETWORK === "mainnet") {
-    const missing = assets(env).find((a) => feeds[a.mint] === undefined);
-    if (missing) throw new Fail(500, `No Pyth feed is configured for ${missing.symbol} (${missing.mint}); mainnet needs one for every asset.`);
+    const missing = list.find((a) => feeds[a.mint] === undefined);
+    if (missing) throw new Fail(500, `No Pyth price account is configured for ${missing.symbol} (${missing.mint}); mainnet needs one for every asset.`);
   }
   const reference = parsed(env.REFERENCE ?? {}, "REFERENCE") as Record<string, { price: unknown; expo: unknown }>;
   const out: Record<string, Quoted> = {};
@@ -226,77 +232,80 @@ async function prices(env: Env): Promise<Record<string, Quoted>> {
     out[mint] = { price: String(r?.price), expo: Number(r?.expo), publishTime: now };
   }
   if (Object.keys(feeds).length === 0) return out;
-  return { ...out, ...(await pyth(env, feeds, now)) };
+  const symbol = (mint: string) => list.find((a) => a.mint === mint)?.symbol ?? mint;
+  return { ...out, ...(await pyth(env, feeds, symbol, now)) };
 }
 
-async function pyth(env: Env, feeds: Record<string, string>, now: number): Promise<Record<string, Quoted>> {
-  if (!env.PYTH_API_KEY) throw new Fail(500, "PYTH_FEEDS is set but the PYTH_API_KEY secret is missing.");
+async function pyth(env: Env, feeds: Record<string, PythAccount>, symbol: (mint: string) => string, now: number): Promise<Record<string, Quoted>> {
   const maxAge = limitVar(env.PYTH_MAX_AGE_SECS, "PYTH_MAX_AGE_SECS");
   const maxConf = limitVar(env.PYTH_MAX_CONF_BPS, "PYTH_MAX_CONF_BPS");
-  const base = (env.PYTH_URL ?? "https://hermes.pyth.network").replace(/\/+$/, "");
+  const base = rpcBase(env);
   const key = JSON.stringify([base, feeds]);
-  // Age is re-checked on every read; a cached price that went stale is fetched again.
+  // Age is re-checked on every read; a cached price that went stale is read again.
   const fresh = (p: Record<string, Quoted>) => Object.values(p).every((q) => now - q.publishTime <= maxAge);
   if (priceCache?.key === key && Date.now() - priceCache.at < PRICE_CACHE_MS && fresh(priceCache.prices)) return priceCache.prices;
 
-  const ids = [...new Set(Object.values(feeds))];
-  const url = `${base}/v2/updates/price/latest?${ids.map((id) => `ids[]=${id}`).join("&")}&parsed=true`;
-  let text: string;
+  const mints = Object.keys(feeds);
+  const body = JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "getMultipleAccounts",
+    params: [mints.map((m) => feeds[m]!.account), { encoding: "base64", commitment: "confirmed" }],
+  });
+  let value: unknown;
   try {
-    const response = await fetch(url, { headers: { authorization: `Bearer ${env.PYTH_API_KEY}` }, redirect: "manual", signal: AbortSignal.timeout(HERMES_TIMEOUT_MS) });
-    const bytes = response.ok ? await readCapped(response.body, 256 * 1024) : null;
+    const response = await fetch(withKey(base, env), {
+      method: "POST", headers: { "content-type": "application/json" }, body, redirect: "manual", signal: AbortSignal.timeout(PRICE_TIMEOUT_MS),
+    });
+    const bytes = response.ok ? await readCapped(response.body, 64 * 1024) : null;
     if (bytes === null) throw new Error();
-    text = new TextDecoder().decode(bytes);
+    value = JSON.parse(new TextDecoder().decode(bytes))?.result?.value;
   } catch {
     throw new Fail(503, "Live prices are unavailable right now. Try again shortly.");
   }
-  const byId = checkHermes(text, now, maxAge, maxConf);
+  if (!Array.isArray(value) || value.length !== mints.length) throw new Fail(503, "Live prices are unavailable right now. Try again shortly.");
   const result: Record<string, Quoted> = {};
-  for (const [mint, id] of Object.entries(feeds)) {
-    const q = byId.get(id);
-    if (q === undefined) throw new Fail(503, `The price feed for ${mint} is missing from Pyth's reply.`);
-    result[mint] = q;
-  }
+  mints.forEach((mint, i) => {
+    result[mint] = checkPriceAccount(value[i], feeds[mint]!.feedId, symbol(mint), now, maxAge, maxConf);
+  });
   priceCache = { key, at: Date.now(), prices: result };
   return result;
 }
 
-const I64_MAX = (1n << 63n) - 1n;
-
-// Port of core::price::parse_hermes plus the future-timestamp check of cli/src/config.rs
-// hermes_prices: any bad feed in the reply fails the whole call.
-export function checkHermes(text: string, now: number, maxAge: number, maxConfBps: number): Map<string, Quoted> {
+// PriceUpdateV2, little-endian: discriminator 8 | write authority 32 | verification level at 40
+// (1 = Full, one byte; 0 = Partial, two bytes) | feed id 32 | price i64 | conf u64 | expo i32 | publish time i64 | ...
+export function checkPriceAccount(account: unknown, feedId: string, symbol: string, now: number, maxAge: number, maxConfBps: number): Quoted {
   const fail = (why: string): never => {
-    throw new Fail(503, `Live prices failed a safety check: ${why}.`);
+    throw new Fail(503, `The ${symbol} price failed a safety check: ${why}.`);
   };
-  let reply: { parsed?: unknown };
+  const a = account as { owner?: unknown; data?: unknown } | null;
+  if (a === null || typeof a !== "object") return fail("its Pyth account does not exist");
+  if (a.owner !== PYTH_RECEIVER) return fail("its account is not owned by Pyth's receiver program");
+  const b64 = Array.isArray(a.data) && a.data[1] === "base64" && typeof a.data[0] === "string" ? a.data[0] : fail("its account data is not base64");
+  let data: Uint8Array;
   try {
-    reply = JSON.parse(text);
+    data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
   } catch {
-    return fail("the reply is not JSON");
+    return fail("its account data is not base64");
   }
-  if (!Array.isArray(reply?.parsed)) return fail("the reply has no parsed feeds");
-  const out = new Map<string, Quoted>();
-  for (const feed of reply.parsed as { id?: unknown; price?: Record<string, unknown> }[]) {
-    if (typeof feed?.id !== "string" || typeof feed.price !== "object" || feed.price === null) return fail("a feed is malformed");
-    const id = feed.id.replace(/^0x/, "").toLowerCase();
-    const { price, conf, expo, publish_time: published } = feed.price;
-    if (typeof price !== "string" || !/^[+-]?[0-9]{1,19}$/.test(price) || BigInt(price) > I64_MAX) return fail(`feed ${id} has a bad price`);
-    if (typeof conf !== "string" || !/^\+?[0-9]{1,20}$/.test(conf) || BigInt(conf) > U64_MAX) return fail(`feed ${id} has a bad confidence`);
-    if (!Number.isInteger(expo) || Math.abs(expo as number) > 2 ** 31) return fail(`feed ${id} has a bad exponent`);
-    if (!Number.isSafeInteger(published)) return fail(`feed ${id} has a bad publish time`);
-    const p = BigInt(price);
-    const t = published as number;
-    if (t > now + maxAge) return fail(`feed ${id} is published in the future`);
-    if (now - t > maxAge) return fail(`feed ${id} is stale (published ${now - t} s ago, max ${maxAge} s)`);
-    if (p <= 0n) return fail(`feed ${id} has a non-positive price`);
-    if (BigInt(conf) * 10_000n > p * BigInt(maxConfBps)) return fail(`feed ${id} is too uncertain (confidence wider than ${maxConfBps} bps)`);
-    out.set(id, { price: p.toString(), expo: expo as number, publishTime: t });
-  }
-  return out;
+  if (data.length < 101) return fail("its account is too short");
+  if (data[40] !== 1) return fail("the update is not fully verified");
+  const id = [...data.subarray(41, 73)].map((x) => x.toString(16).padStart(2, "0")).join("");
+  if (id !== feedId) return fail("the account holds a different feed");
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const price = view.getBigInt64(73, true);
+  const conf = view.getBigUint64(81, true);
+  const expo = view.getInt32(89, true);
+  const published = view.getBigInt64(93, true);
+  const t = BigInt(now);
+  if (published > t + BigInt(maxAge)) return fail("it is published in the future");
+  if (t - published > BigInt(maxAge)) return fail(`it is stale (published ${t - published} s ago, max ${maxAge} s)`);
+  if (price <= 0n) return fail("the price is not positive");
+  if (conf * 10_000n > price * BigInt(maxConfBps)) return fail(`its confidence is wider than ${maxConfBps} bps of the price`);
+  return { price: price.toString(), expo, publishTime: Number(published) };
 }
 
 // ---- upstreams ----
+
+const rpcBase = (env: Env) => env.UPSTREAM_RPC ?? (env.NETWORK === "local" ? LOCAL.rpc : helius(env, "/"));
 
 function helius(env: Env, path: string): string {
   if (env.NETWORK !== "devnet" && env.NETWORK !== "mainnet") throw new Fail(503, "This network has no upstream configured.");
@@ -372,7 +381,7 @@ async function rpc(request: Request, env: Env): Promise<Response> {
     const replies = refused.map((r, i) => r ?? rpcError((calls[i] as { id?: unknown }).id, -32600, "Batch refused: another request in it is not allowed"));
     return json(Array.isArray(value) ? replies : replies[0]);
   }
-  const base = env.UPSTREAM_RPC ?? (env.NETWORK === "local" ? LOCAL.rpc : helius(env, "/"));
+  const base = rpcBase(env);
   // Forward the original bytes so u64 integers keep their precision.
   const response = await upstream(withKey(base, env), {
     method: "POST",

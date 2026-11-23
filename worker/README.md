@@ -8,7 +8,7 @@ network peer, so the Helius key and the dealer key never reach the browser.
 | Route | Method | What it does |
 | --- | --- | --- |
 | `/api/config` | GET | Public config: `{network, rpcPath, sprPath, programId, assets:[{mint,symbol,decimals,maxSell?}], dealers:[{pubkey}], bandBps, minTtlSecs, maxTtlSecs, faucet, paused}` |
-| `/api/prices` | GET | `{[mint]: {price: "<int>", expo, publishTime}}` from Pyth Hermes when `PYTH_FEEDS` is set, otherwise the fixed `REFERENCE` values stamped now |
+| `/api/prices` | GET | `{[mint]: {price: "<int>", expo, publishTime}}` from Pyth's on-chain price accounts when `PYTH_ACCOUNTS` is set, otherwise the fixed `REFERENCE` values stamped now |
 | `/api/rpc` | POST | Solana JSON-RPC proxy. Method allowlist, batches checked per element, 64 KiB body cap |
 | `/v1/spr/*` | GET, POST | Helius Privacy Rings indexer and TEE prover proxy. Exact path allowlist, 1 MiB request cap, response cap 10 MiB (indexer) / 1 MiB (prover) |
 | `/api/tee-policy` | GET | The signed TEE policy for `devnet`/`mainnet` (the browser checks the signatures). 404 on `local` |
@@ -49,18 +49,18 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `PROGRAM_ID` | var | Swap program ID |
 | `ASSETS` | var | JSON `[{"mint","symbol","decimals"}]` |
 | `BAND_BPS`, `MIN_TTL_SECS`, `MAX_TTL_SECS` | var | Numbers |
-| `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}`: fixed prices for mints without a Pyth feed. Ignored on `mainnet` |
+| `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}`: fixed prices for mints without a Pyth account. Ignored on `mainnet` |
 | `FAUCET` | var | `"1"` turns on `/api/faucet` |
 | `PAUSED` | var | `"1"` stops `/api/quotes` and `/api/faucet` (503); everything else keeps working |
-| `PYTH_API_KEY` | secret | Hermes key, sent as `Authorization: Bearer` |
-| `PYTH_FEEDS` | var | JSON `{"<mint>":"<feed id hex>"}` |
-| `PYTH_URL` | var | Hermes base URL. Default `https://hermes.pyth.network` |
-| `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_FEEDS`. A feed older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
+| `PYTH_ACCOUNTS` | var | JSON `{"<mint>":{"account":"<base58>","feedId":"<64 hex>"}}`: Pyth price update accounts (e.g. mainnet SOL/USD `7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE`) |
+| `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_ACCOUNTS`. A price older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
 
-Prices: Hermes is asked for `/v2/updates/price/latest?ids[]=…&parsed=true` (as the CLI does),
-checked as `core::price::parse_hermes` and `cli/src/config.rs` do, and cached for 5 s per
-isolate; the age is re-checked on every read. A Hermes failure is a 503, never the fixed values.
-On `mainnet` every asset in `ASSETS` needs a feed, or `/api/prices` is a 500.
+Prices: one `getMultipleAccounts` (base64) to the RPC upstream reads every configured account.
+Each must exist, be owned by Pyth's receiver `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`,
+be fully verified (byte 40 = 1), and hold the configured feed id; then the price, age and
+confidence checks above apply. The result is cached for 5 s per isolate and the age is re-checked
+on every read. Any failure is a 503 naming the asset, never the fixed values. On `mainnet` every
+asset in `ASSETS` needs an account, or `/api/prices` is a 500.
 
 A path below `/v1/spr` is appended to the chosen base, so `/v1/spr/getUserRecords` goes to
 `<UPSTREAM_INDEXER>/getUserRecords` and `/v1/spr/prove/x` to `<UPSTREAM_PROVER>/prove/x`.
@@ -105,7 +105,6 @@ npx tsc --noEmit
 cd ../web && pnpm build && cd ../worker
 npx wrangler secret put HELIUS_API_KEY
 npx wrangler secret put DEALER_KEY
-npx wrangler secret put PYTH_API_KEY   # only with PYTH_FEEDS
 npx wrangler deploy --var NETWORK:devnet --var FAUCET:1 \
   --var DEALERS:'[{"url":"https://<tunnel>","pubkey":"<pubkey>"}]' \
   --var PROGRAM_ID:<id> --var ASSETS:'[...]' --var REFERENCE:'{...}' \
