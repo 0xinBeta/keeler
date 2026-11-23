@@ -341,14 +341,26 @@ Each item goes to the piece that owns the files.
 - The page says it plainly: "The dealer may decline if the price moves before
   it settles. Your funds stay locked until the quote expires, then you can
   take them back."
+- Price source (changed 2026-11-23: Pyth's Hermes API now needs a paid key,
+  so nothing uses it): Pyth's on-chain price feed accounts, read through the
+  RPC we already have. Checked on mainnet: SOL/USD
+  `7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE` and USDC/USD
+  `Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX` are fully verified and 22–35 s
+  old. A reader must check: the account owner is Pyth's receiver program
+  `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, verification level is Full,
+  the feed id is the configured one, price > 0, age and confidence within
+  limits. Layout: 8-byte discriminator, 32-byte write authority, verification
+  level (1 byte for Full), feed id (32), price i64, conf u64, exponent i32,
+  publish time i64, all little-endian.
 - Worker: `GET /api/prices` → `{[mint]: {price: "<int>", expo, publishTime}}`.
-  With a `PYTH_API_KEY` secret and `PYTH_FEEDS` (mint → feed id) it reads
-  Hermes with the same checks as the CLI (`core::price::parse_hermes` plus the
-  future-timestamp and missing-feed checks in `cli/src/config.rs`), limits
+  With `PYTH_ACCOUNTS` (mint → `{account, feedId}`) it reads those accounts
+  with one `getMultipleAccounts`, applies the checks above with
   `PYTH_MAX_AGE_SECS` and `PYTH_MAX_CONF_BPS`, caches 5 s and re-checks age on
-  every read. A Hermes failure is a 503, never a fall-back to fixed values.
-  Without feeds it returns the fixed `REFERENCE` values; on `mainnet` a mint
-  without a feed is an error.
+  every read. A failed read or check is a 503, never a fall-back to fixed
+  values. Without `PYTH_ACCOUNTS` it returns the fixed `REFERENCE` values; on
+  `mainnet` a mint without an account is an error.
+- Dealer: the same source and checks in Rust replace the Hermes source in
+  `cli/src/config.rs` and `core/src/price.rs`.
 - Browser: the band check uses `/api/prices`; the quotes view shows the
   price's age.
 
