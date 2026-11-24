@@ -53,7 +53,8 @@ export type LendWasm = Hashing & {
   decode(note: NoteOpening, leafIndex: bigint): Promise<{ ownerIsMe: boolean; pool?: bigint; vault?: bigint; positionId?: bigint; shares: bigint }>;
 };
 
-export type Owners = { user: Uint8Array; pda: Uint8Array; viewing: Uint8Array };
+/** `tags`: the view tags the user's wallet finds a payment under (its viewing key's x, its identity's tag). */
+export type Owners = { user: Uint8Array; pda: Uint8Array; viewing: Uint8Array; tags: Uint8Array[] };
 
 export type LendDeps = {
   network: string;
@@ -154,7 +155,20 @@ export function createLend(d: LendDeps): KeelerLend {
   let session: Session | undefined;
   let lastFigures: KeeperPools["pools"] = [];
   let scanned = false;
+  /** The keeper's view is due (a fill, a spent note, a lost browser) but was not read for want of a session. */
+  let wanted = false;
+  let who: string | undefined;
   const running = new Set<string>();
+  /** Session and rescan belong to one wallet: a switch starts over. */
+  const forWallet = () => {
+    const me = d.wallet();
+    if (who === me) return;
+    who = me;
+    session = undefined;
+    scanned = false;
+    wanted = false;
+  };
+  const NO_SESSION = new Error("no lending session");
 
   const exclusive = async <T>(key: string, run: () => Promise<T>): Promise<T> => {
     if (running.has(key)) throw err("busy", key === "lend" ? "Another lending operation is in progress. Wait for it to finish." : "This refund is already in progress. Wait for it to finish.");
@@ -166,9 +180,11 @@ export function createLend(d: LendDeps): KeelerLend {
     }
   };
 
-  /** The session, asking the wallet once to authorise it (or again within 5 minutes of its expiry). */
-  const authorise = async (now: number): Promise<Session> => {
+  /** The session, asking the wallet once to authorise it (or again within 5 minutes of its expiry); never asks unless `prompt`. */
+  const authorise = async (now: number, prompt = true): Promise<Session> => {
+    forWallet();
     if (session && session.expiry - now > 300) return session;
+    if (!prompt) throw NO_SESSION;
     const keys = await sessionKey(d.sessionSeed());
     const expiry = sessionExpiryFor(now);
     const auth = await d.signMessage(authorisationMessage({ network: d.network, programId: d.programId, wallet: d.wallet(), sessionKey: keys.key, expiry }));
@@ -192,10 +208,10 @@ export function createLend(d: LendDeps): KeelerLend {
   };
 
   /** A signed keeper request; one 401 drops the session and asks again (an expired or replaced session). */
-  const keeper = async <T>(method: "GET" | "POST", path: string, body: Fields): Promise<T> => {
+  const keeper = async <T>(method: "GET" | "POST", path: string, body: Fields, prompt = true): Promise<T> => {
     for (let attempt = 0; ; attempt++) {
       const now = await d.chainNow();
-      const fields = await signRequest(await authorise(now), d.wallet(), method, path, body, now);
+      const fields = await signRequest(await authorise(now, prompt), d.wallet(), method, path, body, now);
       try {
         if (method === "GET") return await call<T>(`/api${path}?${new URLSearchParams(Object.entries(fields).map(([k, v]) => [k, String(v)]))}`);
         return await call<T>(`/api${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fields) });
@@ -342,22 +358,21 @@ export function createLend(d: LendDeps): KeelerLend {
     }
   };
 
-  /** Positions a liquidation spent: what they held, until the successor shows what was sold. */
-  const liquidated = new Map<string, { at: number; price: bigint; collateral: bigint; debtShares: bigint }>();
-  const noteLiquidation = async (p: PositionRecord, signature: string) => {
-    const wire = await d.chain.transaction(signature);
-    const ix = wire ? lendInstructions(wire, d.programId).find((x) => x.tag === TAG.liquidate) : undefined;
-    if (ix) liquidated.set(p.id, { at: await d.chainNow(), price: u64At(ix.data.subarray(1), ARGS.liquidate.bound), collateral: p.collateral, debtShares: p.debtShares });
+  /** The lend instruction that spent a note, or undefined while the RPC has no copy of its transaction. */
+  const spentWith = async (signature: string) => {
+    const wire = await d.chain.transaction(signature).catch(() => null);
+    return wire ? (lendInstructions(wire, d.programId)[0] ?? null) : undefined;
   };
 
   /**
    * Receipts and positions: local openings still unspent, plus verified keeper-view openings. The keeper view is read
    * when `useKeeper`, or when a local note was spent by something other than this page (a fill, a liquidation): only
-   * the keeper's opening describes its successor.
+   * the keeper's opening describes its successor. A spent record stays until what replaced it is known, so a keeper
+   * that is away or a session not yet allowed never makes a deposit or a position disappear.
    */
-  const holdings = async (useKeeper: boolean, now: number) => {
+  const holdings = async (useKeeper: boolean, now: number, prompt: boolean) => {
     const s = d.store();
-    const gone: PositionRecord[] = [];
+    const spent: { kind: "receipt" | "position"; r: ReceiptRecord | PositionRecord; by: string }[] = [];
     for (const kind of ["receipt", "position"] as const) {
       for (const r of s.all(kind)) {
         if (empty(r)) {
@@ -365,17 +380,15 @@ export function createLend(d: LendDeps): KeelerLend {
           continue;
         }
         const where = await d.chain.note(r.note.hash, r.note.blinding).catch(() => undefined);
-        if (!where?.spentBy) continue;
-        s.remove(kind, hex(r.note.hash));
-        useKeeper = true;
-        if (kind === "position") {
-          gone.push(r as PositionRecord);
-          await noteLiquidation(r as PositionRecord, where.spentBy).catch(() => undefined);
-        }
+        if (where?.spentBy) spent.push({ kind, r, by: where.spentBy });
       }
     }
-    if (useKeeper) {
-      const view = await keeper<KeeperAccount>("GET", "/lend/account", {}).catch(() => undefined);
+    const stale = new Set(spent.map((x) => hex(x.r.note.hash)));
+    const current = (id: string) => s.all("position").some((x) => x.id === id && !stale.has(hex(x.note.hash)));
+    let view: KeeperAccount | undefined;
+    if (useKeeper || wanted || spent.length > 0) {
+      view = await keeper<KeeperAccount>("GET", "/lend/account", {}, prompt).catch(() => undefined);
+      wanted = view === undefined && session === undefined;
       if (view?.index) learnIndex(view.index, now);
       for (const r of view?.receipts ?? []) {
         const got = await adopt("receipt", r.pool, r.message);
@@ -384,27 +397,43 @@ export function createLend(d: LendDeps): KeelerLend {
       for (const p of view?.positions ?? []) {
         const v = cfg.vaults.find((x) => x.id === p.vault);
         // A position this browser holds unspent is current; the keeper's view may lag behind it.
-        if (!v || s.all("position").some((x) => x.id === p.position)) continue;
+        if (!v || current(p.position)) continue;
         const got = await adopt("position", v.collateralMint, p.message);
         if (!got || got.decoded.positionId?.toString() !== p.position) continue;
         if (got.note.amount === 0n && got.decoded.shares === 0n) continue;
-        const before = liquidated.get(p.position);
-        liquidated.delete(p.position);
+        // What a liquidation sold: the spent record before it against its successor.
+        const before = spent.find((x) => x.kind === "position" && (x.r as PositionRecord).id === p.position);
+        const ix = before ? await spentWith(before.by) : undefined;
         const at = index(v.debtMint, "borrow", now);
-        const lastLiquidation = before
-          ? { at: before.at, price: before.price, collateralSold: before.collateral - got.note.amount, debtRepaid: debtOf(before.debtShares, at) - debtOf(got.decoded.shares, at) }
-          : null;
+        const old = before?.r as PositionRecord | undefined;
+        const lastLiquidation =
+          old && ix?.tag === TAG.liquidate
+            ? { at: now, price: u64At(ix.data.subarray(1), ARGS.liquidate.bound), collateralSold: old.collateral - got.note.amount, debtRepaid: debtOf(old.debtShares, at) - debtOf(got.decoded.shares, at) }
+            : (old?.lastLiquidation ?? null);
         s.put("position", hex(got.note.hash), { vault: v.id, id: p.position, collateral: got.note.amount, debtShares: got.decoded.shares, note: got.note, lastLiquidation });
       }
     }
-    // A position a keeper fill spent, with no successor from the keeper (it went away): derive the successor where it
-    // is computable and keep it only if the chain has exactly that note.
-    for (const old of gone) {
-      if (s.all("position").some((x) => x.id === old.id) || liquidated.has(old.id)) continue;
-      const next = await successor(old).catch(() => undefined);
+    for (const { kind, r, by } of spent) {
+      const drop = () => s.remove(kind, hex(r.note.hash));
+      // A receipt's successor, if it has shares, is in the keeper's view.
+      if (kind === "receipt") {
+        if (view) drop();
+        continue;
+      }
+      const old = r as PositionRecord;
+      if (current(old.id)) {
+        drop();
+        continue;
+      }
+      const ix = await spentWith(by);
+      // Closed: nothing follows it. A keeper fill with no word from the keeper: derive the successor where it is
+      // computable and keep it only if the chain has exactly that note.
+      const next = ix?.tag === TAG.close || ix?.tag === TAG.liquidate ? undefined : await successor(old).catch(() => undefined);
       if (next && !empty(next)) s.put("position", hex(next.note.hash), next);
+      // Otherwise it stays until the keeper's view describes what replaced it; a view without it means it is empty.
+      if (next || ix?.tag === TAG.close || view) drop();
     }
-    return { receipts: s.all("receipt"), positions: s.all("position") };
+    return { receipts: s.all("receipt"), positions: s.all("position"), needsSession: wanted };
   };
 
   /** A keeper deposit-add (collateral grows by an intent of this position's) or a full repay (no debt shares left). */
@@ -482,8 +511,10 @@ export function createLend(d: LendDeps): KeelerLend {
       await d.sync();
       const source = d.notes(mint).filter((n) => n.amount >= amount).sort((a, b) => (a.amount < b.amount ? -1 : 1))[0];
       if (!source) throw err("insufficient-note", `No single private note of ${asset(mint).symbol} covers that amount. Enter at most your largest note, or deposit more.`);
-      on("proving");
       const now = await d.chainNow();
+      // Any wallet prompt for the session comes before the progress steps start.
+      await authorise(now);
+      on("proving");
       const t = await keeper<{ id?: unknown; expiry?: unknown; signature?: unknown }>("POST", "/lend/ticket", { purpose, amount: amount.toString(), ...ticket });
       const expiry = await verifyTicketReply(t, PURPOSE[purpose], target, amount, now);
       const built = await d.build.intent({ source: source.utxo, mint, amount, purpose: PURPOSE[purpose], target, expiry }, () => {}).catch((e) => {
@@ -558,6 +589,7 @@ export function createLend(d: LendDeps): KeelerLend {
     place: Pick<LendOperation, "pool" | "vault" | "positionId" | "amounts">,
     on: (s: LendStep) => void,
   ) => {
+    await authorise(await d.chainNow());
     on("keeper");
     const reply = parseBuild(await keeper<WireBuild>("POST", "/lend/build", { op: kind, ...request }));
     const owners = await d.owners();
@@ -565,7 +597,7 @@ export function createLend(d: LendDeps): KeelerLend {
     const seed = d.wasm.seed(SEED_DOMAIN[kind], spent.blinding);
     const checked = await checkKeeperTransaction(
       reply,
-      { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
+      { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, payoutTags: owners.tags, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
       d.wasm,
     );
     // The keeper's index is kept only once its transaction passed the check.
@@ -573,11 +605,15 @@ export function createLend(d: LendDeps): KeelerLend {
     const blindings = new Map<number, Uint8Array>();
     for (const n of want.notes) blindings.set(n.slot, await d.wasm.blinding(checked.firstNullifier, seed, n.slot));
     const creates = want.creates(blindings, checked.outputs);
+    // The keeper's blockhash is seconds old and lives 150 blocks; this bound only decides when an unseen send gave up,
+    // so without a block height nothing is sent (a guess could call a send that still lands "expired").
+    const height = await d.chain.blockHeight().catch(() => {
+      throw err("network", "Could not read the chain's block height, so nothing was sent. Try again.");
+    });
+    const lastValidBlockHeight = height + 300n;
     const record: OpRecord = { id: hex(checked.outputs[kind === "redeem" ? SLOT.redeem.receipt : SLOT.draw.position]!), kind, ...place, step: "signing", status: "pending", expiry: null, createdAt: Number(checked.now), spends: spent.hash, ...(creates ? { creates } : {}) };
     save(record);
     on("signing");
-    // The keeper's blockhash is seconds old and lives 150 blocks; this bound only decides when an unseen send gave up.
-    const lastValidBlockHeight = (await d.chain.blockHeight().catch(() => 0n)) + 300n;
     const op = await sendSaved(record, { transaction: checked.transaction, lastValidBlockHeight }, () => {
       settle(record);
       on("landed");
@@ -632,13 +668,17 @@ export function createLend(d: LendDeps): KeelerLend {
       return { pools, vaults };
     },
 
-    async lendAccount(): Promise<LendAccount> {
+    async lendAccount(opts = {}): Promise<LendAccount> {
       d.sessionSeed(); // throws while locked
+      forWallet();
       const now = await d.chainNow();
       let found = 0;
       if (!scanned) {
-        found = await rescan().catch(() => 0);
-        scanned = true;
+        // A failed rescan is tried again on the next read.
+        found = await rescan().then(
+          (n) => ((scanned = true), n),
+          () => 0,
+        );
       }
       const s = d.store();
       const before = new Map(s.all("op").map((r) => [r.id, r.status]));
@@ -647,13 +687,13 @@ export function createLend(d: LendDeps): KeelerLend {
       // its records; and after a fill, whose note only the keeper's opening describes.
       const lost = found > 0 && s.all("receipt").length === 0 && s.all("position").length === 0;
       const filled = ops.some((r) => r.intent && r.status === "landed" && before.get(r.id) !== "landed");
-      const held = await holdings(session !== undefined || lost || filled, now);
+      const held = await holdings(session !== undefined || lost || filled, now, opts.prompt ?? true);
       const receipts: Receipt[] = held.receipts.map((r) => ({ pool: r.pool, shares: r.shares, value: assetsOf(r.shares, index(r.pool, "supply", now)) }));
       const positions: Position[] = held.positions.map((p) => {
         const v = vaultOf(p.vault);
         return { vault: p.vault, id: p.id, collateral: p.collateral, debt: debtOf(p.debtShares, index(v.debtMint, "borrow", now)), lastLiquidation: p.lastLiquidation };
       });
-      return { receipts, positions, operations: ops.sort((a, b) => b.createdAt - a.createdAt).map(toOp), asOf: now };
+      return { receipts, positions, operations: ops.sort((a, b) => b.createdAt - a.createdAt).map(toOp), asOf: now, ...(held.needsSession ? { needsSession: true as const } : {}) };
     },
 
     supply(pool, amount, on) {
@@ -666,6 +706,10 @@ export function createLend(d: LendDeps): KeelerLend {
       const v = vaultOf(vaultId);
       if (positionId === null && amount < BigInt(v.minCollateral)) return Promise.reject(err("below-minimum", `A new position needs at least ${v.minCollateral} base units of ${asset(v.collateralMint).symbol}. Enter a larger amount.`));
       if (positionId !== null) positionRecord(positionId);
+      // A reload while an opening deposit waits must not open a second position beside it.
+      else if (d.store().all("op").some((o) => o.kind === "deposit" && o.vault === v.id && o.intent && (o.status === "pending" || o.status === "refundable") && !d.store().all("position").some((x) => x.id === o.positionId))) {
+        return Promise.reject(err("busy", "Your first deposit to this vault is still waiting for the keeper. Once it is in, add to that position; if it expires, take it back first."));
+      }
       // A new position takes a fresh random id, named by the intent and the ticket.
       const id = positionId ?? (new DataView(crypto.getRandomValues(new Uint8Array(8)).buffer).getBigUint64(0) >> 1n).toString();
       return intent("deposit", "deposit", v.collateralMint, amount, BigInt(id), { pool: v.debtMint, vault: v.id, positionId: id }, { vault: v.id, position: id }, on);
@@ -706,7 +750,7 @@ export function createLend(d: LendDeps): KeelerLend {
             return {
               checked: () => remember(pool, "supply", reply.index!, reply.now),
               notes: [
-                { slot: SLOT.redeem.payout, owner: owners.user, mint, amount: paid, kind: NOTE_KIND.token, state: new Uint8Array() },
+                { slot: SLOT.redeem.payout, owner: owners.user, mint, amount: paid, kind: NOTE_KIND.token, state: new Uint8Array(), payout: true },
                 { slot: SLOT.redeem.receipt, owner: owners.pda, mint, amount: 0n, kind: NOTE_KIND.receipt, state },
               ],
               creates: (b, outputs) => ({ receipt: { pool, shares: left, note: { hash: outputs[SLOT.redeem.receipt]!, mint: pool, amount: 0n, blinding: b.get(SLOT.redeem.receipt)!, state, kind: NOTE_KIND.receipt } } }),
@@ -740,8 +784,8 @@ export function createLend(d: LendDeps): KeelerLend {
               reference,
               notes: [
                 { slot: SLOT.draw.position, owner: owners.pda, mint: collateralMint, amount: collateral, kind: NOTE_KIND.position, state },
-                { slot: SLOT.draw.debtPayout, owner: owners.user, mint: debtMint, amount: borrow, kind: NOTE_KIND.token, state: new Uint8Array() },
-                { slot: SLOT.draw.collateralPayout, owner: owners.user, mint: collateralMint, amount: withdraw, kind: NOTE_KIND.token, state: new Uint8Array() },
+                { slot: SLOT.draw.debtPayout, owner: owners.user, mint: debtMint, amount: borrow, kind: NOTE_KIND.token, state: new Uint8Array(), payout: true },
+                { slot: SLOT.draw.collateralPayout, owner: owners.user, mint: collateralMint, amount: withdraw, kind: NOTE_KIND.token, state: new Uint8Array(), payout: true },
               ],
               creates: (b, outputs) => ({
                 position: { ...p, collateral, debtShares, note: { hash: outputs[SLOT.draw.position]!, mint: v.collateralMint, amount: collateral, blinding: b.get(SLOT.draw.position)!, state, kind: NOTE_KIND.position } },

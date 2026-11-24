@@ -216,7 +216,7 @@ test("liquidation: borrow near the limit, the price drops, the keeper liquidates
   // position is past the 85% threshold and below the program's 90% max limit, so the liquidation is partial.
   setPrice(8.6);
   await timed("liquidation: price moved to the page showing it", () => expect(p.getByText(/^Liquidated /)).toBeVisible({ timeout: KEEPER }));
-  await expect(p.getByText(/The position is back at 85% and the rest is still yours\./)).toBeVisible();
+  await expect(p.getByText(/The position is back to 85% or less, and the rest is still yours\./)).toBeVisible();
   const collateral = units(await position(0).innerText(), 9);
   expect(collateral).toBeLessThan(1_000_000_000n);
   expect(collateral).toBeGreaterThan(500_000_000n);
@@ -245,6 +245,8 @@ test("recovery: with the browser's storage cleared, the receipt and the position
   }, SEED_KEY);
   await timed("recovery: reload to receipts and positions shown", async () => {
     await open();
+    // The page never asks the wallet on its own: the reader allows the session to fetch the keeper's view.
+    await page.getByRole("button", { name: "Check with the keeper" }).click({ timeout: 120_000 });
     await tab("Earn");
     await expect(p.locator(".mine-big")).toBeVisible({ timeout: 120_000 });
     await tab("Borrow");

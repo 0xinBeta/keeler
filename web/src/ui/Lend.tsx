@@ -15,7 +15,8 @@ export type LendProps = {
   market: Market | null;
   account: LendAccount | null;
   chainOffset: number | null;
-  refreshLend: () => Promise<unknown>;
+  /** `prompt`: the wallet may ask to allow the lending session (only on the reader's click). */
+  refreshLend: (prompt?: boolean) => Promise<unknown>;
   refreshBalances: () => Promise<unknown>;
 };
 
@@ -146,7 +147,7 @@ function Progress({ p, op, onDone }: { p: LendProps; op: ReturnType<typeof useOp
   else if (status === "refunded") line = "Done. The funds are back in your private balance.";
   else if (status === "refundable") line = "The keeper did not take it in before the request expired. The funds are still yours: take them back.";
   else if (status === "failed") line = live?.error ?? "It failed.";
-  else line = step ? `${STEP_LABEL[step]}…` : "Starting…";
+  else line = step ? `${STEP_LABEL[step]}…` : "Starting… Your wallet may ask once to allow this lending session.";
 
   const refund = async () => {
     setBusy(true);
@@ -624,7 +625,8 @@ export function BorrowTab(p: LendProps) {
           {st === "liquidatable" && (
             <p className="note note-error" role="status">
               <strong>Past {pct(vault.liquidationThresholdBps, 0)}.</strong> The keeper sells only enough collateral to bring the position back
-              to {pct(vault.liquidationThresholdBps, 0)}, plus the {pct(vault.penaltyBps, 0)} penalty. Repay or add collateral to keep more of it.
+              to {pct(vault.liquidationThresholdBps, 0)} (past {pct(vault.liquidationMaxLimitBps, 0)}, to repay the whole loan), plus the{" "}
+              {pct(vault.penaltyBps, 0)} penalty. Repay or add collateral to keep more of it.
             </p>
           )}
           {position.lastLiquidation && <LiquidatedNote position={position} vault={vault} debt={d} now={now} />}
@@ -734,7 +736,11 @@ function LiquidatedNote({ position, vault, debt, now }: { position: Position; va
       <strong>Liquidated {when}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt was repaid with{" "}
       <Amount value={l.collateralSold} asset={vault.collateral} />, the {pct(vault.penaltyBps, 0)} penalty included, at{" "}
       {priceText(l.price, vault)} {vault.debt.symbol}.{" "}
-      {debt === 0n ? "The whole loan is repaid; the rest of your collateral is still yours." : `The position is back at ${pct(vault.liquidationThresholdBps, 0)} and the rest is still yours.`}
+      {debt === 0n
+        ? "The whole loan is repaid; the rest of your collateral is still yours."
+        : position.collateral === 0n
+          ? "No collateral is left; the remaining debt stays on the position until you repay it."
+          : `The position is back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest is still yours.`}
     </div>
   );
 }
@@ -798,6 +804,25 @@ export function LendActivity(p: LendProps) {
       <div className="section-head">
         <h2 id="lending-title">Your lending</h2>
       </div>
+      {p.account?.needsSession && (
+        <p className="note">
+          The keeper may have news for your lending (a fill, or a change made in another browser).{" "}
+          <button
+            className="btn btn-ghost"
+            disabled={busy === "session"}
+            onClick={() => {
+              setBusy("session");
+              setError(null);
+              p.refreshLend(true)
+                .catch((e) => setError(errorText(e)))
+                .finally(() => setBusy(null));
+            }}
+          >
+            Check with the keeper
+          </button>{" "}
+          Your wallet asks once to allow this lending session.
+        </p>
+      )}
       {ops.length === 0 && liquidations.length === 0 ? (
         <p className="muted">Nothing yet. Deposit to Earn or open a position from Earn and Borrow above.</p>
       ) : (

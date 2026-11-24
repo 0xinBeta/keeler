@@ -60,7 +60,8 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_ACCOUNTS`. A price older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
 | `LEND_PROGRAM_ID` | var | Lend program ID (base58) |
 | `LEND_POOLS` | var | JSON `[{"mint","curve":[{"utilisationBps","rateBps"}],"feeBps","maxUtilisationBps","minSupply"}]`. The curve has 2 to 8 points, utilisation strictly rising from 0 to 10000 |
-| `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps` |
+| `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps`. Every pool mint and collateral mint must also be in `ASSETS` (the page reads lend amounts with its decimals) |
+| `LEND_KEEPER_URL` | var | Optional `http(s)://` base URL of the lending keeper. Default: the first `DEALERS` entry's `url` |
 
 ## Lending
 
@@ -69,7 +70,7 @@ and every `/api/lend/*` route is a 404. With any of them set, all three must be 
 `/api/config` and the lend routes are a 500. `/api/config` then carries
 `lend: {programId, pools, vaults}` exactly as configured.
 
-Each route goes to the keeper, which for now is the first `DEALERS` entry, with `x-keeler-key`.
+Each route goes to the keeper (`LEND_KEEPER_URL`, or else the first `DEALERS` entry) with `x-keeler-key`.
 Bodies and queries must have exactly the fields below (unknown fields are refused, 400);
 amounts and ids are decimal strings that fit a u64, `timestamp`, `expiry`, `now` and `at` are
 whole seconds, `vault` is 0 to 65535. The Worker forwards only the checked fields, and returns
@@ -77,13 +78,17 @@ only a reply of exactly the shape below; anything else is a 502. A keeper 4xx wi
 `{"error": "<text>"}` is passed through (text cut to 200 characters). Bodies and replies are
 capped at 16 KiB. Timeout 30 s for `build`, 10 s for the rest.
 
-Signed fields, on `ticket`, `build` and `account` (the keeper checks the signatures and freshness;
-the Worker checks shape only): `wallet` (base58), `nonce` (32 lowercase hex), `timestamp`,
-`sessionKey` (base58, the browser's session key), `sessionExpiry` (unix seconds), `sessionAuth`
-(128 lowercase hex: the wallet's signature over the authorisation text), `signature` (128 lowercase
-hex: the session key's signature over the request). In the `account` query, `timestamp` and
-`sessionExpiry` are read as numbers. The byte layouts, the authorisation text and the freshness and
-replay rules are in `docs/lend-api.md`.
+Signed fields, on `ticket`, `build` and `account`: `wallet` (base58), `nonce` (32 lowercase hex),
+`timestamp`, `sessionKey` (base58, the browser's session key), `sessionExpiry` (unix seconds),
+`sessionAuth` (128 lowercase hex: the wallet's signature over the authorisation text), `signature`
+(128 lowercase hex: the session key's signature over the request). In the `account` query,
+`timestamp` and `sessionExpiry` are read as numbers. After the shape check the Worker verifies both
+Ed25519 signatures, `sessionAuth` over the authorisation text rebuilt from its own `NETWORK` and
+`LEND_PROGRAM_ID`, and `signature` over the request bytes for the keeper path; either failing is a
+401 before any global limit or the keeper is touched. Session expiry, freshness and replay need
+chain time and the keeper's nonce store, so they stay the keeper's checks. The byte layouts and the
+authorisation text are in `docs/lend-api.md`; `web/tests/fixtures/lend-requests.json`, the page's
+own signed requests, is in the Worker's tests.
 
 | Route | Request | Reply |
 | --- | --- | --- |
@@ -122,18 +127,23 @@ constant key for everyone. These are settings: tune them to your Helius plan. A 
 | `PROVE_GLOBAL_LIMIT` | 30 | global | POST `/prove/*` |
 | `QUOTE_LIMIT` | 30 | client | `/api/quotes` |
 | `FAUCET_LIMIT` | 3 | client | `/api/faucet` |
-| `LEND_READ_LIMIT` | 60 | client | `/api/lend/pools`, `/api/lend/account` |
-| `LEND_READ_GLOBAL_LIMIT` | 600 | global | same |
+| `LEND_READ_LIMIT` | 120 | client | `/api/lend/pools`, `/api/lend/account` (a tab with a request in flight reads about 21 a minute) |
+| `LEND_READ_GLOBAL_LIMIT` | 1200 | global | same |
 | `LEND_TICKET_LIMIT` | 10 | client | `/api/lend/ticket` |
-| `LEND_TICKET_GLOBAL_LIMIT` | 60 | global | same |
+| `LEND_TICKET_GLOBAL_LIMIT` | 60 | global | `/api/lend/ticket` for `supply` and `deposit`; a `repay` ticket is never charged here |
 | `LEND_BUILD_LIMIT` | 6 | client | `/api/lend/build` (each is two keeper proofs) |
-| `LEND_BUILD_GLOBAL_LIMIT` | 12 | global | same |
 
 The client limit is checked first. A global limit is charged only after the request passed
-every check (method, path, size, content type, shape), so malformed requests cannot use up
-everyone's share. A proof POST must be a JSON object (`application/json`) or a TEE-encrypted
-body (`application/octet-stream` with `Spr-Tee`, `Spr-Tee-Enc` and at least 16 bytes);
-anything else is a 400 or 415 before `PROVE_GLOBAL_LIMIT` is touched.
+every check (method, path, size, content type, shape, and for lending both signatures), so
+malformed or unsigned requests cannot use up everyone's share. Repayment tickets skip the global
+ticket limit, so other people's traffic never stops a repayment. Builds have no global limit: the
+keeper builds one at a time per pool and answers 409 while busy, and a build that proves needs a
+note of the wallet's own. A proof POST must be a JSON object naming its `circuitType`
+(`application/json`, as every SDK proof request does) or a TEE-encrypted body
+(`application/octet-stream` with `Spr-Tee: v1`, a 64-hex `Spr-Tee-Enc` and at least 36 bytes);
+anything else is a 400 or 415 before `PROVE_GLOBAL_LIMIT` is touched. An encrypted body cannot be
+told from junk of the right shape without the enclave's key, so `PROVE_GLOBAL_LIMIT` still bounds
+spend rather than guarantees honest users their share.
 
 When a binding is missing, `NETWORK=local` means no limit. On any other network the request
 is refused with a 503.
