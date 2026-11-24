@@ -476,6 +476,10 @@ pub fn liquidate(
     }
     let paid = payout(x, p, pr);
     let after = repay_shares(debt_shares, x as u64, borrow_price)?;
+    // The circuit refuses a repay worth less than one debt share.
+    if after.shares == debt_shares {
+        return Err(NothingToLiquidate);
+    }
     Ok(Liquidation {
         repay: x as u64,
         buffer: (x * p / B) as u64,
