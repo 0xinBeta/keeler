@@ -444,6 +444,26 @@ describe("keeper-built operations: redeem and draw", () => {
     expect(W.store.get("index", TUSD)?.supply?.index).toBe(INDEX);
   });
 
+  it("withdraws everything by shares: pays their worth at the keeper's index and leaves a zero-share receipt", async () => {
+    const r = await withReceipt();
+    // 227.272727 shares at 1.1 are worth floor(249.9999997) = 249.999999 tUSD.
+    W.keeper.build = () => keeperBuild(W, "redeem", r, redeemNotes(r, 249_999999n, 0n));
+    const op = await W.lend.redeem(TUSD, "all", () => {});
+    expect(op).toMatchObject({ status: "landed", amounts: [{ amount: 249_999999n }] });
+    expect(W.log.requests.at(-1)?.body).toMatchObject({ op: "redeem", pool: TUSD, shares: "227272727" });
+    expect(W.log.requests.at(-1)?.body).not.toHaveProperty("amount");
+    expect(W.store.all("receipt")[0]?.shares).toBe(0n);
+  });
+
+  it("refuses a redeem of everything that pays less than the shares' worth or leaves shares behind", async () => {
+    const r = await withReceipt();
+    for (const notes of [redeemNotes(r, 249_999998n, 0n), redeemNotes(r, 249_999999n, 1n)]) {
+      W.keeper.build = () => keeperBuild(W, "redeem", r, notes);
+      expect((await refusal(W.lend.redeem(TUSD, "all", () => {}))).message).toMatch(/does not match your request/);
+    }
+    expect(W.log.signed).toHaveLength(1); // only the supply that opened the session
+  });
+
   it("refuses a redeem paying less, paying someone else, or burning more shares, without asking the wallet", async () => {
     const r = await withReceipt();
     const cases = [

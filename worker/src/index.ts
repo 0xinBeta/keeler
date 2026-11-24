@@ -731,8 +731,10 @@ const TICKET_REQUEST: Spec = {
 const TICKET_REPLY: Spec = { id: [hex(32), true], expiry: [uint, true], signature: [hex(128), true] };
 const BUILD_REQUEST: Spec = {
   ...SIGNED, op: [oneOf("redeem", "draw"), true], pool: [address, false], vault: [vaultId, false], position: [amount, false],
-  amount: [amount, false], borrow: [amount, false], withdraw: [amount, false],
+  amount: [amount, false], shares: [amount, false], borrow: [amount, false], withdraw: [amount, false],
 };
+/** A redeem names exactly one of `amount` and `shares`; only a redeem takes `shares`. */
+const buildFits = (b: Record<string, unknown>) => (b.op === "redeem" ? (b.amount === undefined) !== (b.shares === undefined) : b.shares === undefined);
 // A v1 transaction is at most 4,096 bytes: 5,464 base64 characters.
 const BUILD_REPLY: Spec = { transaction: [base64(5464), true], outputs: [list(hex(64), 1, 8), true], now: [uint, true], bound: [amount, false], index: [amount, false] };
 const ACCOUNT_REPLY: Spec = {
@@ -777,7 +779,7 @@ async function lend(request: Request, env: Env, url: URL, path: string): Promise
   let query = "";
   if (route.method === "POST") {
     const clean = shaped(await smallJson(request, LEND_BODY_CAP), route.request);
-    if (clean === null) throw new Fail(400, `The request body does not have the fields ${route.keeper} takes.`);
+    if (clean === null || (route.request === BUILD_REQUEST && !buildFits(clean))) throw new Fail(400, `The request body does not have the fields ${route.keeper} takes.`);
     body = JSON.stringify(clean);
   } else {
     const params = [...url.searchParams];
