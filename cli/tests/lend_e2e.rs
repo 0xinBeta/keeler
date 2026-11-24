@@ -97,8 +97,13 @@ impl Ledger for Probe<'_> {
     fn spender(&self, n: &[u8; 32]) -> Result<Option<Vec<([u8; 32], u64)>>> {
         self.inner.spender(n)
     }
-    fn intents(&self, w: &Address) -> Result<Vec<Intent>> {
-        self.inner.intents(w)
+    fn intents(
+        &self,
+        w: &Address,
+        after: Option<&str>,
+        pages: usize,
+    ) -> Result<(Vec<Intent>, Option<String>)> {
+        self.inner.intents(w, after, pages)
     }
     fn quote(&self, v: u64) -> Result<Quote> {
         self.inner.quote(v)
@@ -117,8 +122,8 @@ impl Ledger for Probe<'_> {
         }
         self.inner.send(tx)
     }
-    fn history(&self) -> Result<Vec<Note>> {
-        self.inner.history()
+    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+        self.inner.history(after)
     }
 }
 

@@ -34,6 +34,13 @@ struct World {
     state: Option<PathBuf>,
     /// Test prices posted: (vault, price, confidence).
     posted: Vec<(u64, u64, u64)>,
+    /// Builds of these ops fail (no proof, no funds).
+    fail: Vec<Op>,
+    /// Sends are refused for good.
+    reject: bool,
+    /// The `after` of each history and intents read.
+    history_after: Vec<Option<String>>,
+    intents_after: Vec<Option<String>>,
 }
 
 #[derive(Default)]
@@ -185,8 +192,16 @@ impl Ledger for Fake {
     fn spender(&self, nullifier: &[u8; 32]) -> Result<Option<Vec<([u8; 32], u64)>>> {
         Ok(self.w().spenders.get(nullifier).cloned())
     }
-    fn intents(&self, wallet: &Address) -> Result<Vec<Intent>> {
-        Ok(self.w().intents.get(wallet).cloned().unwrap_or_default())
+    fn intents(
+        &self,
+        wallet: &Address,
+        after: Option<&str>,
+        _: usize,
+    ) -> Result<(Vec<Intent>, Option<String>)> {
+        let mut w = self.w();
+        w.intents_after.push(after.map(str::to_owned));
+        let all = w.intents.get(wallet).cloned().unwrap_or_default();
+        Ok((all, Some("cursor".into())))
     }
     fn quote(&self, _: u64) -> Result<Quote> {
         self.w().quote.ok_or_else(|| anyhow!("no price"))
@@ -203,6 +218,9 @@ impl Ledger for Fake {
     }
     fn build(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built> {
         let mut w = self.w();
+        if w.fail.contains(&job.op()) {
+            bail!("the fake refuses to build a {:?}", job.op());
+        }
         w.next += 1;
         let n = w.next * 100;
         let r = || reserve.cloned().context("no reserve");
@@ -355,6 +373,9 @@ impl Ledger for Fake {
             w.sent.push(p.op);
             (p, w.hold, w.state.clone())
         };
+        if self.w().reject {
+            return Err(anyhow::Error::new(Rejected("preflight".into())));
+        }
         if let Some(path) = state {
             let book: Book = serde_json::from_slice(&std::fs::read(path)?)?;
             assert!(
@@ -369,8 +390,10 @@ impl Ledger for Fake {
         }
         Ok("sig".into())
     }
-    fn history(&self) -> Result<Vec<Note>> {
-        Ok(self.w().history.clone())
+    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+        let mut w = self.w();
+        w.history_after.push(after.map(str::to_owned));
+        Ok((w.history.clone(), Some("mark".into())))
     }
 }
 
@@ -631,7 +654,7 @@ fn with_liquidity(s: &Setup, k: &Keeper<Fake>) -> User {
 fn tickets_are_signed_saved_and_limited() {
     let s = Setup::new(
         "tickets",
-        r#","limits":{"tickets_per_wallet_hour":3,"max_open_intents":5}"#,
+        r#","limits":{"tickets_per_wallet_hour":3,"open_per_wallet":2}"#,
     );
     let k = s.keeper();
     let u = s.user();
@@ -661,20 +684,18 @@ fn tickets_are_signed_saved_and_limited() {
     assert!(lend_auth::ticket_signed_by(&s.signer.pubkey(), &m, &sig));
     let saved = load_book(&s.state, &s.signer.pubkey(), &keeler_lend::ID).unwrap();
     assert_eq!(saved.tickets.len(), 1);
-    // Per-wallet hourly limit: the 422 above did not count, so 2 more.
+    // Two open at a time per wallet, three an hour; the 422 above did not
+    // count.
     assert_eq!(supply_ticket(&k, &u, 2 * USD).0, 200);
+    let (st, v) = supply_ticket(&k, &u, 2 * USD);
+    assert_eq!(st, 429, "open per wallet: {v}");
+    s.fake.advance(601);
     assert_eq!(supply_ticket(&k, &u, 2 * USD).0, 200);
-    assert_eq!(supply_ticket(&k, &u, 2 * USD).0, 429);
+    let (st, v) = supply_ticket(&k, &u, 2 * USD);
+    assert_eq!(st, 429, "per hour: {v}");
     s.fake.advance(HOUR);
-    // Those three expired, so the open cap counts only new ones.
-    for _ in 0..3 {
-        assert_eq!(supply_ticket(&k, &u, 2 * USD).0, 200);
-    }
+    assert_eq!(supply_ticket(&k, &u, 2 * USD).0, 200);
     let other = s.user();
-    assert_eq!(supply_ticket(&k, &other, 2 * USD).0, 200);
-    assert_eq!(supply_ticket(&k, &other, 2 * USD).0, 200);
-    let (st, v) = supply_ticket(&k, &other, 2 * USD);
-    assert_eq!(st, 429, "max open: {v}");
     // Unknown pool, vault and purpose.
     let bad = ticket(
         &k,
@@ -1118,7 +1139,7 @@ fn records_come_before_sends_and_a_failed_save_sends_nothing() {
     // The state file cannot be written: the build is not sent.
     std::fs::create_dir_all(s.state.with_extension("tmp")).unwrap();
     let sent = s.fake.w().sent.len();
-    let intent = s.fake.intents(&u.addr()).unwrap().remove(0);
+    let intent = s.fake.intents(&u.addr(), None, 1).unwrap().0.remove(0);
     assert!(k.execute(Job::Supply { intent }, None).is_err());
     assert_eq!(s.fake.w().sent.len(), sent, "nothing is sent unrecorded");
     assert!(k.snapshot().unwrap().pending.is_empty());
@@ -1295,6 +1316,12 @@ fn config_limits_are_checked() {
     assert!(require_test_network(&main).is_err());
     assert!(require_test_network(&lend_cfg(r#","price":"pyth""#)).is_err());
     assert!(lend_cfg(r#","price_refresh_secs":90"#).check().is_err());
+    assert!(lend_cfg(r#","poll_secs":0"#).check().is_err());
+    let mut label = lend_cfg("");
+    label.network = "Mainnet".into();
+    assert!(label.check().is_err(), "not a plain lowercase name");
+    label.network = "mainnet-beta".into();
+    assert!(label.check().is_err(), "the test price on mainnet-beta");
 }
 
 #[test]
@@ -1339,4 +1366,319 @@ fn the_price_is_never_posted_with_pyth() {
     s.fake.advance(600);
     assert!(!k.refresh_price().unwrap());
     assert!(s.fake.w().posted.is_empty());
+}
+
+/// A drew `borrow` against `collateral` in position 1, landed and settled.
+fn borrower(s: &Setup, k: &Keeper<Fake>, collateral: u64, borrow: u64) -> User {
+    let a = s.user();
+    fund_intent(s, k, &a, purpose::DEPOSIT, 1, collateral);
+    assert_eq!(drain(k), vec![Op::DepositOpen]);
+    let (st, v) = draw(k, &a, 1, borrow);
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    a
+}
+
+fn ticket_of<'b>(book: &'b Book, id: &str) -> &'b Ticket {
+    book.tickets.iter().find(|t| t.id == id).unwrap()
+}
+
+#[test]
+fn a_failing_liquidation_waits_and_the_queue_goes_on() {
+    let s = Setup::new("liq-fail", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let _a = borrower(&s, &k, SOL, 7 * USD);
+    let b = s.user();
+    fund_intent(&s, &k, &b, purpose::DEPOSIT, 2, SOL);
+    drain(&k);
+    // a goes under, and its liquidation cannot be built (no funds, say).
+    s.fake.w().fail.push(Op::Liquidate);
+    s.fake.w().quote = Some(Quote {
+        low: 8 * DOLLAR,
+        high: 8 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    fund_intent(&s, &k, &b, purpose::DEPOSIT, 2, SOL / 10);
+    assert_eq!(
+        drain(&k),
+        vec![Op::DepositAdd],
+        "the deposit is not held up"
+    );
+    assert_eq!(
+        s.fake
+            .w()
+            .builds
+            .iter()
+            .filter(|o| **o == Op::Liquidate)
+            .count(),
+        0,
+        "refused builds are not counted as built"
+    );
+    // Nor are owner builds.
+    let (st, v) = redeem(&k, &lender, USD);
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    // After the backoff it is tried again, and goes.
+    s.fake.w().fail.clear();
+    assert!(drain(&k).is_empty(), "still waiting");
+    s.fake.advance(LIQUIDATION_BACKOFF);
+    s.fake.w().quote.as_mut().unwrap().published = now_of(&k) as i64;
+    assert_eq!(drain(&k), vec![Op::Liquidate]);
+}
+
+#[test]
+fn liquidations_need_a_younger_price_than_the_program() {
+    let s = Setup::new("liq-age", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    s.fake.w().quote = Some(Quote {
+        low: 8 * DOLLAR,
+        high: 8 * DOLLAR + 1,
+        published: (now_of(&k) - PRICE_LIQUIDATE - 1) as i64,
+    });
+    assert!(drain(&k).is_empty(), "it would land after 90 s");
+    s.fake.w().quote.as_mut().unwrap().published += 1;
+    assert_eq!(drain(&k), vec![Op::Liquidate]);
+}
+
+#[test]
+fn a_rejected_send_is_dropped_at_once_and_retried_later() {
+    let s = Setup::new("reject", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    let u = s.user();
+    let id = fund_intent(&s, &k, &u, purpose::SUPPLY, 1, 3 * USD);
+    s.fake.w().reject = true;
+    assert_eq!(drain(&k), vec![Op::Supply], "sent once, then it backs off");
+    let book = k.snapshot().unwrap();
+    assert!(book.pending.is_empty(), "no wait for the window");
+    let t = ticket_of(&book, &id);
+    assert_eq!((t.attempts, t.status), (1, TicketStatus::Open));
+    s.fake.w().reject = false;
+    s.fake.advance(RETRY_SECS << 1);
+    assert_eq!(drain(&k), vec![Op::Supply]);
+    let book = k.snapshot().unwrap();
+    assert_eq!(ticket_of(&book, &id).status, TicketStatus::Filled);
+}
+
+#[test]
+fn failures_back_off_and_repays_are_never_given_up() {
+    let s = Setup::new("retry", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    let a = borrower(&s, &k, SOL, 5 * USD);
+    let lender = s.user();
+    let supply = fund_intent(&s, &k, &lender, purpose::SUPPLY, 1, 2 * USD);
+    let repay = fund_intent(&s, &k, &a, purpose::REPAY, 1, USD);
+    s.fake.w().fail = vec![Op::Supply, Op::Repay];
+    // A short outage gives nothing up.
+    for _ in 0..5 {
+        k.step().unwrap();
+        s.fake.advance(1);
+    }
+    let book = k.snapshot().unwrap();
+    assert_eq!(ticket_of(&book, &supply).attempts, 1, "backing off");
+    // A long one gives up the supply (its maker refunds), not the repay.
+    for _ in 0..8 {
+        k.step().unwrap();
+        s.fake.advance(30);
+    }
+    let book = k.snapshot().unwrap();
+    let (t, r) = (ticket_of(&book, &supply), ticket_of(&book, &repay));
+    assert_eq!((t.status, t.attempts), (TicketStatus::Failed, MAX_ATTEMPTS));
+    assert_eq!(r.status, TicketStatus::Open);
+    assert!(r.attempts >= MAX_ATTEMPTS);
+    s.fake.w().fail.clear();
+    s.fake.advance(RETRY_SECS << 5);
+    assert_eq!(drain(&k), vec![Op::Repay]);
+}
+
+#[test]
+fn a_build_whose_other_input_went_elsewhere_is_dropped() {
+    let s = Setup::new("taken", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    let p = k.snapshot().unwrap().pending[0].clone();
+    // The receipt is spent by another transaction; the reserve is not.
+    s.fake.w().spent.insert(hex32(&p.inputs[1]).unwrap());
+    k.resolve().unwrap();
+    let book = k.snapshot().unwrap();
+    assert!(book.pending.is_empty(), "it can never land");
+    assert!(book.receipts.is_empty());
+    assert!(book.reserve.is_some());
+}
+
+#[test]
+fn liquidity_is_checked_last_and_rounded() {
+    let s = Setup::new("liquidity", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let rich = s.user();
+    fund_intent(&s, &k, &rich, purpose::DEPOSIT, 1, 100 * SOL);
+    let poor = s.user();
+    fund_intent(&s, &k, &poor, purpose::DEPOSIT, 1, SOL);
+    drain(&k);
+    // Health, then liquidity: a small position learns nothing of the pool.
+    assert_eq!(draw(&k, &poor, 1, 200 * USD).0, 423);
+    assert_eq!(draw(&k, &rich, 1, 101 * USD).0, 410);
+    assert_eq!(draw(&k, &rich, 1, 96 * USD).0, 410, "the 95% cap");
+    assert_eq!(draw(&k, &poor, 1, 9_999).0, 422, "below the minimum borrow");
+    let (st, v) = draw(&k, &rich, 1, 94_990_000);
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    // 5.01 tUSD idle: 5.005 fits exactly, but is checked as 5.1.
+    assert_eq!(redeem(&k, &lender, 5_005_000).0, 410);
+    assert_eq!(
+        redeem(&k, &lender, 9_999).0,
+        422,
+        "below the minimum redeem"
+    );
+    assert_eq!(redeem(&k, &lender, 5 * USD).0, 200);
+}
+
+#[test]
+fn reservations_are_not_extended_and_a_lapse_cools_down() {
+    let s = Setup::new("lapse", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let a = s.user();
+    fund_intent(&s, &k, &a, purpose::DEPOSIT, 1, SOL);
+    drain(&k);
+    let t = now_of(&k);
+    assert_eq!(draw(&k, &a, 1, USD).0, 200);
+    s.fake.advance(10);
+    assert_eq!(draw(&k, &a, 1, USD).0, 200, "a may build again");
+    assert_eq!(k.snapshot().unwrap().reservation.unwrap().until, t + 20);
+    s.fake.advance(10);
+    assert_eq!(
+        draw(&k, &a, 1, USD).0,
+        409,
+        "lapsed unused: not again at once"
+    );
+    assert_eq!(redeem(&k, &lender, USD).0, 200, "others go");
+    s.fake.advance(21);
+    assert_eq!(draw(&k, &a, 1, USD).0, 200);
+}
+
+#[test]
+fn builds_per_wallet_are_limited() {
+    let s = Setup::new("builds", r#","limits":{"builds_per_wallet_hour":2}"#);
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    assert_eq!(redeem(&k, &lender, USD).0, 429);
+    // A wallet with nothing to spend never gets that far.
+    let b = s.user();
+    assert_eq!(redeem(&k, &b, USD).0, 404);
+    s.fake.advance(HOUR);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+}
+
+#[test]
+fn the_open_ticket_cap_counts_queued_intents_and_spares_repays() {
+    let s = Setup::new("cap", r#","limits":{"max_open_intents":2}"#);
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    let a = borrower(&s, &k, SOL, USD);
+    // Two queued supplies whose fills fail, so their tickets stay open.
+    s.fake.w().fail.push(Op::Supply);
+    let x = s.user();
+    let y = s.user();
+    let ids = [
+        fund_intent(&s, &k, &x, purpose::SUPPLY, 1, 2 * USD),
+        fund_intent(&s, &k, &y, purpose::SUPPLY, 1, 2 * USD),
+    ];
+    k.step().unwrap();
+    let book = k.snapshot().unwrap();
+    assert!(ids.iter().all(|id| ticket_of(&book, id).seen));
+    // Tickets without an intent do not count, but the queue is full now.
+    let z = s.user();
+    assert_eq!(supply_ticket(&k, &z, 2 * USD).0, 429);
+    assert_eq!(deposit_ticket(&k, &z, 1, SOL).0, 429, "a new position");
+    // A repay or a top-up of a position never waits for others.
+    assert_eq!(repay_ticket(&k, &a, 1, USD).0, 200);
+    assert_eq!(deposit_ticket(&k, &a, 1, SOL / 10).0, 200);
+}
+
+#[test]
+fn tickets_issued_ahead_count_toward_the_listed_eight() {
+    let s = Setup::new("ahead", r#","limits":{"open_per_wallet":20}"#);
+    let k = s.keeper();
+    let u = s.user();
+    for i in 0..8 {
+        assert_eq!(deposit_ticket(&k, &u, i, SOL).0, 200);
+    }
+    assert_eq!(deposit_ticket(&k, &u, 9, SOL).0, 429);
+}
+
+#[test]
+fn racing_ticket_requests_cannot_pass_a_cap_together() {
+    let s = Setup::new("racing", r#","limits":{"open_per_wallet":3}"#);
+    let k = s.keeper();
+    let u = s.user();
+    let ok = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..8)
+            .map(|_| sc.spawn(|| supply_ticket(&k, &u, 2 * USD).0))
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|st| *st == 200)
+            .count()
+    });
+    assert_eq!(ok, 3);
+}
+
+#[test]
+fn one_keeper_per_state_file() {
+    let s = Setup::new("lock", "");
+    let k = s.keeper();
+    assert!(Keeper::open(&s.cfg, &s.fake, &s.signer, s.state.clone()).is_err());
+    drop(k);
+    s.keeper();
+}
+
+#[test]
+fn history_and_intent_scans_go_on_from_their_marks() {
+    let s = Setup::new("marks", "");
+    let k = s.keeper();
+    assert_eq!(k.snapshot().unwrap().scanned.as_deref(), Some("mark"));
+    drop(k);
+    let k = s.keeper();
+    assert_eq!(s.fake.w().history_after, vec![None, Some("mark".into())]);
+    let u = s.user();
+    supply_ticket(&k, &u, 2 * USD);
+    k.step().unwrap();
+    k.step().unwrap();
+    assert_eq!(s.fake.w().intents_after, vec![None, Some("cursor".into())]);
+}
+
+#[test]
+fn the_slot_answers_503_until_the_keeper_is_up() {
+    let s = Setup::new("slot", "");
+    let cell = OnceLock::new();
+    let slot = Slot(&cell);
+    assert_eq!(slot.lend("GET", "/lend/pools", b"").0, 503);
+    assert!(cell.set(s.keeper()).is_ok());
+    assert_eq!(slot.lend("GET", "/lend/pools", b"").0, 200);
+}
+
+#[test]
+fn coarse_up_rounds_up_to_two_figures() {
+    assert_eq!(coarse_up(0), 0);
+    assert_eq!(coarse_up(99), 99);
+    assert_eq!(coarse_up(101), 110);
+    assert_eq!(coarse_up(9_901), 10_000);
+    assert_eq!(coarse_up(5_005_000), 5_100_000);
+    assert_eq!(coarse_up(5_000_000), 5_000_000);
+    assert_eq!(coarse_up(u64::MAX), u64::MAX);
 }
