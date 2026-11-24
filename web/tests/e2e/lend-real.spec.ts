@@ -245,6 +245,8 @@ test("recovery: with the browser's storage cleared, the receipt and the position
   }, SEED_KEY);
   await timed("recovery: reload to receipts and positions shown", async () => {
     await open();
+    // The page never asks the wallet on its own: the reader allows the session to fetch the keeper's view.
+    await page.getByRole("button", { name: "Check with the keeper" }).click({ timeout: 120_000 });
     await tab("Earn");
     await expect(p.locator(".mine-big")).toBeVisible({ timeout: 120_000 });
     await tab("Borrow");

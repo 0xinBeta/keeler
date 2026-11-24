@@ -25,7 +25,7 @@ type Props = {
   setTab: (t: Tab) => void;
   market: Market | null;
   account: LendAccount | null;
-  refreshLend: () => Promise<unknown>;
+  refreshLend: (prompt?: boolean) => Promise<unknown>;
 };
 
 export type Tab = "swap" | "earn" | "borrow" | "balances";

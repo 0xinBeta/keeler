@@ -466,6 +466,17 @@ describe("keeper-built operations: redeem and draw", () => {
     expect(W.store.get("index", TUSD)?.supply?.index).toBe(INDEX);
   });
 
+  it("sends nothing and saves nothing when the block height cannot be read", async () => {
+    const r = await withReceipt();
+    W.keeper.build = (b) => keeperBuild(W, "redeem", r, redeemNotes(r, BigInt(String(b.amount)), 227_272727n - 90_909091n));
+    W.deps.chain.blockHeight = async () => {
+      throw new Error("rpc down");
+    };
+    expect((await refusal(W.lend.redeem(TUSD, 100_000000n, () => {}))).code).toBe("network");
+    expect(W.log.sent).toHaveLength(1); // the supply that opened the session
+    expect(W.store.all("op").filter((o) => o.kind === "redeem")).toEqual([]);
+  });
+
   it("withdraws everything by shares: pays their worth at the keeper's index and leaves a zero-share receipt", async () => {
     const r = await withReceipt();
     // 227.272727 shares at 1.1 are worth floor(249.9999997) = 249.999999 tUSD.
@@ -623,13 +634,68 @@ describe("a keeper fill with the keeper gone", () => {
     expect(a.positions).toMatchObject([{ id: "42", collateral: 4_000000000n, debt: 0n }]);
   });
 
-  it("keeps nothing it cannot find on chain", async () => {
+  it("keeps a spent position it cannot replace until the keeper's view says what replaced it", async () => {
     await W.lend.supply(TUSD, 1_000000n, () => {});
     const p = await givePosition(W, 42n, 4_000000000n, 1_000000n);
     await W.lend.lendAccount();
     W.notes.set(hex(p.hash), { leafIndex: 9n, spentBy: "fill" });
     W.keeper.status = 502;
+    expect((await W.lend.lendAccount()).positions).toMatchObject([{ id: "42", collateral: 4_000000000n }]);
+    // The keeper is back and no longer lists it: it is gone (an empty successor).
+    W.keeper.status = 200;
+    W.keeper.account.positions = [];
     expect((await W.lend.lendAccount()).positions).toEqual([]);
+  });
+
+  it("drops a spent receipt only once the keeper's view was read", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const r = await giveReceipt(W, 5_000000n);
+    await W.lend.lendAccount();
+    W.notes.set(hex(r.hash), { leafIndex: 7n, spentBy: "elsewhere" });
+    W.keeper.status = 502;
+    expect((await W.lend.lendAccount()).receipts).toHaveLength(1);
+    W.keeper.status = 200;
+    W.keeper.account.receipts = [];
+    expect((await W.lend.lendAccount()).receipts).toEqual([]);
+  });
+});
+
+describe("sessions, prompts, and one opening per vault", () => {
+  it("never asks the wallet on a read with prompt false, and says the keeper's view is due", async () => {
+    const p = await givePosition(W, 42n, 4_000000000n, 1_000000n);
+    W.store.put("position", hex(p.hash), { vault: 1, id: "42", collateral: 4_000000000n, debtShares: 1_000000n, note: { hash: p.hash, blinding: p.blinding, amount: 4_000000000n, state: p.state } as never, lastLiquidation: null });
+    W.notes.set(hex(p.hash), { leafIndex: 9n, spentBy: "fill" });
+    const a = await W.lend.lendAccount({ prompt: false });
+    expect(W.log.signMessage).toBe(0);
+    expect(a.needsSession).toBe(true);
+    expect((await W.lend.lendAccount()).needsSession).toBeUndefined();
+    expect(W.log.signMessage).toBe(1);
+  });
+
+  it("starts a new session after a wallet switch", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    W.deps.wallet = () => "Other1111111111111111111111111111111111111" as never;
+    await W.lend.lendAccount({ prompt: false });
+    W.deps.wallet = () => W.USER;
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    expect(W.log.signMessage).toBe(2);
+  });
+
+  it("tries a failed rescan again on the next read", async () => {
+    let scans = 0;
+    W.deps.chain.scanIntents = async () => {
+      if (++scans === 1) throw new Error("rpc down");
+      return [];
+    };
+    await W.lend.lendAccount();
+    await W.lend.lendAccount();
+    await W.lend.lendAccount();
+    expect(scans).toBe(2);
+  });
+
+  it("refuses a second opening deposit to a vault while the first waits", async () => {
+    await W.lend.deposit(1, null, 1_000000000n, () => {});
+    expect((await refusal(createLend(W.deps).deposit(1, null, 1_000000000n, () => {}))).code).toBe("busy");
   });
 });
 

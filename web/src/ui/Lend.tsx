@@ -15,7 +15,8 @@ export type LendProps = {
   market: Market | null;
   account: LendAccount | null;
   chainOffset: number | null;
-  refreshLend: () => Promise<unknown>;
+  /** `prompt`: the wallet may ask to allow the lending session (only on the reader's click). */
+  refreshLend: (prompt?: boolean) => Promise<unknown>;
   refreshBalances: () => Promise<unknown>;
 };
 
@@ -146,7 +147,7 @@ function Progress({ p, op, onDone }: { p: LendProps; op: ReturnType<typeof useOp
   else if (status === "refunded") line = "Done. The funds are back in your private balance.";
   else if (status === "refundable") line = "The keeper did not take it in before the request expired. The funds are still yours: take them back.";
   else if (status === "failed") line = live?.error ?? "It failed.";
-  else line = step ? `${STEP_LABEL[step]}…` : "Starting…";
+  else line = step ? `${STEP_LABEL[step]}…` : "Starting… Your wallet may ask once to allow this lending session.";
 
   const refund = async () => {
     setBusy(true);
@@ -798,6 +799,25 @@ export function LendActivity(p: LendProps) {
       <div className="section-head">
         <h2 id="lending-title">Your lending</h2>
       </div>
+      {p.account?.needsSession && (
+        <p className="note">
+          The keeper may have news for your lending (a fill, or a change made in another browser).{" "}
+          <button
+            className="btn btn-ghost"
+            disabled={busy === "session"}
+            onClick={() => {
+              setBusy("session");
+              setError(null);
+              p.refreshLend(true)
+                .catch((e) => setError(errorText(e)))
+                .finally(() => setBusy(null));
+            }}
+          >
+            Check with the keeper
+          </button>{" "}
+          Your wallet asks once to allow this lending session.
+        </p>
+      )}
       {ops.length === 0 && liquidations.length === 0 ? (
         <p className="muted">Nothing yet. Deposit to Earn or open a position from Earn and Borrow above.</p>
       ) : (
