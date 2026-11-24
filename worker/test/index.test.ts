@@ -513,6 +513,7 @@ describe("/api/lend/*", () => {
   const query = (o: Record<string, unknown>) => "?" + new URLSearchParams(Object.entries(o).map(([k, v]) => [k, String(v)]));
   const TICKET = { ...SIGNED, purpose: "supply", pool: MINT_B, amount: "5000000" };
   const BUILD = { ...SIGNED, op: "draw", vault: 0, position: "7", borrow: "1000000", withdraw: "0" };
+  const REDEEM = { ...SIGNED, op: "redeem", pool: MINT_B, shares: "5000000" };
   const TX = "A".repeat(5464); // 4,096 bytes
   const OUT = "cd".repeat(32);
   const POOLS_REPLY = { pools: [{ mint: MINT_B, at: 1_800_000_000, size: "1000000000", utilisationBps: 5000, supplyRateBps: 120, borrowRateBps: 280 }] };
@@ -584,6 +585,11 @@ describe("/api/lend/*", () => {
     expect(JSON.parse(calls[2]!.init.body as string)).toEqual(TICKET);
     expect(JSON.parse(calls[3]!.init.body as string)).toEqual(BUILD);
     expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([10000, 10000, 10000, 30000]);
+    // A redeem of everything names its shares, and a partial one its amount.
+    for (const body of [REDEEM, { ...SIGNED, op: "redeem", pool: MINT_B, amount: "1000000" }]) {
+      expect((await call(post("/api/lend/build", body), lendEnv())).res.status).toBe(200);
+      expect(JSON.parse(calls.at(-1)!.init.body as string)).toEqual(body);
+    }
   });
 
   it("refuses requests of the wrong shape without asking the keeper", async () => {
@@ -612,6 +618,10 @@ describe("/api/lend/*", () => {
       post("/api/lend/ticket", "[]"),
       post("/api/lend/build", { ...BUILD, op: "liquidate" }),
       post("/api/lend/build", { ...BUILD, vault: 70000 }),
+      post("/api/lend/build", { ...REDEEM, amount: "1000000", shares: "5000000" }),
+      post("/api/lend/build", { ...SIGNED, op: "redeem", pool: MINT_B }),
+      post("/api/lend/build", { ...REDEEM, shares: "5" + "0".repeat(20) }),
+      post("/api/lend/build", { ...BUILD, shares: "5000000" }),
       post("/api/lend/build", { ...BUILD, pad: "x".repeat(5 * 1024) }), // over the old 4 KiB cap: refused for shape, not size
     ];
     for (const r of bad) expect((await call(r, e)).res.status, r.url).toBe(400);

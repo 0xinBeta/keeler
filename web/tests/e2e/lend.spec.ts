@@ -86,6 +86,15 @@ test("earn: deposit, interest accrues, withdraw", async ({ page }, info) => {
   await p.getByRole("button", { name: "Done", exact: true }).click();
   await expect.poll(async () => units(await value.innerText(), 6)).toBeLessThan(401_000_000n);
   await expect(activity(page).locator("li.order-settled")).toHaveCount(2);
+
+  // Withdraw all: by shares, so nothing is left in the deposit.
+  await p.getByRole("group", { name: "Earn action" }).getByRole("button", { name: "Withdraw" }).click();
+  await p.getByRole("button", { name: "Withdraw all" }).click();
+  await p.getByRole("button", { name: "Withdraw", exact: true }).last().click();
+  await expect(p.getByText("Done. The withdrawal is in your private balance.")).toBeVisible({ timeout: 15_000 });
+  await p.getByRole("button", { name: "Done", exact: true }).click();
+  await expect(activity(page).locator("li.order-settled")).toHaveCount(3);
+  await expect(p.locator(".mine-big")).toHaveCount(0);
   expect(problems).toEqual([]);
 });
 

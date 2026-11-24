@@ -596,27 +596,33 @@ export function createLend(d: LendDeps): KeelerLend {
       exclusive("lend", async () => {
         const receipt = mustHave(d.store().all("receipt").find((r) => r.pool === pool), "a deposit in this pool");
         const mint = mintBytes(pool);
+        const all = amount === "all";
+        // Withdrawing everything names the shares, so none are left behind; the payout is known once the keeper states its index.
+        const place = { pool, vault: null, positionId: null, amounts: [{ asset: asset(pool), amount: all ? 0n : amount }] };
         let left = 0n;
         return keeperBuilt(
           "redeem",
-          { pool, amount: amount.toString() },
+          all ? { pool, shares: receipt.shares.toString() } : { pool, amount: amount.toString() },
           receipt.note,
           (reply, owners) => {
             if (reply.index === undefined || reply.index < PRICE_SCALE) throw err("network", "The keeper did not state a usable share price. Nothing was sent.");
-            const burned = sharesToBurn(amount, reply.index);
+            const burned = all ? receipt.shares : sharesToBurn(amount, reply.index);
             if (burned > receipt.shares) throw err("insufficient-note", "That is more than your deposit is worth. Enter a smaller amount.");
+            const paid = all ? assetsOf(burned, reply.index) : amount;
+            if (paid === 0n) throw err("below-minimum", "Your deposit is worth nothing to withdraw yet. Nothing was sent.");
+            place.amounts[0]!.amount = paid;
             left = receipt.shares - burned;
             remember(pool, "supply", reply.index, reply.now);
             const state = withLastU64(receipt.note.state, left);
             return {
               notes: [
-                { slot: SLOT.redeem.payout, owner: owners.user, mint, amount, kind: NOTE_KIND.token, state: new Uint8Array() },
+                { slot: SLOT.redeem.payout, owner: owners.user, mint, amount: paid, kind: NOTE_KIND.token, state: new Uint8Array() },
                 { slot: SLOT.redeem.receipt, owner: owners.pda, mint, amount: 0n, kind: NOTE_KIND.receipt, state },
               ],
               creates: (b, outputs) => ({ receipt: { pool, shares: left, note: { hash: outputs[SLOT.redeem.receipt]!, mint: pool, amount: 0n, blinding: b.get(SLOT.redeem.receipt)!, state, kind: NOTE_KIND.receipt } } }),
             };
           },
-          { pool, vault: null, positionId: null, amounts: [{ asset: asset(pool), amount }] },
+          place,
           on,
         );
       }),
