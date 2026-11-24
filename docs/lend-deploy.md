@@ -21,14 +21,25 @@ nothing.
    deploy those bytes; `program-id` records what they were built for. It refuses if the build
    changes a tracked file. The circuits and verifying keys do not depend on these parameters: the
    build checks them against `lend/lend-keys.CHECKSUM`, so the browser package is the local one.
-3. `deploy estimate` (with `--estimate`, then stops) or `deploy program`: checks devnet's genesis
+   `build-params.json` records the program ID, admin, keeper and mints; a rerun refuses if they
+   have changed since (another Keychain item or swap deploy), and `scripts/run-dealer.sh` builds
+   the keeper from this file, not from the Keychain.
+3. Copies the proving keys from `lend/target/zk/keeler-lend` to `target/devnet-<name>/keys/`
+   once, checked against `lend/lend-keys.CHECKSUM` (and checked again on every rerun). The keeper
+   reads these (`KEELER_LEND_KEYS_DIR`), so a later `scripts/setup-lend.sh` cannot change them
+   under it.
+4. `deploy estimate` (with `--estimate`, then stops) or `deploy program`: checks devnet's genesis
    hash, prints the rent, fees and peak, and sends nothing if the deploy wallet holds less than the
    deploy still needs. The deploy goes through a buffer and resumes after any failure; a finished one
    sends nothing. `summary.json` gets the program ID and upgrade authority.
 
 Everything it writes is under `target/devnet-<name>/`. The tool builds in its own cargo target
 there, so the live dealer's `target/release` is not touched. `build/` and `cargo/` can be deleted
-after a deploy; `keeler_lend.so` and `program-id` must stay for reruns.
+after a deploy; `keeler_lend.so`, `program-id`, `build-params.json` and `keys/` must stay, for
+reruns and the dealer. A deployment made before `build-params.json` and `keys/` existed gets both
+from a rerun with `--estimate` (which sends nothing). A buffer left from a deploy of other bytes
+cannot be resumed: the tool refuses and names it, and the way on is another deployment name (a
+fresh buffer key); its rent stays locked until it is closed by hand.
 
 ## Cost
 

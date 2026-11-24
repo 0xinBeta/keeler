@@ -184,14 +184,14 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | 401 | `network` | Session or signature refused (the page retries once with a new session) |
 | 403 | `paused` | Lending paused at the keeper (new supply, new positions, borrowing) |
 | 404 | `storage` | No such position or receipt |
-| 409 | `busy` | The reserve is in use; try again shortly |
-| 410 | `no-liquidity` | Not enough in the pool |
+| 409 | `busy` | The reserve is in use, or this wallet let its reservation lapse unused within `reservation_secs`; try again shortly |
+| 410 | `no-liquidity` | Not enough in the pool (checked last, at the amount rounded up to two significant figures) |
 | 412 | `price-stale` | The oracle price is too old |
 | 422 | `below-minimum` | Under a minimum |
 | 423 | `unhealthy` | The position would be unhealthy |
-| 429 | `rate-limited` | Too many requests |
+| 429 | `rate-limited` | Too many requests: tickets or builds per wallet per hour, open tickets per wallet, open intents in all, or the 8 receipts or positions a wallet may hold (open tickets count) |
 | 502, 504 | `keeper-offline` | The keeper did not answer (Worker) |
-| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured (Worker) |
+| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured (Worker); the keeper still starting or failing to start inside the dealer; a build that took over 25 s |
 | other | `network` | |
 
 ## Layouts the page checks
