@@ -22,3 +22,5 @@ mod deposit;
 mod draw;
 mod liquidate;
 mod repay;
+pub mod vault;
+pub use {close::*, deposit::*, draw::*, liquidate::*, repay::*};

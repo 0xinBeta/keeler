@@ -130,25 +130,10 @@ fn dispatch_refuses_empty_and_unknown_tags() {
     for (bytes, err) in [
         (vec![], LendError::InvalidInstructionData),
         (vec![0], LendError::UnknownInstruction),
-        (vec![11], LendError::UnknownInstruction),
+        (vec![13], LendError::UnknownInstruction),
     ] {
         let ix = Instruction::new_with_bytes(id, &bytes, vec![AccountMeta::new(user, true)]);
         expect_err_exact(&mollusk, &ix, &accounts, code(err));
-    }
-}
-
-#[test]
-fn unbuilt_instructions_refuse_with_their_own_code() {
-    let (mollusk, id) = setup();
-    for (ix, err) in [
-        (tag::DEPOSIT, LendError::DepositNotBuilt),
-        (tag::DRAW, LendError::DrawNotBuilt),
-        (tag::REPAY, LendError::RepayNotBuilt),
-        (tag::LIQUIDATE, LendError::LiquidateNotBuilt),
-        (tag::CLOSE, LendError::CloseNotBuilt),
-    ] {
-        let ix = Instruction::new_with_bytes(id, &[ix], vec![]);
-        expect_err_exact(&mollusk, &ix, &[], code(err));
     }
 }
 

@@ -5,9 +5,10 @@ pub mod intent;
 // Earn:
 pub mod redeem;
 pub mod supply;
-// Vault (deposit may become deposit_open and deposit_add, see SPIKE.md item 3):
-// pub mod close;
-// pub mod deposit;
-// pub mod draw;
-// pub mod liquidate;
-// pub mod repay;
+// Vault:
+pub mod close;
+pub mod deposit_add;
+pub mod deposit_open;
+pub mod draw;
+pub mod liquidate;
+pub mod repay;

@@ -6,7 +6,7 @@
 //! | 20000-20099 | shared checks (`instructions/mod.rs`) |
 //! | 20100 | init_reserve | 20200 intent | 20300 cancel_intent |
 //! | 20400 | supply | 20500 redeem (Earn) |
-//! | 20600 | deposit | 20700 draw | 20800 repay | 20900 liquidate | 21000 close (Vault) |
+//! | 20600 | deposit | 20700 draw | 20800 repay | 20900 liquidate | 21000 close (Vault: `vaults::VaultError`) |
 //!
 //! The shielded pool's own errors (for example 7043, a nullifier or reserve
 //! address already used) pass through the CPI unchanged.
@@ -39,13 +39,6 @@ pub enum LendError {
     // supply.
     /// The clock is past the intent's expiry: only `cancel_intent` takes it.
     IntentExpired = 20_400,
-
-    // Stubs: each later instruction answers this until it is built.
-    DepositNotBuilt = 20_600,
-    DrawNotBuilt = 20_700,
-    RepayNotBuilt = 20_800,
-    LiquidateNotBuilt = 20_900,
-    CloseNotBuilt = 21_000,
 }
 
 impl From<LendError> for ProgramError {

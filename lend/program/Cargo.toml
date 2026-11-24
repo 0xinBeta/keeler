@@ -11,8 +11,14 @@ crate-type = ["cdylib", "lib"]
 [features]
 # The committed verifying keys come from `zolana zk compile --test` (a fixed
 # public seed): for local networks and devnet only, never mainnet.
-default = ["insecure-test-setup"]
+default = ["insecure-test-setup", "test-price"]
 insecure-test-setup = []
+# A keeper-set price account per vault, accepted in place of Pyth. Local
+# networks and devnet only: `vaults.rs` refuses it without
+# insecure-test-setup or with `mainnet`.
+test-price = []
+# Marks a mainnet build; it cannot have test-price.
+mainnet = []
 bpf-entrypoint = []
 # The circuits and their native execution, plus the client helpers.
 circuits = ["dep:xark", "spr-program/client", "dep:spr-transaction", "dep:spr-keypair"]

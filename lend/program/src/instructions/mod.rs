@@ -29,6 +29,7 @@ pub mod deposit;
 pub mod draw;
 pub mod liquidate;
 pub mod repay;
+pub mod vault;
 
 pub fn process_instruction(
     program_id: &Address,
@@ -52,6 +53,8 @@ pub fn process_instruction(
         tag::REPAY => repay::process(accounts, data),
         tag::LIQUIDATE => liquidate::process(accounts, data),
         tag::CLOSE => close::process(accounts, data),
+        tag::DEPOSIT_ADD => deposit::process_add(accounts, data),
+        tag::SET_TEST_PRICE => vault::set_test_price(accounts, data),
         _ => Err(LendError::UnknownInstruction.into()),
     }
 }

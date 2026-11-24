@@ -21,5 +21,5 @@ trap stop_prover EXIT
 mkdir -p "$lend/target/proving-keys"
 cd "$lend"
 tests=()
-for t in ${LEND_CHAIN_TESTS:-chain earn_chain}; do tests+=(--test "$t"); done
+for t in ${LEND_CHAIN_TESTS:-chain earn_chain vault_chain}; do tests+=(--test "$t"); done
 cargo test --release -p keeler-lend-sdk "${tests[@]}" -- --ignored --nocapture "$@"

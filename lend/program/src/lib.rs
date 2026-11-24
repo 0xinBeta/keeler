@@ -18,6 +18,7 @@ mod wasm;
 pub mod error;
 #[cfg(all(not(feature = "build-circuits"), not(xark)))]
 pub mod instructions;
+pub mod vaults;
 #[cfg(all(not(feature = "build-circuits"), not(xark)))]
 #[rustfmt::skip] // The generator's exact output.
 #[allow(clippy::useless_conversion)]
@@ -35,6 +36,11 @@ pub mod tag {
     pub const REPAY: u8 = 8;
     pub const LIQUIDATE: u8 = 9;
     pub const CLOSE: u8 = 10;
+    /// `deposit` into an existing position (`DEPOSIT` opens one).
+    pub const DEPOSIT_ADD: u8 = 11;
+    /// Local networks and devnet (`test-price`): the keeper sets a vault's
+    /// test price account.
+    pub const SET_TEST_PRICE: u8 = 12;
 }
 
 /// The pool PDA `[POOL_SEED, mint]`: owns the mint's reserve.
