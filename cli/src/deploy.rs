@@ -10,6 +10,10 @@
 //!    interface;
 //! 4. register the dealer and bring its private balance of each mint up to
 //!    the inventory: mint the shortfall to its token account, deposit it.
+//!
+//! [`deploy_one`] does step 2 alone for a [`ProgramPlan`] (one named
+//! program, nothing else), after checking the wallet holds what the deploy
+//! still needs ([`estimate`]).
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -49,6 +53,8 @@ const CHUNK: usize = 900;
 /// Top a balance up only once it falls below this share of its target, so
 /// fees spent since the last run do not cause a transfer on every rerun.
 const TOP_UP_BELOW_PCT: u64 = 90;
+/// The base fee; the tool sets no priority fee.
+const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 
 /// What one setup does. Keys are key sources; on devnet, Keychain items.
 #[derive(Deserialize)]
@@ -75,6 +81,42 @@ pub struct PlanToken {
     pub key: KeySource,
     /// The dealer's private balance to reach, in base units.
     pub inventory: u64,
+}
+
+/// One program deployed on its own, with its own Keychain items.
+#[derive(Deserialize)]
+pub struct ProgramPlan {
+    /// For log lines and the summary, e.g. "lend".
+    pub name: String,
+    pub network: Network,
+    pub genesis_hash: String,
+    /// Pays and is the upgrade authority.
+    pub deploy_key: KeySource,
+    pub program_key: KeySource,
+    pub buffer_key: KeySource,
+    pub program_so: PathBuf,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct ProgramSummary {
+    pub name: String,
+    pub program_id: String,
+    pub upgrade_authority: String,
+}
+
+/// What deploying `so_bytes` of program costs, in lamports.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct Estimate {
+    pub so_bytes: usize,
+    /// Comes back to the wallet when the deploy closes the buffer.
+    pub buffer_rent: u64,
+    pub program_data_rent: u64,
+    pub program_rent: u64,
+    /// Base fees of every transaction, once each.
+    pub fees: u64,
+    /// Out of the wallet at once, just before the deploy closes the buffer.
+    pub peak: u64,
+    pub balance: u64,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -557,18 +599,131 @@ pub fn genesis_hash(rpc_url: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no genesis hash in the RPC reply"))
 }
 
+/// `network`'s RPC, after checking it is the cluster with genesis `want`.
+fn checked_rpc(network: &Network, want: &str) -> Result<SolanaRpc> {
+    let (rpc_url, _) = network.urls()?;
+    let got = genesis_hash(&rpc_url)?;
+    ensure!(
+        got == want,
+        "the RPC's genesis hash is {got}, not {want}; refusing"
+    );
+    Ok(SolanaRpc::new(rpc_url))
+}
+
 impl Plan {
     /// The plan's RPC, after checking it is the plan's cluster.
     pub fn rpc(&self) -> Result<SolanaRpc> {
-        let (rpc_url, _) = self.network.urls()?;
-        let got = genesis_hash(&rpc_url)?;
-        let want = &self.genesis_hash;
-        ensure!(
-            got == *want,
-            "the RPC's genesis hash is {got}, not {want}; refusing"
-        );
-        Ok(SolanaRpc::new(rpc_url))
+        checked_rpc(&self.network, &self.genesis_hash)
     }
+}
+
+impl ProgramPlan {
+    /// The plan's RPC, after checking it is the plan's cluster.
+    pub fn rpc(&self) -> Result<SolanaRpc> {
+        checked_rpc(&self.network, &self.genesis_hash)
+    }
+
+    pub fn so(&self) -> Result<Vec<u8>> {
+        std::fs::read(&self.program_so)
+            .with_context(|| format!("read {}", self.program_so.display()))
+    }
+}
+
+/// Lamports as SOL, exactly.
+pub fn sol(lamports: u64) -> String {
+    format!(
+        "{}.{:09} SOL",
+        lamports / 1_000_000_000,
+        lamports % 1_000_000_000
+    )
+}
+
+/// What a fresh deploy of `so_bytes` costs `payer`, with its balance; reads
+/// rent from the chain and needs no key.
+pub fn estimate(rpc: &SolanaRpc, payer: &Address, so_bytes: usize) -> Result<Estimate> {
+    let rent = |len| rpc.get_minimum_balance_for_rent_exemption(len).map_err(err);
+    let buffer_rent = rent(BUFFER_HEADER + so_bytes)?;
+    let program_data_rent = rent(PROGRAM_DATA_HEADER + so_bytes)?;
+    let program_rent = rent(PROGRAM_LEN)?;
+    // Create the buffer and deploy take two signatures each, a write one.
+    let signatures = 4 + so_bytes.div_ceil(CHUNK) as u64;
+    let fees = signatures * LAMPORTS_PER_SIGNATURE;
+    Ok(Estimate {
+        so_bytes,
+        buffer_rent,
+        program_data_rent,
+        program_rent,
+        fees,
+        peak: buffer_rent + program_data_rent + program_rent + fees,
+        balance: rpc.get_balance(*payer).map_err(err)?,
+    })
+}
+
+/// Prints `e` for a person deciding whether to fund the wallet.
+pub fn log_estimate(name: &str, payer: &Address, e: &Estimate) {
+    log!(
+        "deploy {name}: {} bytes; buffer rent {} (refunded at deploy), program data rent {}, \
+         program rent {}, fees {}",
+        e.so_bytes,
+        sol(e.buffer_rent),
+        sol(e.program_data_rent),
+        sol(e.program_rent),
+        sol(e.fees)
+    );
+    log!(
+        "deploy {name}: needs {} at peak; wallet {payer} holds {}",
+        sol(e.peak),
+        sol(e.balance)
+    );
+}
+
+/// Deploys the plan's one program, or checks it is already there with
+/// these bytes. Before sending anything it checks the wallet holds what the
+/// deploy still needs: the peak, or for a resumed buffer the program's rent
+/// and the fees of the writes and deploy left.
+pub fn deploy_one(plan: &ProgramPlan) -> Result<ProgramSummary> {
+    let name = &plan.name;
+    let rpc = plan.rpc()?;
+    let deployer = plan.deploy_key.keypair()?;
+    let program = plan.program_key.keypair()?;
+    let buffer = plan.buffer_key.keypair()?;
+    let so = plan.so()?;
+    let e = estimate(&rpc, &deployer.pubkey(), so.len())?;
+    log_estimate(name, &deployer.pubkey(), &e);
+    // A deployed program needs nothing; deploy_program checks its bytes.
+    if rpc.get_account(program.pubkey()).map_err(err)?.is_none() {
+        let need = match rpc.get_account(buffer.pubkey()).map_err(err)? {
+            None => e.peak,
+            // Its rent and the writes that landed are spent already.
+            Some(a) => {
+                let left = so
+                    .chunks(CHUNK)
+                    .enumerate()
+                    .filter(|(i, c)| {
+                        let at = BUFFER_HEADER + i * CHUNK;
+                        a.data.get(at..at + c.len()) != Some(*c)
+                    })
+                    .count() as u64;
+                e.program_data_rent + e.program_rent + (left + 2) * LAMPORTS_PER_SIGNATURE
+            }
+        };
+        ensure!(
+            e.balance >= need,
+            "deploy {name}: the wallet holds {} but the deploy still needs {}; fund {} \
+             and rerun; nothing sent",
+            sol(e.balance),
+            sol(need),
+            deployer.pubkey()
+        );
+    }
+    deploy_program(&rpc, &deployer, &program, &buffer, &so, None)?;
+    let authority = upgrade_authority(&rpc, &program.pubkey())?
+        .ok_or_else(|| anyhow!("{} is immutable", program.pubkey()))?;
+    Ok(ProgramSummary {
+        name: name.clone(),
+        program_id: program.pubkey().to_string(),
+        upgrade_authority: authority.to_string(),
+    })
 }
 
 /// Runs every step of `plan`.
@@ -672,5 +827,22 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(plan.tokens[0].inventory, 10_000_000_000_000);
+    }
+
+    #[test]
+    fn program_plan_parses_and_sol_prints_exactly() {
+        let plan: ProgramPlan = serde_json::from_value(json!({
+            "name": "lend",
+            "network": {"rpc_url": "https://devnet.helius-rpc.com", "indexer_url": "https://devnet.helius-rpc.com/v1/spr", "prover": {"helius": {"keychain": "k"}}},
+            "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+            "deploy_key": {"keychain": "keeler-devnet-deploy"},
+            "program_key": {"keychain": "keeler-devnet-lend-program"},
+            "buffer_key": {"keychain": "keeler-devnet-lend-buffer"},
+            "program_so": "keeler_lend.so"
+        }))
+        .unwrap();
+        assert_eq!(plan.name, "lend");
+        assert_eq!(sol(12_345_678_901), "12.345678901 SOL");
+        assert_eq!(sol(5_000), "0.000005000 SOL");
     }
 }
