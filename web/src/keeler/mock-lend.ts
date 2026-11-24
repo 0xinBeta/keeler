@@ -4,7 +4,9 @@
 // `mock` on the returned object is a test control (price moves); the interface shows it only in a mock build.
 import { KeelerError } from "./index";
 import type { Asset, KeelerLend, LendAccount, LendKind, LendOperation, LendStep, Liquidation, Pool, Position, Vault } from "./index";
-import { accrue, borrowRateBps, liquidationSize, maxBorrow, maxWithdraw, PRICE_SCALE, supplyRateBps } from "../ui/lend-math";
+import * as L from "./lend-math";
+
+const PRICE_SCALE = L.PRICE_SCALE;
 
 export type MockLendControls = {
   /** Moves the oracle price by `bps` (negative is down). */
@@ -25,7 +27,6 @@ type Shared = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const now = () => Math.floor(Date.now() / 1000);
-const ceilDiv = (a: bigint, b: bigint) => (a + b - 1n) / b;
 
 const START_PRICE = 142_370_000_000n; // 142.37 tUSD per tSOL
 const CURVE = [
@@ -34,6 +35,7 @@ const CURVE = [
   { utilisationBps: 9300, rateBps: 700 },
   { utilisationBps: 10_000, rateBps: 1500 },
 ];
+const CORE_CURVE: L.Curve = { kinks: CURVE.map((k) => ({ utilBps: BigInt(k.utilisationBps), rateBps: BigInt(k.rateBps) })) };
 
 type MockPosition = { id: string; vault: number; collateral: bigint; debtShares: bigint; lastLiquidation: Liquidation | null };
 type MockOp = LendOperation & { fill: (() => void) | null };
@@ -67,44 +69,43 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
     priceTime: now(),
   };
 
+  const cv: L.Vault = {
+    cfBps: BigInt(vault.collateralFactorBps),
+    ltBps: BigInt(vault.liquidationThresholdBps),
+    lmlBps: BigInt(vault.liquidationMaxLimitBps),
+    penaltyBps: BigInt(vault.penaltyBps),
+  };
+
   // Reserve: other suppliers' 2.4M tUSD, 1.73M of it borrowed. Prices are 1e12-scaled share prices.
-  const r = {
+  let r: L.Reserve = {
     supplyPrice: PRICE_SCALE,
     borrowPrice: PRICE_SCALE,
     supplyShares: 2_400_000_000000n,
     debtShares: 1_730_000_000000n,
-    buffer: 0n,
-    rateBps: 0,
-    last: Date.now() / 1000,
+    rateBps: 0n,
+    lastUpdate: BigInt(now()),
   };
   let myShares = 0n;
   const positions: MockPosition[] = [];
   const ops: MockOp[] = [];
   let watcher = 0;
 
-  const supplied = () => (r.supplyShares * r.supplyPrice) / PRICE_SCALE;
-  const borrowed = () => ceilDiv(r.debtShares * r.borrowPrice, PRICE_SCALE);
-  const utilisation = () => {
-    const sup = supplied();
-    return sup === 0n ? 0 : Number((borrowed() * 10_000n) / sup);
-  };
+  const supplied = () => L.totalSupply(r);
+  const borrowed = () => L.totalDebt(r);
+  const utilisation = () => Number(L.utilisationBps(r));
   const setRate = () => {
-    r.rateBps = borrowRateBps(utilisation(), CURVE);
+    r = L.refreshRate(r, CORE_CURVE);
   };
   // Applies the stored rate for the elapsed time, then stores the new rate (the plan's accrual order).
   const accrueAll = () => {
-    const t = Date.now() / 1000;
-    const dt = t - r.last;
-    if (dt <= 0) return;
-    const u = utilisation();
-    r.borrowPrice = accrue(r.borrowPrice, r.rateBps, dt) + 1n; // borrow price rounds up
-    r.supplyPrice = accrue(r.supplyPrice, supplyRateBps(r.rateBps, u, pool.feeBps), dt);
-    r.last = t;
+    const t = BigInt(now());
+    if (t <= r.lastUpdate) return;
+    r = L.accrue(r, t, BigInt(pool.feeBps));
     setRate();
   };
   setRate();
 
-  const debtOf = (p: MockPosition) => ceilDiv(p.debtShares * r.borrowPrice, PRICE_SCALE);
+  const debtOf = (p: MockPosition) => L.debtOf(p.debtShares, r.borrowPrice);
   const find = (id: string) => {
     const p = positions.find((x) => x.id === id);
     if (!p) throw new KeelerError("storage", "This browser has no record of that position. Reload the page to read your account again.");
@@ -176,16 +177,16 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
     watcher = window.setTimeout(() => {
       accrueAll();
       for (const p of positions) {
-        const debt = debtOf(p);
-        const size = liquidationSize(p.collateral, debt, vault.price, vault);
-        if (!size) continue;
-        const debtValue = (size.repaid * PRICE_SCALE) / r.borrowPrice;
-        p.debtShares = size.repaid >= debt ? 0n : p.debtShares - debtValue;
-        p.collateral -= size.sold;
-        r.debtShares -= debtValue;
-        // The penalty's proceeds stay in the reserve as its buffer.
-        r.buffer += (size.repaid * BigInt(vault.penaltyBps)) / 10_000n;
-        p.lastLiquidation = { at: now(), debtRepaid: size.repaid, collateralSold: size.sold, price: vault.price };
+        let l: L.Liquidation;
+        try {
+          l = L.liquidate(p.debtShares, r.borrowPrice, p.collateral, vault.price, cv);
+        } catch {
+          continue; // not liquidatable, or nothing to take
+        }
+        r = { ...r, debtShares: r.debtShares - (p.debtShares - l.debtShares) };
+        p.lastLiquidation = { at: now(), debtRepaid: l.repay, collateralSold: l.payout, price: vault.price };
+        p.debtShares = l.debtShares;
+        p.collateral = l.collateral;
       }
       setRate();
     }, 4000);
@@ -205,8 +206,8 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       Object.assign(pool, {
         size: (supplied() / 10_000_000000n) * 10_000_000000n,
         utilisationBps: Math.round(util / 100) * 100,
-        borrowAprBps: r.rateBps,
-        supplyAprBps: supplyRateBps(r.rateBps, util, pool.feeBps),
+        borrowAprBps: Number(r.rateBps),
+        supplyAprBps: Number(L.aprBps(r.rateBps, BigInt(util), BigInt(pool.feeBps)).supplyBps),
         asOf: now(),
       });
       vault.priceTime = now(); // the mock oracle is always fresh
@@ -226,7 +227,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
         lastLiquidation: p.lastLiquidation,
       }));
       return {
-        receipts: myShares > 0n ? [{ pool: pool.id, shares: myShares, value: (myShares * r.supplyPrice) / PRICE_SCALE }] : [],
+        receipts: myShares > 0n ? [{ pool: pool.id, shares: myShares, value: L.assetsOf(myShares, r.supplyPrice) }] : [],
         positions: positionsOut,
         operations: ops.map(strip),
         asOf: now(),
@@ -241,9 +242,9 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
         throw new KeelerError("insufficient-note", "No single private note of tUSD covers that amount. Enter at most your largest note, or deposit more.");
       const o = op("supply", [{ asset: tUSD, amount }], null, true);
       return intent(o, tUSD, amount, () => {
-        const shares = (amount * PRICE_SCALE) / r.supplyPrice;
+        const shares = L.sharesForSupply(amount, r.supplyPrice);
         myShares += shares;
-        r.supplyShares += shares;
+        r = { ...r, supplyShares: r.supplyShares + shares };
       }, on);
     },
 
@@ -251,7 +252,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       s.need();
       keeper();
       accrueAll();
-      const value = (myShares * r.supplyPrice) / PRICE_SCALE;
+      const value = L.assetsOf(myShares, r.supplyPrice);
       if (amount > value) throw new KeelerError("insufficient-note", "That is more than your deposit is worth. Enter a smaller amount.");
       const idle = supplied() - borrowed();
       if (s.scenario === "no-liquidity" || amount > idle)
@@ -262,9 +263,9 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       step(o, "signing", on);
       await sleep(900);
       accrueAll();
-      const burn = amount >= (myShares * r.supplyPrice) / PRICE_SCALE ? myShares : ceilDiv(amount * PRICE_SCALE, r.supplyPrice);
+      const burn = amount >= L.assetsOf(myShares, r.supplyPrice) ? myShares : L.sharesToBurn(amount, r.supplyPrice);
       myShares -= burn;
-      r.supplyShares -= burn;
+      r = { ...r, supplyShares: r.supplyShares - burn };
       s.addNote(tUSD, amount);
       setRate();
       landed(o, on);
@@ -299,8 +300,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       const debt = debtOf(p);
       if (borrow > 0n && debt + borrow < vault.minDebt)
         throw new KeelerError("below-minimum", "A loan must be at least 5 tUSD. Enter a larger amount.");
-      if (borrow > maxBorrow(p.collateral - withdraw, debt, vault.price, vault.collateralFactorBps) ||
-          withdraw > maxWithdraw(p.collateral, debt + borrow, vault.price, vault.collateralFactorBps))
+      if (withdraw > p.collateral || !L.canDraw(debt + borrow, L.collateralValue(p.collateral - withdraw, vault.price), cv))
         throw new KeelerError("unhealthy", "That would take the position past 80% of its collateral's value. Enter a smaller amount.");
       const sup = supplied();
       if (borrow > 0n && (borrowed() + borrow) * 10_000n > sup * BigInt(pool.maxUtilisationBps))
@@ -315,9 +315,9 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       step(o, "signing", on);
       await sleep(900);
       accrueAll();
-      const shares = ceilDiv(borrow * PRICE_SCALE, r.borrowPrice); // debt shares round up
+      const shares = L.borrowShares(borrow, r.borrowPrice); // debt shares round up
       p.debtShares += shares;
-      r.debtShares += shares;
+      r = { ...r, debtShares: r.debtShares + shares };
       p.collateral -= withdraw;
       s.addNote(tUSD, borrow);
       s.addNote(tSOL, withdraw);
@@ -334,12 +334,10 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
         throw new KeelerError("insufficient-note", "No single private note of tUSD covers that amount. Enter at most your largest note, or deposit more.");
       const o = op("repay", [{ asset: tUSD, amount }], positionId, true);
       return intent(o, tUSD, amount, () => {
-        const debt = debtOf(p);
-        const paid = amount > debt ? debt : amount;
-        const shares = paid >= debt ? p.debtShares : (paid * PRICE_SCALE) / r.borrowPrice; // burned rounded down
-        p.debtShares -= shares;
-        r.debtShares -= shares;
-        s.addNote(tUSD, amount - paid); // change
+        const done = L.repayShares(p.debtShares, amount, r.borrowPrice);
+        r = { ...r, debtShares: r.debtShares - (p.debtShares - done.shares) };
+        p.debtShares = done.shares;
+        s.addNote(tUSD, done.change);
       }, on);
     },
 

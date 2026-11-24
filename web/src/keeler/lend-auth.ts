@@ -117,7 +117,7 @@ export async function verifyRequest(network: string, programId: string, method: 
 
 export type Ticket = { programId: Address; wallet: Address; id: string; purpose: number; target: bigint; amount: bigint; expiry: number };
 
-/** `domain ‖ program (32) ‖ wallet (32) ‖ id (16) ‖ purpose u8 ‖ target u64 LE ‖ amount u64 LE ‖ expiry u64 LE` (125 bytes). */
+/** `domain ‖ program (32) ‖ wallet (32) ‖ id (16) ‖ purpose u8 ‖ target u64 LE ‖ amount u64 LE ‖ expiry u64 LE` (126 bytes). */
 export function ticketMessage(t: Ticket): Uint8Array {
   const enc = getAddressEncoder();
   const id = fromHex(t.id);

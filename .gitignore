@@ -4,6 +4,7 @@ target/
 node_modules/
 web/dist/
 web/public/swap/
+web/public/lend/
 web/test-results/
 web/playwright-report/
 .wrangler/

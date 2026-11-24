@@ -713,8 +713,9 @@ async function faucet(request: Request, env: Env): Promise<Response> {
 // ---- /api/lend/* ----
 
 const vaultId: Check = (v) => uint(v) && (v as number) <= 0xffff;
-// A wallet signature over the request, with a nonce and a timestamp; the keeper verifies all three.
-const SIGNED: Spec = { wallet: [address, true], nonce: [hex(32), true], timestamp: [uint, true], signature: [hex(128), true] };
+// A request signed by the browser session key (`sessionKey`), which the wallet authorised once (`sessionAuth`, over
+// the text in docs/lend-api.md) until `sessionExpiry`; with a nonce and a timestamp. The keeper verifies all of it.
+const SIGNED: Spec = { wallet: [address, true], nonce: [hex(32), true], timestamp: [uint, true], sessionKey: [address, true], sessionExpiry: [uint, true], sessionAuth: [hex(128), true], signature: [hex(128), true] };
 const PURPOSE = oneOf("supply", "deposit", "repay");
 // The owner message, encrypted to the owner's viewing key.
 const message = base64(512);
@@ -733,7 +734,7 @@ const BUILD_REQUEST: Spec = {
   amount: [amount, false], borrow: [amount, false], withdraw: [amount, false],
 };
 // A v1 transaction is at most 4,096 bytes: 5,464 base64 characters.
-const BUILD_REPLY: Spec = { transaction: [base64(5464), true], outputs: [list(hex(64), 1, 8), true], now: [uint, true], bound: [amount, false] };
+const BUILD_REPLY: Spec = { transaction: [base64(5464), true], outputs: [list(hex(64), 1, 8), true], now: [uint, true], bound: [amount, false], index: [amount, false] };
 const ACCOUNT_REPLY: Spec = {
   receipts: [list(object({ pool: [address, true], shares: [amount, true], message: [message, true] }), 0, 8), true],
   positions: [list(object({
@@ -779,7 +780,7 @@ async function lend(request: Request, env: Env, url: URL, path: string): Promise
     body = JSON.stringify(clean);
   } else {
     const params = [...url.searchParams];
-    const given = Object.fromEntries(params.map(([k, v]) => [k, k === "timestamp" && /^(0|[1-9][0-9]{0,15})$/.test(v) ? Number(v) : v]));
+    const given = Object.fromEntries(params.map(([k, v]) => [k, (k === "timestamp" || k === "sessionExpiry") && /^(0|[1-9][0-9]{0,15})$/.test(v) ? Number(v) : v]));
     const clean = params.length === Object.keys(given).length ? shaped(given, route.request) : null;
     if (clean === null) throw new Fail(400, `The query does not have the fields ${route.keeper} takes.`);
     if (params.length > 0) query = "?" + new URLSearchParams(Object.entries(clean).map(([k, v]) => [k, String(v)]));
