@@ -135,9 +135,10 @@ export function App({ keeler }: { keeler: Keeler }) {
   const [account, setAccount] = useState<LendAccount | null>(null);
   const lendSeen = useRef(new Map<string, string>());
   const refreshMarket = useCallback(() => (lend ? lend.pools().then(setMarket) : Promise.resolve()), [lend]);
-  const refreshAccount = useCallback(async () => {
+  // Reads the page starts on its own never ask the wallet; the reader asks for that (`prompt`).
+  const refreshAccount = useCallback(async (prompt = false) => {
     if (!lend) return;
-    const a = await lend.lendAccount();
+    const a = await lend.lendAccount({ prompt });
     setAccount(a);
     // A keeper fill or a liquidation changes private balances too.
     let changed = false;
@@ -148,8 +149,8 @@ export function App({ keeler }: { keeler: Keeler }) {
     if (changed) refreshBalances().catch(() => {});
   }, [lend, refreshBalances]);
   // After an action: market and account each on their own, so a keeper or price outage still shows the account.
-  const refreshLend = useCallback(async () => {
-    const [, a] = await Promise.allSettled([refreshMarket(), refreshAccount()]);
+  const refreshLend = useCallback(async (prompt?: boolean) => {
+    const [, a] = await Promise.allSettled([refreshMarket(), refreshAccount(prompt)]);
     if (a.status === "rejected") throw a.reason;
   }, [refreshMarket, refreshAccount]);
 

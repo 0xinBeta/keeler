@@ -48,6 +48,7 @@ const config: LendServerConfig = {
 };
 const USER_ADDR = new Uint8Array(64).fill(1);
 const PDA_ADDR = new Uint8Array(64).fill(2);
+const USER_TAG = new Uint8Array(32).fill(1);
 const RESERVE_NF = new Uint8Array(32).fill(0xaa);
 const INDEX = 1_100_000_000_000n; // 1.1 tUSD per share
 const TSOL_PRICE = { price: "14237000000", expo: -8, publishTime: T0 }; // $142.37
@@ -63,6 +64,8 @@ const wasm: LendDeps["wasm"] = {
   hash: async (n) => sha(n.owner, n.mint, u64Bytes(n.amount), Uint8Array.of(n.kind), n.state, n.blinding),
   seed: (domain, prev) => sha(domain, prev),
   nullifier: (hash, blinding) => sha("nf", hash, blinding),
+  // A fake payout ciphertext: mint ‖ amount ‖ blinding (see keeperBuild).
+  openPayout: async ({ data }) => (data.length === 72 ? { mint: data.slice(0, 32), amount: u64At(data, 32), blinding: data.slice(40), plain: true } : undefined),
   // Test states: 16 opaque bytes, then the pool or position id, then the shares.
   decode: async (n) => ({ ownerIsMe: n.state[0] !== 0xee, shares: u64At(n.state, n.state.length - 8), positionId: u64At(n.state, n.state.length - 16), pool: u64At(n.state, n.state.length - 16) }),
 };
@@ -184,7 +187,7 @@ async function world() {
     send,
     sync: async () => {},
     notes: (mint) => (mint === TUSD ? [{ amount: 500_000000n, utxo: "tusd-note" }] : [{ amount: 5_000000000n, utxo: "tsol-note" }]),
-    owners: async () => ({ user: USER_ADDR, pda: PDA_ADDR, viewing: new Uint8Array(33).fill(6) }),
+    owners: async () => ({ user: USER_ADDR, pda: PDA_ADDR, viewing: new Uint8Array(33).fill(6), tags: [USER_TAG] }),
     chain: {
       note: async (hash) => notes.get(hex(hash)) ?? {},
       signatureStatus: async (s) => sigs.get(s) ?? null,
@@ -225,12 +228,17 @@ async function keeperBuild(W: World, op: "redeem" | "draw", spent: { hash: Uint8
     const n = notes.find((x) => x.slot === slot);
     return n ? wasm.hash({ ...n, blinding: await wasm.blinding(first, seed, slot) }) : sha("pad", Uint8Array.of(slot));
   }));
+  // Each note's ciphertext opens to it, under the owner's tag.
+  const data = await Promise.all([0, 1, 2, 3].map(async (slot) => {
+    const n = notes.find((x) => x.slot === slot);
+    return n ? Uint8Array.of(...n.mint, ...u64Bytes(n.amount), ...(await wasm.blinding(first, seed, slot))) : new Uint8Array(72);
+  }));
   const transact = encodeTransactInstructionData({
     expiryUnixTs: BigInt(W.clock.now + 60),
     txViewingPk: new Uint8Array(33).fill(2),
     salt: new Uint8Array(16),
     interfaceTransfers: [],
-    outputs: outputs.map((utxoHash) => ({ utxoHash, ownerTag: { kind: "inline" as const, value: new Uint8Array(32) } })),
+    outputs: outputs.map((utxoHash, i) => ({ utxoHash, ownerTag: { kind: "inline" as const, value: USER_TAG }, data: data[i] })),
     messages: [],
     privateTxHash: new Uint8Array(32),
     circuit: { kind: "confidentialSigner", inputs: 2, outputs: 4, publicAssetSlots: 0 },
@@ -458,6 +466,17 @@ describe("keeper-built operations: redeem and draw", () => {
     expect(W.store.get("index", TUSD)?.supply?.index).toBe(INDEX);
   });
 
+  it("sends nothing and saves nothing when the block height cannot be read", async () => {
+    const r = await withReceipt();
+    W.keeper.build = (b) => keeperBuild(W, "redeem", r, redeemNotes(r, BigInt(String(b.amount)), 227_272727n - 90_909091n));
+    W.deps.chain.blockHeight = async () => {
+      throw new Error("rpc down");
+    };
+    expect((await refusal(W.lend.redeem(TUSD, 100_000000n, () => {}))).code).toBe("network");
+    expect(W.log.sent).toHaveLength(1); // the supply that opened the session
+    expect(W.store.all("op").filter((o) => o.kind === "redeem")).toEqual([]);
+  });
+
   it("withdraws everything by shares: pays their worth at the keeper's index and leaves a zero-share receipt", async () => {
     const r = await withReceipt();
     // 227.272727 shares at 1.1 are worth floor(249.9999997) = 249.999999 tUSD.
@@ -615,13 +634,68 @@ describe("a keeper fill with the keeper gone", () => {
     expect(a.positions).toMatchObject([{ id: "42", collateral: 4_000000000n, debt: 0n }]);
   });
 
-  it("keeps nothing it cannot find on chain", async () => {
+  it("keeps a spent position it cannot replace until the keeper's view says what replaced it", async () => {
     await W.lend.supply(TUSD, 1_000000n, () => {});
     const p = await givePosition(W, 42n, 4_000000000n, 1_000000n);
     await W.lend.lendAccount();
     W.notes.set(hex(p.hash), { leafIndex: 9n, spentBy: "fill" });
     W.keeper.status = 502;
+    expect((await W.lend.lendAccount()).positions).toMatchObject([{ id: "42", collateral: 4_000000000n }]);
+    // The keeper is back and no longer lists it: it is gone (an empty successor).
+    W.keeper.status = 200;
+    W.keeper.account.positions = [];
     expect((await W.lend.lendAccount()).positions).toEqual([]);
+  });
+
+  it("drops a spent receipt only once the keeper's view was read", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const r = await giveReceipt(W, 5_000000n);
+    await W.lend.lendAccount();
+    W.notes.set(hex(r.hash), { leafIndex: 7n, spentBy: "elsewhere" });
+    W.keeper.status = 502;
+    expect((await W.lend.lendAccount()).receipts).toHaveLength(1);
+    W.keeper.status = 200;
+    W.keeper.account.receipts = [];
+    expect((await W.lend.lendAccount()).receipts).toEqual([]);
+  });
+});
+
+describe("sessions, prompts, and one opening per vault", () => {
+  it("never asks the wallet on a read with prompt false, and says the keeper's view is due", async () => {
+    const p = await givePosition(W, 42n, 4_000000000n, 1_000000n);
+    W.store.put("position", hex(p.hash), { vault: 1, id: "42", collateral: 4_000000000n, debtShares: 1_000000n, note: { hash: p.hash, blinding: p.blinding, amount: 4_000000000n, state: p.state } as never, lastLiquidation: null });
+    W.notes.set(hex(p.hash), { leafIndex: 9n, spentBy: "fill" });
+    const a = await W.lend.lendAccount({ prompt: false });
+    expect(W.log.signMessage).toBe(0);
+    expect(a.needsSession).toBe(true);
+    expect((await W.lend.lendAccount()).needsSession).toBeUndefined();
+    expect(W.log.signMessage).toBe(1);
+  });
+
+  it("starts a new session after a wallet switch", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    W.deps.wallet = () => "Other1111111111111111111111111111111111111" as never;
+    await W.lend.lendAccount({ prompt: false });
+    W.deps.wallet = () => W.USER;
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    expect(W.log.signMessage).toBe(2);
+  });
+
+  it("tries a failed rescan again on the next read", async () => {
+    let scans = 0;
+    W.deps.chain.scanIntents = async () => {
+      if (++scans === 1) throw new Error("rpc down");
+      return [];
+    };
+    await W.lend.lendAccount();
+    await W.lend.lendAccount();
+    await W.lend.lendAccount();
+    expect(scans).toBe(2);
+  });
+
+  it("refuses a second opening deposit to a vault while the first waits", async () => {
+    await W.lend.deposit(1, null, 1_000000000n, () => {});
+    expect((await refusal(createLend(W.deps).deposit(1, null, 1_000000000n, () => {}))).code).toBe("busy");
   });
 });
 

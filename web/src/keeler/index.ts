@@ -190,6 +190,8 @@ export type LendAccount = {
   operations: LendOperation[];
   /** Chain time the values above were computed at. */
   asOf: number;
+  /** The keeper has news for this account (a fill, a change made elsewhere) that a read with `prompt` can fetch. */
+  needsSession?: true;
 };
 
 /**
@@ -198,7 +200,8 @@ export type LendAccount = {
  */
 export interface KeelerLend {
   pools(): Promise<{ pools: Pool[]; vaults: Vault[] }>;
-  lendAccount(): Promise<LendAccount>;
+  /** `prompt: false` never asks the wallet; a read that needed the session then says `needsSession`. */
+  lendAccount(opts?: { prompt?: boolean }): Promise<LendAccount>;
   /** Earn: `amount` of the pool's asset from one private note into the pool. */
   supply(pool: string, amount: bigint, on: (step: LendStep) => void): Promise<LendOperation>;
   /** Earn: `amount` of the pool's asset out of the receipt into the private balance; "all" burns every share. */

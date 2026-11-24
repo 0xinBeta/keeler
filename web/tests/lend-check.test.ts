@@ -23,7 +23,7 @@ import { encodeTransactInstructionData } from "@heliuslabs/spr/internal";
 import { describe, expect, it } from "vitest";
 import { KeelerError } from "../src/keeler/index";
 import { checkKeeperTransaction, COMPUTE_BUDGET_PROGRAM, decodeTransact, type ExpectedNote, type Expected, type Hashing } from "../src/keeler/lend-check";
-import { ARGS, SLOT, TAG, u64Bytes } from "../src/keeler/lend-layout";
+import { ARGS, SLOT, TAG, u64At, u64Bytes } from "../src/keeler/lend-layout";
 
 const PROGRAM = address("A7qaBKJ1gJRcKwMWyyRdr9YhmbBmnMaemM9Sijah3EbC");
 const KEEPER = address("GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq");
@@ -50,10 +50,16 @@ const sha = (...parts: Uint8Array[]) => {
   parts.forEach((p) => h.update(p));
   return new Uint8Array(h.digest());
 };
+/** A fake payout ciphertext: mint ‖ amount ‖ blinding ‖ plain flag, "sealed" by being prefixed with its slot index. */
+const seal = (slotIndex: number, mint: Uint8Array, amount: bigint, blinding: Uint8Array, plain = true) => Uint8Array.of(slotIndex, ...mint, ...u64Bytes(amount), ...blinding, plain ? 1 : 0);
 const hashing: Hashing = {
   blinding: async (first, seed, slot) => sha(first, seed, Uint8Array.of(slot)),
   hash: async (n) => sha(n.owner, n.mint, u64Bytes(n.amount), Uint8Array.of(n.kind), n.state, n.blinding),
+  // Opens only under the slot index it was sealed for, as the real cipher.
+  openPayout: async ({ data, slotIndex }) =>
+    data.length === 74 && data[0] === slotIndex ? { mint: data.slice(1, 33), amount: u64At(data, 33), blinding: data.slice(41, 73), plain: data[73] === 1 } : undefined,
 };
+const MY_TAG = new Uint8Array(32).fill(7);
 
 const w = (a: Address) => ({ address: a, role: AccountRole.WRITABLE });
 const ws = (a: Address) => ({ address: a, role: AccountRole.WRITABLE_SIGNER });
@@ -65,14 +71,14 @@ type Op = "redeem" | "draw";
 function notes(op: Op): ExpectedNote[] {
   if (op === "redeem") {
     return [
-      { slot: SLOT.redeem.payout, owner: USER_ADDR, mint: MINT, amount: 250_000000n, kind: 0, state: new Uint8Array() },
+      { slot: SLOT.redeem.payout, owner: USER_ADDR, mint: MINT, amount: 250_000000n, kind: 0, state: new Uint8Array(), payout: true },
       { slot: SLOT.redeem.receipt, owner: PDA_ADDR, mint: MINT, amount: 0n, kind: 2, state: new Uint8Array(40).fill(3) },
     ];
   }
   return [
     { slot: SLOT.draw.position, owner: PDA_ADDR, mint: SOL_MINT, amount: 3_000000000n, kind: 3, state: new Uint8Array(48).fill(4) },
-    { slot: SLOT.draw.debtPayout, owner: USER_ADDR, mint: MINT, amount: 100_000000n, kind: 0, state: new Uint8Array() },
-    { slot: SLOT.draw.collateralPayout, owner: USER_ADDR, mint: SOL_MINT, amount: 0n, kind: 0, state: new Uint8Array() },
+    { slot: SLOT.draw.debtPayout, owner: USER_ADDR, mint: MINT, amount: 100_000000n, kind: 0, state: new Uint8Array(), payout: true },
+    { slot: SLOT.draw.collateralPayout, owner: USER_ADDR, mint: SOL_MINT, amount: 0n, kind: 0, state: new Uint8Array(), payout: true },
   ];
 }
 const expected = (op: Op, over: Partial<Expected> = {}): Expected => ({
@@ -83,6 +89,7 @@ const expected = (op: Op, over: Partial<Expected> = {}): Expected => ({
   chainNow: NOW,
   spends: RECEIPT_NULLIFIER,
   ownerViewing: VIEWING,
+  payoutTags: [new Uint8Array(32).fill(1), MY_TAG],
   seed: SEED,
   notes: notes(op),
   ...(op === "draw" ? { reference: REFERENCE } : {}),
@@ -104,6 +111,9 @@ type Build = {
   nonce?: boolean;
   viewing?: Uint8Array;
   spentSecond?: boolean;
+  /** Replaces what slot `slot` publishes (its ciphertext); null publishes none. */
+  data?: (slot: number, honest: Uint8Array) => Uint8Array | null;
+  ownerTag?: Uint8Array;
 };
 
 async function build(o: Build = {}) {
@@ -117,12 +127,20 @@ async function build(o: Build = {}) {
       return n ? hashing.hash({ ...n, blinding: await hashing.blinding(RECEIPT_NULLIFIER, SEED, slot) }) : sha(Uint8Array.of(slot));
     }),
   );
+  // Every slot publishes a ciphertext (the SDK's 1:1 assembly); the owner's payouts open to their notes.
+  const published = await Promise.all(
+    [0, 1, 2, 3].map(async (slot) => {
+      const n = (o.notes ?? notes(op)).find((x) => x.slot === slot);
+      const honest = n ? seal(slot, n.mint, n.amount, await hashing.blinding(RECEIPT_NULLIFIER, SEED, slot)) : new Uint8Array(74);
+      return o.data ? o.data(slot, honest) : honest;
+    }),
+  );
   const transact = encodeTransactInstructionData({
     expiryUnixTs: BigInt(o.expiry ?? NOW + 60),
     txViewingPk: new Uint8Array(33).fill(2),
     salt: new Uint8Array(16),
     interfaceTransfers: o.transfers ? [{ kind: "solWithdrawal", amount: 5n }] : [],
-    outputs: outputs.map((utxoHash) => ({ utxoHash, ownerTag: { kind: "inline" as const, value: new Uint8Array(32).fill(7) } })),
+    outputs: outputs.map((utxoHash, i) => ({ utxoHash, ownerTag: { kind: "inline" as const, value: o.ownerTag ?? MY_TAG }, ...(published[i] ? { data: published[i] } : {}) })),
     messages: [],
     privateTxHash: new Uint8Array(32),
     circuit: { kind: "confidentialSigner", inputs: 2, outputs: 4, publicAssetSlots: 0 },
@@ -243,6 +261,28 @@ describe("the signing check", () => {
     expect(await refusal(checkKeeperTransaction(honest, expected("redeem", { spends: new Uint8Array(32).fill(1) }), hashing))).toMatch(/does not spend your note/);
     expect(await refusal(checkKeeperTransaction({ ...honest, now: NOW - 1 }, expected("redeem"), hashing))).toMatch(/states differs/);
     expect(await refusal(checkKeeperTransaction(await build({ spentSecond: true }), expected("redeem"), hashing))).toMatch(/does not spend your note first/);
+  });
+
+  it("refuses a payout the wallet would never find: another tag, no ciphertext, or one that opens to another note", async () => {
+    expect(await refusal(checkKeeperTransaction(await build({ ownerTag: new Uint8Array(32).fill(8) }), expected("redeem"), hashing))).toMatch(/output 2 is not addressed to your wallet/);
+    expect(await refusal(checkKeeperTransaction(await build({ data: (slot, h) => (slot === 2 ? null : h) }), expected("redeem"), hashing))).toMatch(/output 2 is not addressed/);
+    const blinding = await hashing.blinding(RECEIPT_NULLIFIER, SEED, SLOT.redeem.payout);
+    // Correct hash, but the ciphertext says less, another token, another blinding, carries data, or is sealed for another slot.
+    for (const lie of [
+      seal(2, MINT, 1n, blinding),
+      seal(2, SOL_MINT, 250_000000n, blinding),
+      seal(2, MINT, 250_000000n, new Uint8Array(32)),
+      seal(2, MINT, 250_000000n, blinding, false),
+      seal(1, MINT, 250_000000n, blinding),
+      new Uint8Array(10),
+    ]) {
+      expect(await refusal(checkKeeperTransaction(await build({ data: (slot, h) => (slot === 2 ? lie : h) }), expected("redeem"), hashing))).toMatch(/output 2 would not show up in your private balance/);
+    }
+    // The slot index counts data-bearing slots only.
+    const skip = await build({ data: (slot, h) => (slot === 0 ? null : slot === 2 ? Uint8Array.of(1, ...h.subarray(1)) : h) });
+    expect((await checkKeeperTransaction(skip, expected("redeem"), hashing)).now).toBe(BigInt(NOW));
+    // A payout of nothing (the draw's collateral slot here) has nothing to find.
+    expect((await checkKeeperTransaction(await build({ op: "draw", data: (slot, h) => (slot === 3 ? null : h) }), expected("draw"), hashing)).bound).toBeDefined();
   });
 
   it("refuses a new receipt or position encrypted to another viewing key", async () => {
