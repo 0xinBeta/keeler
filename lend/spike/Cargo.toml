@@ -1,0 +1,64 @@
+[package]
+name = "lend-spike"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# Part 1 of docs/plan-lend.md section 0: proves the toolkit can do what the
+# lend program needs. Results in ../SPIKE.md. Not deployed anywhere.
+[lib]
+name = "lend_spike"
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["insecure-test-setup"]
+insecure-test-setup = []
+bpf-entrypoint = []
+circuits = ["dep:xark", "spr-program/client"]
+wasm = ["dep:xark", "spr-program/wasm"]
+build-circuits = ["circuits", "spr-program/build"]
+
+[dependencies]
+xark = { workspace = true, optional = true }
+borsh = { workspace = true }
+groth16-solana = { workspace = true, features = ["bsb22"] }
+light-program-profiler = { workspace = true }
+pinocchio = { workspace = true, features = ["cpi"] }
+solana-address = { workspace = true, features = ["curve25519"] }
+solana-program-error = { workspace = true }
+wincode = { workspace = true }
+spr-account-checks = { workspace = true }
+spr-hasher = { workspace = true }
+spr-interface = { workspace = true }
+spr-program = { workspace = true, features = ["cpi", "compression", "verifier"] }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+serde_json = "1"
+xark-groth16 = { workspace = true }
+ark-ec = { version = "0.6", default-features = false, features = ["std", "parallel"] }
+ark-poly = { version = "0.6", default-features = false, features = ["std", "parallel"] }
+solana-instruction = { workspace = true }
+solana-keypair = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+solana-signer = { workspace = true }
+spr-client = { workspace = true, features = ["reqwest", "solana-rpc"] }
+spr-keypair = { workspace = true }
+spr-program = { workspace = true, features = ["client"] }
+spr-program-test = { workspace = true, features = ["localnet"] }
+spr-transaction = { workspace = true }
+
+[[test]]
+name = "spike"
+path = "tests/spike.rs"
+required-features = ["circuits"]
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = [
+    'cfg(xark)',
+    'cfg(xark_client)',
+    'cfg(target_os, values("solana"))',
+    'cfg(feature, values("profile-heap"))',
+]

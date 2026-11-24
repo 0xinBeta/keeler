@@ -1,0 +1,3 @@
+target/
+# The prover's log, written next to whichever crate starts it.
+test-ledger/
