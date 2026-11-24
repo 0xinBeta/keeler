@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import worker, { PRICE_UPDATE_V2, type Env } from "../src/index";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import worker, { PRICE_UPDATE_V2, base58Key, type Env } from "../src/index";
+// Signed requests the page's own signer made from fixed keys (web/src/keeler/lend-auth.ts); the keeper's tests use it too.
+import fixture from "../../web/tests/fixtures/lend-requests.json";
 
 const KEY = "HELIUSSECRET123";
 const DKEY = "DEALERSECRET456";
 const SIG = "ab".repeat(64);
+const hexBytes = (h: string) => Uint8Array.from(h.match(/../g) ?? [], (b) => parseInt(b, 16));
 const MINT_A = "So11111111111111111111111111111111111111112";
 const MINT_B = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const TRADER = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
@@ -194,7 +197,7 @@ describe("/api/rpc", () => {
       expect(res.status).toBe(503);
       expect(body.error).toContain("Rate limiting");
     }
-    expect((await call(post("/v1/spr/prove/merge_8_1", {}), env({ PROVE_GLOBAL_LIMIT: undefined }))).res.status).toBe(503);
+    expect((await call(post("/v1/spr/prove/merge_8_1", { circuitType: "merge" }), env({ PROVE_GLOBAL_LIMIT: undefined }))).res.status).toBe(503);
     expect((await call(post("/api/quotes", {}), env({ QUOTE_LIMIT: undefined }))).res.status).toBe(503);
     expect(calls).toHaveLength(0);
     const local = env({ NETWORK: "local", RPC_LIMIT: undefined, RPC_GLOBAL_LIMIT: undefined });
@@ -228,7 +231,7 @@ describe("/v1/spr/*", () => {
     const e = env({ NETWORK: "local", HELIUS_API_KEY: undefined, UPSTREAM_INDEXER: "http://127.0.0.1:8784/", UPSTREAM_PROVER: "http://127.0.0.1:3001" });
     await call(post("/v1/spr/getUserRecords", { jsonrpc: "2.0" }), e);
     await call(req("/v1/spr/attestation?nonce=ab"), e);
-    await call(post("/v1/spr/prove/merge_8_1/indexed", {}, { "spr-tee": "v1" }), e);
+    await call(post("/v1/spr/prove/merge_8_1/indexed", { circuitType: "merge" }, { "spr-tee": "v1" }), e);
     expect(calls.map((c) => [c.init.method, c.url])).toEqual([
       ["POST", "http://127.0.0.1:8784/getUserRecords"],
       ["GET", "http://127.0.0.1:3001/attestation?nonce=ab"],
@@ -438,8 +441,8 @@ describe("round 2", () => {
     const seen: string[] = [];
     const named = (name: string, ok: boolean) => ({ limit: async () => (seen.push(name), { success: ok }) }) as RateLimit;
     const e = env({ SPR_LIMIT: named("spr", true), PROVE_LIMIT: named("prove", false), RPC_LIMIT: named("rpc", true) });
-    expect((await call(post("/v1/spr/prove/merge_8_1", {}), e)).res.status).toBe(429);
-    expect((await call(post("/v1/spr/prove/merge_8_1/indexed", {}), e)).res.status).toBe(429);
+    expect((await call(post("/v1/spr/prove/merge_8_1", { circuitType: "merge" }), e)).res.status).toBe(429);
+    expect((await call(post("/v1/spr/prove/merge_8_1/indexed", { circuitType: "merge" }), e)).res.status).toBe(429);
     expect((await call(req("/v1/spr/prove/merge_8_1/status?jobId=a"), e)).res.status).toBe(200);
     expect((await call(post("/v1/spr/getMerkleProofs", {}), e)).res.status).toBe(200);
     expect(seen).toEqual(["prove", "prove", "spr", "spr"]);
@@ -450,13 +453,14 @@ describe("round 2", () => {
   it("allows indexer replies up to 10 MiB, prover replies up to 1 MiB", async () => {
     mockFetch(() => new Response(new Uint8Array(5 * 1024 * 1024)));
     expect((await worker.fetch(post("/v1/spr/getEncryptedUtxosByTags", {}), env())).status).toBe(200);
-    expect((await worker.fetch(post("/v1/spr/prove/merge_8_1", {}), env())).status).toBe(502);
+    expect((await worker.fetch(post("/v1/spr/prove/merge_8_1", { circuitType: "merge" }), env())).status).toBe(502);
     mockFetch(() => new Response(new Uint8Array(10 * 1024 * 1024 + 1)));
     expect((await worker.fetch(post("/v1/spr/getEncryptedUtxosByTags", {}), env())).status).toBe(502);
   });
 });
 
 describe("proof requests and the global prover limit", () => {
+  const ENC = "e1".repeat(32);
   it("charges the global limit only for a well-formed proof request", async () => {
     mockFetch(() => Response.json({}));
     const seen: string[] = [];
@@ -469,17 +473,22 @@ describe("proof requests and the global prover limit", () => {
       [post("/v1/spr/prove/merge_8_1", ""), 400],
       [raw("{}", { "content-type": "text/plain" }), 415],
       [raw("{}", {}), 415],
-      [raw(new Uint8Array(32), { "content-type": "application/octet-stream", "spr-tee": "v1" }), 400],
-      [raw(new Uint8Array(8), { "content-type": "application/octet-stream", "spr-tee": "v1", "spr-tee-enc": "ee" }), 400],
+      [raw(new Uint8Array(64), { "content-type": "application/octet-stream", "spr-tee": "v1" }), 400],
+      [raw(new Uint8Array(8), { "content-type": "application/octet-stream", "spr-tee": "v1", "spr-tee-enc": ENC }), 400],
+      [raw(new Uint8Array(64), { "content-type": "application/octet-stream", "spr-tee": "v2", "spr-tee-enc": ENC }), 400],
+      [raw(new Uint8Array(64), { "content-type": "application/octet-stream", "spr-tee": "v1", "spr-tee-enc": "ee" }), 400],
+      [post("/v1/spr/prove/merge_8_1", {}), 400],
+      [post("/v1/spr/prove/merge_8_1", { a: 1 }), 400],
+      [post("/v1/spr/prove/merge_8_1", { circuitType: "a b" }), 400],
       [post("/v1/spr/prove/merge_8_1", "x".repeat(1024 * 1024 + 65)), 413],
     ] as const) {
       expect((await call(r, e)).res.status).toBe(status);
     }
-    expect(seen).toEqual(Array(8).fill("client"));
+    expect(seen).toEqual(Array(13).fill("client"));
     expect(calls).toHaveLength(0);
     seen.length = 0;
-    expect((await call(post("/v1/spr/prove/merge_8_1", { a: 1 }, { "content-type": "application/json; charset=utf-8" }), e)).res.status).toBe(200);
-    expect((await call(raw(new Uint8Array(32), { "content-type": "application/octet-stream", "spr-tee": "v1", "spr-tee-enc": "ee" }), e)).res.status).toBe(200);
+    expect((await call(post("/v1/spr/prove/merge_8_1", { circuitType: "merge", a: 1 }, { "content-type": "application/json; charset=utf-8" }), e)).res.status).toBe(200);
+    expect((await call(raw(new Uint8Array(64), { "content-type": "application/octet-stream", "spr-tee": "v1", "spr-tee-enc": ENC }), e)).res.status).toBe(200);
     expect(seen).toEqual(["client", "global", "client", "global"]);
     expect(calls).toHaveLength(2);
   });
@@ -495,25 +504,47 @@ describe("proof requests and the global prover limit", () => {
 });
 
 describe("/api/lend/*", () => {
-  const PROGRAM = "Lend1111111111111111111111111111111111111111";
+  const PROGRAM = fixture.program_id;
   const POOLS = [{
     mint: MINT_B,
     curve: [{ utilisationBps: 0, rateBps: 0 }, { utilisationBps: 8800, rateBps: 500 }, { utilisationBps: 9300, rateBps: 700 }, { utilisationBps: 10000, rateBps: 1500 }],
     feeBps: 1000, maxUtilisationBps: 9500, minSupply: "1000000",
   }];
   const VAULTS = [{
-    id: 0, collateralMint: MINT_A, debtMint: MINT_B, cfBps: 8000, ltBps: 8500, lmlBps: 9000, penaltyBps: 100, minCollateral: "10000000", minDebt: "1000000",
+    id: 1, collateralMint: MINT_A, debtMint: MINT_B, cfBps: 8000, ltBps: 8500, lmlBps: 9000, penaltyBps: 100, minCollateral: "10000000", minDebt: "1000000",
   }];
-  const LIMITS = ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT", "LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT", "LEND_BUILD_LIMIT", "LEND_BUILD_GLOBAL_LIMIT"] as const;
+  const LIMITS = ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT", "LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT", "LEND_BUILD_LIMIT"] as const;
   const lendEnv = (over: Partial<Env> = {}) => env({
     LEND_PROGRAM_ID: PROGRAM, LEND_POOLS: JSON.stringify(POOLS), LEND_VAULTS: JSON.stringify(VAULTS),
+    ASSETS: JSON.stringify([{ mint: MINT_A, symbol: "tSOL", decimals: 9 }, { mint: MINT_B, symbol: "tUSD", decimals: 6 }]),
     ...Object.fromEntries(LIMITS.map((n) => [n, allow])), ...over,
   });
-  const SIGNED = { wallet: TRADER, nonce: "0f".repeat(16), timestamp: 1_800_000_000, sessionKey: MINT_A, sessionExpiry: 1_800_086_340, sessionAuth: SIG, signature: SIG };
+  const [ACCOUNT_REQ, TICKET_REQ, BUILD_REQ] = fixture.requests as unknown as { method: string; path: string; fields: Record<string, string | number> }[];
+  // In the order the Worker forwards a query.
+  const SIGNED = Object.fromEntries(["wallet", "nonce", "timestamp", "sessionKey", "sessionExpiry", "sessionAuth", "signature"].map((k) => [k, ACCOUNT_REQ!.fields[k]!]));
   const query = (o: Record<string, unknown>) => "?" + new URLSearchParams(Object.entries(o).map(([k, v]) => [k, String(v)]));
-  const TICKET = { ...SIGNED, purpose: "supply", pool: MINT_B, amount: "5000000" };
-  const BUILD = { ...SIGNED, op: "draw", vault: 0, position: "7", borrow: "1000000", withdraw: "0" };
-  const REDEEM = { ...SIGNED, op: "redeem", pool: MINT_B, shares: "5000000" };
+  const TICKET = TICKET_REQ!.fields;
+  const BUILD = BUILD_REQ!.fields;
+  /** `body` signed by the fixture's session as the page signs it (docs/lend-api.md, "Request bytes"). */
+  const sessionKey = crypto.subtle.importKey("pkcs8", Uint8Array.from([...hexBytes("302e020100300506032b657004220420"), ...hexBytes(fixture.session.seed_hex)]), { name: "Ed25519" }, false, ["sign"]);
+  async function signed(path: string, body: Record<string, string | number>, nonce = "0e".repeat(16)) {
+    const f: Record<string, string | number> = { ...body, wallet: fixture.wallet.address, sessionKey: fixture.session.key, sessionExpiry: fixture.session.expiry, sessionAuth: fixture.session.auth_hex, nonce, timestamp: fixture.now };
+    const canonical = Object.keys(f).filter((k) => !["signature", "nonce", "timestamp"].includes(k)).sort().map((k) => `${k}=${f[k]}\n`).join("");
+    const time = new Uint8Array(8);
+    new DataView(time.buffer).setBigUint64(0, BigInt(fixture.now), true);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical)));
+    const message = Uint8Array.from([...new TextEncoder().encode(`keeler-lend-request-v1\nPOST\n${path}\n`), ...hexBytes(nonce), ...time, ...digest]);
+    const sig = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, await sessionKey, message));
+    return { ...f, signature: [...sig].map((b) => b.toString(16).padStart(2, "0")).join("") };
+  }
+  let REDEEM: Record<string, string | number>;
+  let REDEEM_AMOUNT: Record<string, string | number>;
+  let REDEEM_RECEIPT: Record<string, string | number>;
+  beforeAll(async () => {
+    REDEEM = await signed("/lend/build", { op: "redeem", pool: MINT_B, shares: "5000000" });
+    REDEEM_AMOUNT = await signed("/lend/build", { op: "redeem", pool: MINT_B, amount: "1000000" });
+    REDEEM_RECEIPT = await signed("/lend/build", { op: "redeem", pool: MINT_B, shares: "5000000", receipt: "cd".repeat(32) });
+  });
   const TX = "A".repeat(5464); // 4,096 bytes
   const OUT = "cd".repeat(32);
   const POOLS_REPLY = { pools: [{ mint: MINT_B, at: 1_800_000_000, size: "1000000000", utilisationBps: 5000, supplyRateBps: 120, borrowRateBps: 280 }] };
@@ -587,7 +618,7 @@ describe("/api/lend/*", () => {
     expect(JSON.parse(calls[3]!.init.body as string)).toEqual(BUILD);
     expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([10000, 10000, 10000, 30000]);
     // A redeem of everything names its shares, and a partial one its amount.
-    for (const body of [REDEEM, { ...SIGNED, op: "redeem", pool: MINT_B, amount: "1000000" }, { ...REDEEM, receipt: OUT }]) {
+    for (const body of [REDEEM, REDEEM_AMOUNT, REDEEM_RECEIPT]) {
       expect((await call(post("/api/lend/build", body), lendEnv())).res.status).toBe(200);
       expect(JSON.parse(calls.at(-1)!.init.body as string)).toEqual(body);
     }
@@ -661,30 +692,33 @@ describe("/api/lend/*", () => {
     expect((await call(req("/api/lend/account" + query(SIGNED)), lendEnv())).res.status).toBe(502);
   });
 
-  it("charges the client limit first and the global limit only after validation", async () => {
+  it("charges the client limit first and the global limit only after validation and the signatures", async () => {
     mockFetch(() => Response.json({ id: "ab".repeat(16), expiry: 1, signature: SIG }));
     const seen: string[] = [];
     const named = (name: string, ok = true) => ({ limit: async ({ key }: { key: string }) => (seen.push(`${name}:${key}`), { success: ok }) }) as RateLimit;
     const e = lendEnv(Object.fromEntries(LIMITS.map((n) => [n, named(n)])));
     const ip = { "cf-connecting-ip": "2001:db8:a:b:1:2:3:4" };
     await call(post("/api/lend/ticket", { ...TICKET, extra: 1 }, ip), e);
+    await call(post("/api/lend/ticket", { ...TICKET, signature: SIG }, ip), e);
     await call(post("/api/lend/ticket", TICKET, ip), e);
     await call(post("/api/lend/build", BUILD, ip), e);
     await call(req("/api/lend/pools", { headers: ip }), e);
     await call(req("/api/lend/account", { headers: ip }), e);
     expect(seen).toEqual([
       "LEND_TICKET_LIMIT:2001:db8:a:b::/64",
+      "LEND_TICKET_LIMIT:2001:db8:a:b::/64",
       "LEND_TICKET_LIMIT:2001:db8:a:b::/64", "LEND_TICKET_GLOBAL_LIMIT:global",
-      "LEND_BUILD_LIMIT:2001:db8:a:b::/64", "LEND_BUILD_GLOBAL_LIMIT:global",
+      // A build has no global limit: the keeper's lane paces builds.
+      "LEND_BUILD_LIMIT:2001:db8:a:b::/64",
       "LEND_READ_LIMIT:2001:db8:a:b::/64", "LEND_READ_GLOBAL_LIMIT:global",
       "LEND_READ_LIMIT:2001:db8:a:b::/64",
     ]);
+    const route: Record<(typeof LIMITS)[number], number> = { LEND_READ_LIMIT: 0, LEND_READ_GLOBAL_LIMIT: 0, LEND_TICKET_LIMIT: 2, LEND_TICKET_GLOBAL_LIMIT: 2, LEND_BUILD_LIMIT: 3 };
     for (const n of LIMITS) {
       mockFetch(() => Response.json({}));
-      const i = LIMITS.indexOf(n) >> 1;
-      const { res } = await call(routes()[[0, 2, 3][i]!]!, lendEnv({ [n]: named(n, false) }));
+      const { res } = await call(routes()[route[n]]!, lendEnv({ [n]: named(n, false) }));
       expect(res.status, n).toBe(429);
-      const missing = await call(routes()[[0, 2, 3][i]!]!, lendEnv({ [n]: undefined }));
+      const missing = await call(routes()[route[n]]!, lendEnv({ [n]: undefined }));
       expect(missing.res.status, n).toBe(503);
       expect(missing.body.error).toContain("Rate limiting");
       expect(calls).toHaveLength(0);
@@ -692,6 +726,66 @@ describe("/api/lend/*", () => {
     mockFetch(() => Response.json(POOLS_REPLY));
     const local = lendEnv({ NETWORK: "local", ...Object.fromEntries(LIMITS.map((n) => [n, undefined])) });
     expect((await call(req("/api/lend/pools"), local)).res.status).toBe(200);
+  });
+
+  it("checks the wallet's authorisation and the session's signature before anything global or the keeper", async () => {
+    mockFetch(() => Response.json({ id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG }));
+    const seen: string[] = [];
+    const named = (name: string) => ({ limit: async () => (seen.push(name), { success: true }) }) as RateLimit;
+    const e = lendEnv(Object.fromEntries(LIMITS.map((n) => [n, named(n)])));
+    const flip = (h: string) => (h[0] === "0" ? "1" : "0") + h.slice(1);
+    const forged: Request[] = [
+      post("/api/lend/ticket", { ...TICKET, signature: flip(String(TICKET.signature)) }),
+      post("/api/lend/ticket", { ...TICKET, sessionAuth: flip(String(TICKET.sessionAuth)) }),
+      post("/api/lend/ticket", { ...TICKET, amount: "250000001" }), // a field the signature covers
+      post("/api/lend/ticket", { ...TICKET, nonce: "09".repeat(16) }), // and the nonce, by position
+      post("/api/lend/ticket", { ...TICKET, sessionExpiry: Number(TICKET.sessionExpiry) + 1 }), // the authorised expiry
+      post("/api/lend/ticket", { ...TICKET, wallet: TRADER }), // someone else's wallet
+      post("/api/lend/build", { ...BUILD, timestamp: Number(BUILD.timestamp) + 1 }),
+      post("/api/lend/build", { ...BUILD, signature: TICKET.signature }), // another request's signature
+      req("/api/lend/account" + query({ ...SIGNED, signature: SIG })),
+    ];
+    for (const r of forged) expect((await call(r, e)).res.status, r.url).toBe(401);
+    // Authorised for another program or network.
+    expect((await call(post("/api/lend/ticket", TICKET), lendEnv({ LEND_PROGRAM_ID: TRADER, ASSETS: lendEnv().ASSETS }))).res.status).toBe(401);
+    expect((await call(post("/api/lend/ticket", TICKET), lendEnv({ NETWORK: "mainnet" }))).res.status).toBe(401);
+    expect(calls).toHaveLength(0);
+    expect(seen.every((n) => !n.includes("GLOBAL"))).toBe(true);
+    // The page's own signed requests pass, byte for byte.
+    for (const r of [req("/api/lend/account" + query(SIGNED)), post("/api/lend/ticket", TICKET), post("/api/lend/build", BUILD)]) {
+      expect((await call(r, lendEnv())).res.status).not.toBe(401);
+    }
+  });
+
+  it("never holds a repayment ticket back on the global ticket limit", async () => {
+    mockFetch(() => Response.json({ id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG }));
+    const full = { limit: async () => ({ success: false }) } as RateLimit;
+    const e = lendEnv({ LEND_TICKET_GLOBAL_LIMIT: full });
+    const repay = await signed("/lend/ticket", { purpose: "repay", amount: "1000000", vault: 1, position: "7" });
+    expect((await call(post("/api/lend/ticket", repay), e)).res.status).toBe(200);
+    const deposit = await signed("/lend/ticket", { purpose: "deposit", amount: "1000000", vault: 1, position: "7" });
+    expect((await call(post("/api/lend/ticket", deposit), e)).res.status).toBe(429);
+    // Its own client limit still applies.
+    expect((await call(post("/api/lend/ticket", repay), lendEnv({ LEND_TICKET_LIMIT: full }))).res.status).toBe(429);
+  });
+
+  it("sends lending to LEND_KEEPER_URL when it is set", async () => {
+    mockFetch(() => Response.json(POOLS_REPLY));
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPER_URL: "https://keeper.example/" }))).res.status).toBe(200);
+    expect(calls[0]!.url).toBe("https://keeper.example/lend/pools");
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPER_URL: "keeper.example" }))).res.status).toBe(500);
+  });
+
+  it("refuses lend settings whose mints are not in ASSETS", async () => {
+    expect((await call(req("/api/config"), lendEnv({ ASSETS: JSON.stringify([{ mint: MINT_A, symbol: "tSOL", decimals: 9 }]) }))).res.status).toBe(500);
+    expect((await call(req("/api/config"), lendEnv({ ASSETS: JSON.stringify([{ mint: MINT_B, symbol: "tUSD", decimals: 6 }]) }))).res.status).toBe(500);
+  });
+
+  it("reads base58 keys of 32 bytes only", () => {
+    expect(base58Key("11111111111111111111111111111111")).toEqual(new Uint8Array(32));
+    expect(base58Key(fixture.wallet.address)?.length).toBe(32);
+    expect(base58Key("1111111111111111111111111111111")).toBeNull(); // 31 bytes
+    expect(base58Key("0OIl")).toBeNull();
   });
 
   it("PAUSED does not touch lending: every route still reaches the keeper, whose own pause answers", async () => {

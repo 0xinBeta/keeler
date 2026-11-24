@@ -38,7 +38,7 @@ export interface Env {
   LEND_TICKET_LIMIT?: RateLimit;
   LEND_TICKET_GLOBAL_LIMIT?: RateLimit;
   LEND_BUILD_LIMIT?: RateLimit;
-  LEND_BUILD_GLOBAL_LIMIT?: RateLimit;
+  LEND_KEEPER_URL?: string;
 }
 
 const RPC_BODY_CAP = 64 * 1024;
@@ -165,7 +165,7 @@ export function clientKey(ip: string | null): string {
 }
 
 type LimitName = "RPC_LIMIT" | "RPC_GLOBAL_LIMIT" | "SPR_LIMIT" | "SPR_GLOBAL_LIMIT" | "PROVE_LIMIT" | "PROVE_GLOBAL_LIMIT" | "QUOTE_LIMIT" | "FAUCET_LIMIT"
-  | "LEND_READ_LIMIT" | "LEND_READ_GLOBAL_LIMIT" | "LEND_TICKET_LIMIT" | "LEND_TICKET_GLOBAL_LIMIT" | "LEND_BUILD_LIMIT" | "LEND_BUILD_GLOBAL_LIMIT";
+  | "LEND_READ_LIMIT" | "LEND_READ_GLOBAL_LIMIT" | "LEND_TICKET_LIMIT" | "LEND_TICKET_GLOBAL_LIMIT" | "LEND_BUILD_LIMIT";
 
 /**
  * Charges `times` units to a limiter, keyed per client unless `global`. A missing binding is no
@@ -314,6 +314,11 @@ function lendConfig(env: Env): LendConfig | undefined {
     mints.has(v.debtMint) && (v.cfBps as number) <= (v.ltBps as number) && (v.ltBps as number) <= (v.lmlBps as number) &&
     vaults.findIndex((w) => w.id === v.id) === i);
   if (!ok || mints.size !== pools.length) throw new Fail(500, "The server settings LEND_POOLS and LEND_VAULTS do not fit together.");
+  // The page reads every lend amount with the token's decimals from ASSETS.
+  const listed = new Set(assets(env).map((a) => a.mint));
+  if ([...mints, ...vaults.map((v) => v.collateralMint)].some((m) => !listed.has(m as string))) {
+    throw new Fail(500, "Every LEND_POOLS and LEND_VAULTS mint must be in ASSETS.");
+  }
   return { programId: env.LEND_PROGRAM_ID, pools, vaults };
 }
 
@@ -576,7 +581,7 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
     body = read;
   }
   if (proving) checkProofRequest(headers, body!);
-  // Global spend is charged only for a request that passed every check, so junk cannot use it up.
+  // Global spend is charged only for a request that passed every check, so malformed requests cannot use it up.
   await limit(env, proving ? "PROVE_GLOBAL_LIMIT" : "SPR_GLOBAL_LIMIT", request, 1, true);
   const local = env.NETWORK === "local";
   const base = isIndexer
@@ -607,8 +612,10 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
 function checkProofRequest(headers: Headers, body: Uint8Array) {
   const type = (headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
   if (type === "application/octet-stream") {
-    if (headers.get("spr-tee") === null || headers.get("spr-tee-enc") === null || body.byteLength < 16) {
-      throw new Fail(400, "An encrypted proof request needs Spr-Tee, Spr-Tee-Enc and a body.");
+    // dist/client/prover/tee/encryption.js: version "v1", the HPKE X25519 encapsulated key as 64 hex, and a sealed
+    // JSON body (its 16-byte tag plus at least a `{"circuitType":…}` object).
+    if (headers.get("spr-tee") !== "v1" || !/^[0-9a-f]{64}$/.test(headers.get("spr-tee-enc") ?? "") || body.byteLength < 16 + 20) {
+      throw new Fail(400, "An encrypted proof request needs Spr-Tee v1, a 32-byte Spr-Tee-Enc and a sealed body.");
     }
     return;
   }
@@ -617,7 +624,11 @@ function checkProofRequest(headers: Headers, body: Uint8Array) {
   try {
     v = JSON.parse(new TextDecoder().decode(body));
   } catch {}
-  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new Fail(400, "The proof request must be a JSON object.");
+  // Every SDK proof request (proverRequest, mergeProverRequest, indexedRequestEnvelope) names its circuit.
+  const circuit = (v as { circuitType?: unknown } | null)?.circuitType;
+  if (typeof v !== "object" || v === null || Array.isArray(v) || typeof circuit !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(circuit)) {
+    throw new Fail(400, "The proof request must be a JSON object naming its circuitType.");
+  }
 }
 
 // ---- /api/tee-policy ----
@@ -752,7 +763,7 @@ const ACCOUNT_REPLY: Spec = {
 };
 
 type LendRoute = {
-  method: "GET" | "POST"; keeper: string; limits: [LimitName, LimitName]; timeoutMs: number;
+  method: "GET" | "POST"; keeper: string; limits: [LimitName, LimitName | null]; timeoutMs: number;
   /** The query for a GET, the body for a POST. */
   request: Spec; reply: Spec;
 };
@@ -760,14 +771,86 @@ const LEND_ROUTES: Record<string, LendRoute> = {
   "/api/lend/pools": { method: "GET", keeper: "/lend/pools", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: {}, reply: POOLS_REPLY },
   "/api/lend/account": { method: "GET", keeper: "/lend/account", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: SIGNED, reply: ACCOUNT_REPLY },
   "/api/lend/ticket": { method: "POST", keeper: "/lend/ticket", limits: ["LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: TICKET_REQUEST, reply: TICKET_REPLY },
-  "/api/lend/build": { method: "POST", keeper: "/lend/build", limits: ["LEND_BUILD_LIMIT", "LEND_BUILD_GLOBAL_LIMIT"], timeoutMs: LEND_BUILD_TIMEOUT_MS, request: BUILD_REQUEST, reply: BUILD_REPLY },
+  "/api/lend/build": { method: "POST", keeper: "/lend/build", limits: ["LEND_BUILD_LIMIT", null], timeoutMs: LEND_BUILD_TIMEOUT_MS, request: BUILD_REQUEST, reply: BUILD_REPLY },
 };
 
-// shortcut: one keeper, the first DEALERS entry; return a list here when there is more than one.
+// shortcut: one keeper, LEND_KEEPER_URL or else the first DEALERS entry; return a list here when there is more than one.
 function keeper(env: Env): { url: string } {
+  if (env.LEND_KEEPER_URL !== undefined) {
+    if (!/^https?:\/\/[^\s/]+/.test(env.LEND_KEEPER_URL)) throw new Fail(500, "The server setting LEND_KEEPER_URL is malformed.");
+    return { url: env.LEND_KEEPER_URL };
+  }
   const first = dealers(env)[0];
   if (first === undefined) throw new Fail(503, "No lending keeper is configured.");
   return first;
+}
+
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+/** A base58 Solana address as its 32 bytes, or null. */
+export function base58Key(s: string): Uint8Array | null {
+  let n = 0n;
+  for (const c of s) {
+    const d = B58.indexOf(c);
+    if (d < 0) return null;
+    n = n * 58n + BigInt(d);
+  }
+  const body: number[] = [];
+  for (; n > 0n; n >>= 8n) body.unshift(Number(n & 0xffn));
+  // Each leading "1" is a leading zero byte.
+  const bytes = [...Array(s.length - s.replace(/^1+/, "").length).fill(0), ...body];
+  return bytes.length === 32 ? Uint8Array.from(bytes) : null;
+}
+
+const fromHex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (b) => parseInt(b, 16));
+const utf8 = (s: string) => new TextEncoder().encode(s);
+
+async function ed25519(key: string, signatureHex: string, message: Uint8Array): Promise<boolean> {
+  const raw = base58Key(key);
+  if (raw === null) return false;
+  try {
+    const k = await crypto.subtle.importKey("raw", raw, { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, k, fromHex(signatureHex), message);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The keeper's signature checks 2 and 3 (docs/lend-api.md, "What the keeper checks"), so a request that is not
+ * signed by a session its wallet authorised never reaches a global limit or the keeper. Expiry, freshness and
+ * replay need chain time and the keeper's nonce store: they stay the keeper's.
+ */
+export async function signedByWallet(env: Env, method: string, keeperPath: string, f: Record<string, unknown>): Promise<boolean> {
+  const expiry = f.sessionExpiry as number;
+  let iso: string;
+  try {
+    iso = new Date(expiry * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  } catch {
+    return false;
+  }
+  const auth = [
+    "Keeler Lend: allow this browser session",
+    "",
+    "This lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.",
+    "",
+    `Network: ${env.NETWORK}`,
+    `Program: ${env.LEND_PROGRAM_ID}`,
+    `Wallet: ${f.wallet}`,
+    `Session key: ${f.sessionKey}`,
+    `Expires: ${expiry} (${iso})`,
+  ].join("\n");
+  if (!(await ed25519(f.wallet as string, f.sessionAuth as string, utf8(auth)))) return false;
+  const canonical = Object.keys(f)
+    .filter((k) => k !== "signature" && k !== "nonce" && k !== "timestamp")
+    .sort()
+    .map((k) => `${k}=${String(f[k])}\n`)
+    .join("");
+  const head = utf8(`keeler-lend-request-v1\n${method}\n${keeperPath}\n`);
+  const time = new Uint8Array(8);
+  new DataView(time.buffer).setBigUint64(0, BigInt(f.timestamp as number), true);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", utf8(canonical)));
+  const message = new Uint8Array([...head, ...fromHex(f.nonce as string), ...time, ...digest]);
+  return ed25519(f.sessionKey as string, f.signature as string, message);
 }
 
 async function lend(request: Request, env: Env, url: URL, path: string): Promise<Response> {
@@ -781,21 +864,30 @@ async function lend(request: Request, env: Env, url: URL, path: string): Promise
 
   let body: string | undefined;
   let query = "";
+  let fields: Record<string, unknown> = {};
   if (route.method === "POST") {
     const clean = shaped(await smallJson(request, LEND_BODY_CAP), route.request);
     if (clean === null || (route.request === BUILD_REQUEST && !buildFits(clean))) throw new Fail(400, `The request body does not have the fields ${route.keeper} takes.`);
     body = JSON.stringify(clean);
+    fields = clean;
   } else {
     const params = [...url.searchParams];
     const given = Object.fromEntries(params.map(([k, v]) => [k, (k === "timestamp" || k === "sessionExpiry") && /^(0|[1-9][0-9]{0,15})$/.test(v) ? Number(v) : v]));
     const clean = params.length === Object.keys(given).length ? shaped(given, route.request) : null;
     if (clean === null) throw new Fail(400, `The query does not have the fields ${route.keeper} takes.`);
     if (params.length > 0) query = "?" + new URLSearchParams(Object.entries(clean).map(([k, v]) => [k, String(v)]));
+    fields = clean;
   }
   const key = dealerKey(env);
   const target = keeper(env);
-  // Charged only once the request passed every check.
-  await limit(env, route.limits[1], request, 1, true);
+  if ("signature" in route.request && !(await signedByWallet(env, route.method, route.keeper, fields))) {
+    throw new Fail(401, "This request is not signed by a lending session its wallet authorised.");
+  }
+  // Charged only once the request passed every check, signatures included. A repayment ticket is never held
+  // back by other people's traffic (its client limit still applies), and a build has no global limit: the
+  // keeper's one-at-a-time lane (409) paces builds, and a build that would prove needs the wallet's own note.
+  const global = route.limits[1];
+  if (global !== null && !(path === "/api/lend/ticket" && fields.purpose === "repay")) await limit(env, global, request, 1, true);
 
   const response = await askDealer(target.url, route.keeper + query, key, body, route.timeoutMs);
   if (response === null) throw new Fail(502, "The lending keeper did not answer.");
