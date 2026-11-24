@@ -14,6 +14,8 @@ pub use intent::*;
 // Earn.
 mod redeem;
 mod supply;
+pub use redeem::*;
+pub use supply::*;
 // Vault.
 mod close;
 mod deposit;

@@ -36,9 +36,11 @@ pub enum LendError {
     /// Cancel is allowed only after the intent's expiry.
     NotExpired = 20_300,
 
+    // supply.
+    /// The clock is past the intent's expiry: only `cancel_intent` takes it.
+    IntentExpired = 20_400,
+
     // Stubs: each later instruction answers this until it is built.
-    SupplyNotBuilt = 20_400,
-    RedeemNotBuilt = 20_500,
     DepositNotBuilt = 20_600,
     DrawNotBuilt = 20_700,
     RepayNotBuilt = 20_800,

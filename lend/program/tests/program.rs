@@ -141,8 +141,6 @@ fn dispatch_refuses_empty_and_unknown_tags() {
 fn unbuilt_instructions_refuse_with_their_own_code() {
     let (mollusk, id) = setup();
     for (ix, err) in [
-        (tag::SUPPLY, LendError::SupplyNotBuilt),
-        (tag::REDEEM, LendError::RedeemNotBuilt),
         (tag::DEPOSIT, LendError::DepositNotBuilt),
         (tag::DRAW, LendError::DrawNotBuilt),
         (tag::REPAY, LendError::RepayNotBuilt),

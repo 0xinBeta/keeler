@@ -29,7 +29,7 @@ wasm=$lend/target/wasm
 # cross-origin isolation), as for the swap.
 "$ZOLANA_CLI_BIN" zk compile --test --single-threaded --wasm-out "$wasm" --manifest-path program/Cargo.toml
 
-circuits=(init_reserve intent cancel_intent)
+circuits=(init_reserve intent cancel_intent supply redeem)
 sums=$(cd "$keys" && for c in "${circuits[@]}"; do shasum -a 256 "$c"/circuit.xbc "$c"/pk.bin "$c"/vk.bin; done)
 if $update; then
     printf '%s\n' "$sums" >"$lend/lend-keys.CHECKSUM"
