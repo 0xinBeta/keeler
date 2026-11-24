@@ -257,18 +257,35 @@ fn redeem_refuses_a_stale_now_and_a_transact_without_inputs() {
     let mollusk = setup();
     let owner = Pubkey::new_unique();
     for now in [NOW - 121, NOW + 1] {
-        let (ix, accounts) = redeem(pk(&KEEPER), owner, (true, true), &redeem_args(&owner, now), 2);
+        let (ix, accounts) = redeem(
+            pk(&KEEPER),
+            owner,
+            (true, true),
+            &redeem_args(&owner, now),
+            2,
+        );
         expect_err_exact(&mollusk, &ix, &accounts, code(LendError::StaleNow));
     }
-    let (ix, accounts) = redeem(pk(&KEEPER), owner, (true, true), &redeem_args(&owner, NOW), 0);
+    let (ix, accounts) = redeem(
+        pk(&KEEPER),
+        owner,
+        (true, true),
+        &redeem_args(&owner, NOW),
+        0,
+    );
     expect_err_exact(
         &mollusk,
         &ix,
         &accounts,
         code(LendError::InvalidInstructionData),
     );
-    let (mut ix, accounts) =
-        redeem(pk(&KEEPER), owner, (true, true), &redeem_args(&owner, NOW), 2);
+    let (mut ix, accounts) = redeem(
+        pk(&KEEPER),
+        owner,
+        (true, true),
+        &redeem_args(&owner, NOW),
+        2,
+    );
     ix.data.truncate(40);
     expect_err_exact(
         &mollusk,

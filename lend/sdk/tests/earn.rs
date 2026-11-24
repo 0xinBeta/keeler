@@ -73,7 +73,12 @@ fn input(owner: &ProgramOwner, out: &SppProofOutputUtxo) -> WalletUtxo {
 /// A fresh reserve of `mint` from `init_reserve`, last updated at `NOW`.
 fn fresh_reserve(mint: Mint) -> (SppProofOutputUtxo, WalletUtxo) {
     let p = builders::init_reserve(&keeper(), ADMIN, mint, NOW, 7, TREE_ID).unwrap();
-    let out = p.outputs.iter().find(|o| o.data_hash.is_some()).unwrap().clone();
+    let out = p
+        .outputs
+        .iter()
+        .find(|o| o.data_hash.is_some())
+        .unwrap()
+        .clone();
     let utxo = input(&pool_pda(&mint.asset).owner, &out);
     (out, utxo)
 }
@@ -207,14 +212,23 @@ fn receipt_out(p: &Prepared, user: &ShieldedKeypair, slot: usize) -> (WalletUtxo
 fn supplied(user: &ShieldedKeypair, amount: u64) -> (Prepared, WalletUtxo, WalletUtxo) {
     let (_, reserve) = fresh_reserve(MINT);
     let p = supply(&address(user), reserve, supply_intent(user, amount), NOW).unwrap();
-    let reserve = input(&pool_pda(&MINT.asset).owner, &p.outputs[SUPPLY_RESERVE_SLOT]);
-    let receipt = input(&user_pda(&wallet(user)).owner, &p.outputs[SUPPLY_RECEIPT_SLOT]);
+    let reserve = input(
+        &pool_pda(&MINT.asset).owner,
+        &p.outputs[SUPPLY_RESERVE_SLOT],
+    );
+    let receipt = input(
+        &user_pda(&wallet(user)).owner,
+        &p.outputs[SUPPLY_RECEIPT_SLOT],
+    );
     (p, reserve, receipt)
 }
 
 /// The outputs that are notes, not padding.
 fn owned(p: &Prepared) -> usize {
-    p.outputs.iter().filter(|o| o.owner_address.is_some()).count()
+    p.outputs
+        .iter()
+        .filter(|o| o.owner_address.is_some())
+        .count()
 }
 
 fn viewing(out: &SppProofOutputUtxo) -> X25519Pubkey {
@@ -232,7 +246,10 @@ fn supply_mints_the_maker_a_receipt_and_fills_the_reserve() {
     assert_eq!(owned(&p), 2, "reserve and receipt");
 
     let r = reserve_out(&p, SUPPLY_RESERVE_SLOT);
-    assert_eq!(p.outputs[SUPPLY_RESERVE_SLOT].amount, amount, "all of the intent");
+    assert_eq!(
+        p.outputs[SUPPLY_RESERVE_SLOT].amount, amount,
+        "all of the intent"
+    );
     assert_eq!((r.supply_shares, r.supply_price), (amount, PRICE));
     assert_eq!((r.last_update, r.salt, r.rate_bps), (NOW + 30, 99, 0));
 
@@ -267,9 +284,8 @@ fn outputs_are_encrypted_to_their_owners_and_the_keeper_recovers_them() {
             }
             let payload = ext.outputs[slot].data.as_ref().unwrap();
             // The keeper, who built it, reads every slot with its writer key.
-            let plain =
-                recover_output(&keeper, &p.first_nullifier, payload, ext.salt, slot as u32)
-                    .unwrap();
+            let plain = recover_output(&keeper, &p.first_nullifier, payload, ext.salt, slot as u32)
+                .unwrap();
             assert_eq!((plain.amount, plain.blinding), (out.amount, out.blinding));
             assert_eq!(plain.data, out.data, "slot {slot} data");
             // The owner reads it with their viewing key; the keeper's does not.
@@ -294,7 +310,10 @@ fn outputs_are_encrypted_to_their_owners_and_the_keeper_recovers_them() {
             assert_ne!(read(not_owner).as_ref(), Some(&plain), "slot {slot} other");
         }
     }
-    assert_eq!(viewing(&p.outputs[REDEEM_PAYOUT_SLOT]), user.viewing_pubkey());
+    assert_eq!(
+        viewing(&p.outputs[REDEEM_PAYOUT_SLOT]),
+        user.viewing_pubkey()
+    );
     assert_eq!(
         p.outputs[REDEEM_PAYOUT_SLOT].owner_address,
         Some(address(&user))
@@ -353,7 +372,13 @@ fn supply_refuses_a_fake_reserve() {
     let (template, _) = fresh_reserve(MINT);
     let pool = pool_pda(&MINT.asset).owner;
     // The real one, forged the same way, is accepted: the forgery is sound.
-    assert!(supply(&address(&user), reserve_with(&state, 0), intent.clone(), NOW).is_ok());
+    assert!(supply(
+        &address(&user),
+        reserve_with(&state, 0),
+        intent.clone(),
+        NOW
+    )
+    .is_ok());
     // Another mint's reserve.
     let (_, other) = fresh_reserve(OTHER_MINT);
     assert!(supply(&address(&user), other, intent.clone(), NOW).is_err());
@@ -414,13 +439,19 @@ fn supply_accrues_first() {
     let reserve = reserve_with(&state, 120_000_000_000);
     let p = supply(&address(&user), reserve, supply_intent(&user, amount), now).unwrap();
     let r = reserve_out(&p, SUPPLY_RESERVE_SLOT);
-    assert_eq!((r.borrow_price, r.supply_price), (1_000_136_986_302, 1_000_108_493_150));
+    assert_eq!(
+        (r.borrow_price, r.supply_price),
+        (1_000_136_986_302, 1_000_108_493_150)
+    );
     let shares = (u128::from(amount) * u128::from(PRICE) / 1_000_108_493_150) as u64;
     assert_eq!(r.supply_shares, state.supply_shares + shares);
     assert_eq!(r.last_update, now);
     let (_, receipt) = receipt_out(&p, &user, SUPPLY_RECEIPT_SLOT);
     assert_eq!(receipt.supply_shares, shares);
-    assert_eq!(p.outputs[SUPPLY_RESERVE_SLOT].amount, 120_000_000_000 + amount);
+    assert_eq!(
+        p.outputs[SUPPLY_RESERVE_SLOT].amount,
+        120_000_000_000 + amount
+    );
 }
 
 /// A receipt of `user` for `shares` of the tUSD pool, shaped like a real one.
@@ -512,7 +543,13 @@ fn supply_and_redeem_pass_the_shared_vectors() {
         assert_eq!(receipt.supply_shares, num(&c["out"]["shares"]), "{name}");
     }
     // Redeem: partial, all of a receipt, more than held, more than idle, zero.
-    for name in ["partial", "all of a receipt", "more than held", "more than idle", "zero"] {
+    for name in [
+        "partial",
+        "all of a receipt",
+        "more than held",
+        "more than idle",
+        "zero",
+    ] {
         let c = case(&all, "redeem", name);
         let i = &c["in"];
         let state = vector_reserve(&i["reserve"]);
@@ -531,7 +568,11 @@ fn supply_and_redeem_pass_the_shared_vectors() {
         let p = got.unwrap_or_else(|e| panic!("{name}: {e}"));
         same(&reserve_out(&p, REDEEM_RESERVE_SLOT), &c["out"]["reserve"]);
         let (_, receipt) = receipt_out(&p, &user, REDEEM_RECEIPT_SLOT);
-        assert_eq!(receipt.supply_shares, held - num(&c["out"]["burned"]), "{name}");
+        assert_eq!(
+            receipt.supply_shares,
+            held - num(&c["out"]["burned"]),
+            "{name}"
+        );
         assert_eq!(p.outputs[REDEEM_PAYOUT_SLOT].amount, amount);
         assert_eq!(
             p.outputs[REDEEM_RESERVE_SLOT].amount,
@@ -544,7 +585,14 @@ fn supply_and_redeem_pass_the_shared_vectors() {
 fn redeem_partial_then_full_keeps_three_outputs() {
     let user = keypair(7);
     let (_, reserve, receipt) = supplied(&user, 3_000_000);
-    let p = redeem(&address(&user), reserve, receipt.clone(), 1_000_000, NOW + 5).unwrap();
+    let p = redeem(
+        &address(&user),
+        reserve,
+        receipt.clone(),
+        1_000_000,
+        NOW + 5,
+    )
+    .unwrap();
     check_outputs(&p, REDEEM_BLINDING_DOMAIN, &receipt);
     assert_eq!(owned(&p), 3);
     let (left, state) = receipt_out(&p, &user, REDEEM_RECEIPT_SLOT);
@@ -552,11 +600,17 @@ fn redeem_partial_then_full_keeps_three_outputs() {
     let payout = &p.outputs[REDEEM_PAYOUT_SLOT];
     assert_eq!((payout.amount, payout.data_hash), (1_000_000, None));
     let r = reserve_out(&p, REDEEM_RESERVE_SLOT);
-    assert_eq!((r.supply_shares, r.last_update, r.salt), (2_000_000, NOW + 5, 98));
+    assert_eq!(
+        (r.supply_shares, r.last_update, r.salt),
+        (2_000_000, NOW + 5, 98)
+    );
     assert_eq!(p.outputs[REDEEM_RESERVE_SLOT].amount, 2_000_000);
 
     // The rest: a zero-share receipt keeps the output count.
-    let reserve = input(&pool_pda(&MINT.asset).owner, &p.outputs[REDEEM_RESERVE_SLOT]);
+    let reserve = input(
+        &pool_pda(&MINT.asset).owner,
+        &p.outputs[REDEEM_RESERVE_SLOT],
+    );
     let full = redeem(&address(&user), reserve, left.clone(), 2_000_000, NOW + 5).unwrap();
     check_outputs(&full, REDEEM_BLINDING_DOMAIN, &left);
     assert_eq!(owned(&full), 3);
@@ -612,7 +666,14 @@ fn redeem_refuses_non_owner_overdraw_and_stale_now() {
     .is_ok());
     // Zero, and `now` before the reserve's last update.
     assert!(redeem(&address(&user), reserve.clone(), receipt.clone(), 0, NOW).is_err());
-    assert!(redeem(&address(&user), reserve.clone(), receipt.clone(), 1, NOW - 1).is_err());
+    assert!(redeem(
+        &address(&user),
+        reserve.clone(),
+        receipt.clone(),
+        1,
+        NOW - 1
+    )
+    .is_err());
     // Another mint's reserve.
     let (_, other_reserve) = fresh_reserve(OTHER_MINT);
     assert!(redeem(&address(&user), other_reserve, receipt, 1, NOW).is_err());
@@ -630,14 +691,38 @@ fn redeem_rounds_for_the_pool() {
         last_update: NOW,
         ..Default::default()
     };
-    let p = redeem(&address(&user), reserve_with(&state, 10), receipt_with(&user, 3), 1, NOW)
-        .unwrap();
-    assert_eq!(receipt_out(&p, &user, REDEEM_RECEIPT_SLOT).1.supply_shares, 2);
-    assert!(redeem(&address(&user), reserve_with(&state, 10), receipt_with(&user, 3), 5, NOW)
-        .is_err());
-    let p = redeem(&address(&user), reserve_with(&state, 10), receipt_with(&user, 3), 4, NOW)
-        .unwrap();
-    assert_eq!(receipt_out(&p, &user, REDEEM_RECEIPT_SLOT).1.supply_shares, 0);
+    let p = redeem(
+        &address(&user),
+        reserve_with(&state, 10),
+        receipt_with(&user, 3),
+        1,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        receipt_out(&p, &user, REDEEM_RECEIPT_SLOT).1.supply_shares,
+        2
+    );
+    assert!(redeem(
+        &address(&user),
+        reserve_with(&state, 10),
+        receipt_with(&user, 3),
+        5,
+        NOW
+    )
+    .is_err());
+    let p = redeem(
+        &address(&user),
+        reserve_with(&state, 10),
+        receipt_with(&user, 3),
+        4,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        receipt_out(&p, &user, REDEEM_RECEIPT_SLOT).1.supply_shares,
+        0
+    );
 }
 
 #[test]

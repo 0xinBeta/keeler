@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Runs the SDK's local-network test on port offset 2100 (prover on 3022) and
-# stops the prover it started. Run scripts/setup-lend.sh first.
-# Usage: lend/scripts/run-chain-test.sh
+# Runs the SDK's local-network tests on port offset $ZOLANA_PORT_OFFSET
+# (default 2100, prover on 3001 + offset / 100) and stops the prover it
+# started. Run scripts/setup-lend.sh first.
+# Usage: [ZOLANA_PORT_OFFSET=2200] [LEND_CHAIN_TESTS="earn_chain"] lend/scripts/run-chain-test.sh
 set -euo pipefail
 lend=$(cd "$(dirname "$0")/.." && pwd)
 main=$(git -C "$lend" worktree list --porcelain | awk '/^worktree /{print $2; exit}')
@@ -19,4 +20,6 @@ stop_prover() {
 trap stop_prover EXIT
 mkdir -p "$lend/target/proving-keys"
 cd "$lend"
-cargo test --release -p keeler-lend-sdk --test chain -- --ignored --nocapture "$@"
+tests=()
+for t in ${LEND_CHAIN_TESTS:-chain earn_chain}; do tests+=(--test "$t"); done
+cargo test --release -p keeler-lend-sdk "${tests[@]}" -- --ignored --nocapture "$@"

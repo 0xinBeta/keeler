@@ -77,10 +77,7 @@ impl Redeem {
         // nullifier (the receipt's) it derives every output's blinding.
         require_eq(
             p.tx_context.blinding_seed,
-            poseidon(&[
-                Field::from(REDEEM_BLINDING_DOMAIN),
-                p.receipt_utxo.blinding,
-            ])?,
+            poseidon(&[Field::from(REDEEM_BLINDING_DOMAIN), p.receipt_utxo.blinding])?,
         );
 
         let mut receipt = DataUtxo::new_mut(&p.receipt_utxo, &p.receipt_state)?;

@@ -19,7 +19,13 @@ pub enum CircuitId {
 }
 
 impl CircuitId {
-    pub const ALL: [Self; 5] = [Self::InitReserve, Self::Intent, Self::CancelIntent, Self::Supply, Self::Redeem];
+    pub const ALL: [Self; 5] = [
+        Self::InitReserve,
+        Self::Intent,
+        Self::CancelIntent,
+        Self::Supply,
+        Self::Redeem,
+    ];
 
     /// The directory `zolana zk compile` writes under [`keys_dir`].
     pub fn name(self) -> &'static str {
