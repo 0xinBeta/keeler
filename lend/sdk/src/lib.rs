@@ -2,6 +2,7 @@
 //! proofs and the instruction builders.
 pub mod builders;
 pub mod proof;
+pub mod vault;
 
 use anyhow::{ensure, Result};
 use solana_address::Address;

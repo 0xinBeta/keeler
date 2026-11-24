@@ -138,7 +138,7 @@ fn div_rem<const NB: usize, const DB: usize>(a: Field, b: Field, d: Field) -> (F
     (q, r)
 }
 
-fn div_floor<const NB: usize, const DB: usize>(a: Field, b: Field, d: Field) -> Field {
+pub fn div_floor<const NB: usize, const DB: usize>(a: Field, b: Field, d: Field) -> Field {
     div_rem::<NB, DB>(a, b, d).0
 }
 

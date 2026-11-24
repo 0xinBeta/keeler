@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 keeler-lend = { path = "../program", features = ["circuits"] }
+# The reference maths: the keeper sizes a liquidation with it.
+keeler-core = { path = "../../core" }
 xark = { workspace = true }
 xark-groth16 = { workspace = true }
 # xark-groth16 leaves its MSM and FFT crates sequential; unify the features so

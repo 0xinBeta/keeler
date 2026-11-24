@@ -29,7 +29,7 @@ wasm=$lend/target/wasm
 # cross-origin isolation), as for the swap.
 "$ZOLANA_CLI_BIN" zk compile --test --single-threaded --wasm-out "$wasm" --manifest-path program/Cargo.toml
 
-circuits=(init_reserve intent cancel_intent)
+circuits=(init_reserve intent cancel_intent deposit_open deposit_add draw repay liquidate close)
 sums=$(cd "$keys" && for c in "${circuits[@]}"; do shasum -a 256 "$c"/circuit.xbc "$c"/pk.bin "$c"/vk.bin; done)
 if $update; then
     printf '%s\n' "$sums" >"$lend/lend-keys.CHECKSUM"
@@ -38,8 +38,8 @@ elif [[ $sums != "$(cat "$lend/lend-keys.CHECKSUM")" ]]; then
     echo "the built circuits differ from lend/lend-keys.CHECKSUM; rerun with --update-checksums if a circuit changed" >&2
     exit 1
 fi
-# The browser proves intent and cancel_intent, so it needs their artifacts.
-for c in intent cancel_intent; do
+# The browser proves intent, cancel_intent and close, so it needs their artifacts.
+for c in intent cancel_intent close; do
     mkdir -p "$wasm/$c"
     cp "$keys/$c/"{pk.bin,vk.bin,circuit.xbc} "$wasm/$c/"
 done

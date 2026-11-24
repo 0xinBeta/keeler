@@ -2790,6 +2790,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeler-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "keeler-lend"
 version = "0.1.0"
 dependencies = [
@@ -2822,6 +2831,7 @@ dependencies = [
  "ark-ec 0.6.0",
  "ark-poly 0.6.0",
  "borsh",
+ "keeler-core",
  "keeler-lend",
  "serde_json",
  "sha2 0.10.9",

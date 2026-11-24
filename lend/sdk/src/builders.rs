@@ -31,7 +31,7 @@ fn wallet_address(wallet: &ShieldedKeypair) -> Result<Address> {
         .map_err(err)
 }
 
-type Args = Box<dyn FnOnce(CompressedProof) -> Result<Vec<u8>>>;
+pub(crate) type Args = Box<dyn FnOnce(CompressedProof) -> Result<Vec<u8>>>;
 
 /// A built transaction, ready to prove.
 pub struct Prepared {
@@ -51,7 +51,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    fn new(
+    pub(crate) fn new(
         transaction: ProgramTransaction,
         sender: &ShieldedKeypair,
         circuit: CircuitId,
