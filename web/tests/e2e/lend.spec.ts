@@ -155,7 +155,6 @@ test("borrow: open, borrow, repay, withdraw, liquidation, repay all and close", 
 });
 
 test("an intent the keeper does not fill is taken back after it expires", async ({ page }) => {
-  test.skip(test.info().project.name !== "desktop", "one viewport is enough for the timer");
   const problems = await setUp(page, "?mock=keeper-stalls");
   const p = panel(page);
   await p.getByRole("button", { name: "Earn", exact: true }).click();
@@ -171,7 +170,6 @@ test("an intent the keeper does not fill is taken back after it expires", async 
 });
 
 test("a keeper that is offline is reported before anything is sent", async ({ page }) => {
-  test.skip(test.info().project.name !== "desktop", "one viewport is enough");
   await setUp(page, "?mock=keeper-offline");
   const p = panel(page);
   await p.getByRole("button", { name: "Earn", exact: true }).click();

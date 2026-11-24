@@ -23,10 +23,10 @@ const lendPins = () => {
   };
 };
 
-// The Worker (wrangler dev, port 8787, see scripts/dev.sh) serves /api and /v1/spr in development.
+// The Worker (wrangler dev, port 8787, see scripts/dev.sh; KEELER_WORKER_URL for another) serves /api and /v1/spr in development.
 // It refuses cross-origin requests, and the dev server's origin is not its own, so the proxy drops Origin.
 const worker = {
-  target: "http://127.0.0.1:8787",
+  target: process.env.KEELER_WORKER_URL ?? "http://127.0.0.1:8787",
   configure: (proxy: { on: (event: "proxyReq", fn: (req: { removeHeader: (name: string) => void }) => void) => void }) =>
     proxy.on("proxyReq", (req) => req.removeHeader("origin")),
 };
