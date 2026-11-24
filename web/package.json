@@ -6,7 +6,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run --config tests/vitest.config.ts",
-    "e2e": "playwright test --config tests/playwright.config.ts"
+    "e2e": "playwright test --config tests/playwright.config.ts",
+    "e2e:mock": "playwright test --config tests/playwright.mock.config.ts"
   },
   "dependencies": {
     "@fontsource-variable/onest": "^5.3.1",

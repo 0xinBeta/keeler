@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Balance, Config, Keeler, Order } from "../keeler/index";
-import { Audience, ChainSees, Closing, Dealers, Facts, Faq, Features, Steps } from "./Landing";
+import type { Balance, Config, Keeler, LendAccount, Order } from "../keeler/index";
+import { Audience, ChainSees, Closing, Dealers, Facts, Faq, Features, LendFeatures, LendLiquidation, LendNumbers, LendPrivacy, Steps } from "./Landing";
+import { LendActivity } from "./Lend";
+import type { Market } from "./Lend";
 import { Orders } from "./Orders";
 import { Panel } from "./Panel";
+import type { Tab } from "./Panel";
 import type { DealerLight } from "./ring";
 import { RingCanvas } from "./RingCanvas";
 import { errorText } from "./shared";
@@ -126,11 +129,52 @@ export function App({ keeler }: { keeler: Keeler }) {
     };
   }, [open, refreshOrders, refreshBalances]);
 
+  // Lending: the market is public and read from the start; the account once the wallet is unlocked.
+  const lend = keeler.lend;
+  const [market, setMarket] = useState<Market | null>(null);
+  const [account, setAccount] = useState<LendAccount | null>(null);
+  const lendSeen = useRef(new Map<string, string>());
+  const refreshMarket = useCallback(() => (lend ? lend.pools().then(setMarket) : Promise.resolve()), [lend]);
+  const refreshLend = useCallback(async () => {
+    if (!lend) return;
+    const [m, a] = await Promise.all([lend.pools(), lend.lendAccount()]);
+    setMarket(m);
+    setAccount(a);
+    // A keeper fill or a liquidation changes private balances too.
+    let changed = false;
+    for (const o of a.operations) {
+      if (lendSeen.current.get(o.id) !== o.status) changed = true;
+      lendSeen.current.set(o.id, o.status);
+    }
+    if (changed) refreshBalances().catch(() => {});
+  }, [lend, refreshBalances]);
+
+  useEffect(() => {
+    refreshMarket().catch(() => {});
+    const id = setInterval(() => refreshMarket().catch(() => {}), 30_000);
+    return () => clearInterval(id);
+  }, [refreshMarket]);
+  useEffect(() => {
+    if (ready) refreshLend().catch(() => {});
+  }, [ready, refreshLend]);
+
+  // Poll quickly while an operation is in flight, slower while a loan is open (the keeper may liquidate it).
+  const lendPending = account?.operations.some((o) => o.status === "pending") ?? false;
+  const owing = account?.positions.some((x) => x.debt > 0n) ?? false;
+  useEffect(() => {
+    if (!lendPending && !owing) return;
+    const id = setInterval(() => refreshLend().catch(() => {}), lendPending ? 2000 : 5000);
+    return () => clearInterval(id);
+  }, [lendPending, owing, refreshLend]);
+
+  const [tab, setTab] = useState<Tab>("swap");
   const ringInput = useMemo(() => ({ dealers: lights, proving, settled }), [lights, proving, settled]);
-  const startSwap = useCallback(() => {
+  const openTab = useCallback((t: Tab) => {
+    setTab(t);
     panel.current?.focus();
     panel.current?.scrollIntoView({ block: "center" });
   }, []);
+  const startSwap = useCallback(() => openTab("swap"), [openTab]);
 
   return (
     <>
@@ -147,6 +191,7 @@ export function App({ keeler }: { keeler: Keeler }) {
           <nav aria-label="On this page">
             <a href="#how">How it works</a>
             <a href="#privacy">Privacy</a>
+            {lend && <a href="#lend">Earn & Borrow</a>}
             <a href="#dealers">Dealers</a>
             <a href="#faq">FAQ</a>
           </nav>
@@ -188,6 +233,11 @@ export function App({ keeler }: { keeler: Keeler }) {
                   reloadConfig={reloadConfig}
                   setLights={setLights}
                   setProving={setProving}
+                  tab={tab}
+                  setTab={setTab}
+                  market={market}
+                  account={account}
+                  refreshLend={refreshLend}
                 />
               ) : configError ? (
                 <div className="panel-body">
@@ -223,12 +273,31 @@ export function App({ keeler }: { keeler: Keeler }) {
               }
             />
           )}
+          {ready && lend && (
+            <LendActivity
+              lend={lend}
+              balances={balances}
+              market={market}
+              account={account}
+              chainOffset={chainOffset}
+              refreshLend={refreshLend}
+              refreshBalances={refreshBalances}
+            />
+          )}
           <Features />
           <ChainSees />
           <Steps />
+          {lend && (
+            <>
+              <LendFeatures market={market} onOpen={openTab} />
+              <LendPrivacy />
+              <LendLiquidation />
+              <LendNumbers />
+            </>
+          )}
           <Audience />
           <Dealers />
-          <Faq />
+          <Faq lend={!!lend} />
           <Closing onStart={startSwap} />
         </main>
       </div>
