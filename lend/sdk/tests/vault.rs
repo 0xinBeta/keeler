@@ -1,7 +1,15 @@
 //! The Vault builders natively (no network, no proofs): every rule the
 //! circuits enforce, the outputs' owners and keys, and the keeper reading
 //! every output with its transaction viewing key.
+mod refusal;
 mod utxo;
+
+use keeler_lend::circuits::{Close, DepositAdd, DepositOpen, Draw, Liquidate, Repay};
+use keeler_lend_sdk::proof::CircuitId;
+use refusal::{
+    field, identity_of, refused, refused_because, reserve_refusals, set, state_leaves, under,
+    Compiled,
+};
 
 use keeler_core::lend as core;
 use keeler_lend::circuits::{
@@ -222,12 +230,24 @@ fn deposit_open_refusals() {
     let k = keeper();
     let good = || intent_full(&user, coll(), SOL, purpose::DEPOSIT, 7);
     // Credited to someone other than the maker.
-    assert!(vault::deposit_open(&k, &addr(&other), good(), V, NOW, TREE).is_err());
+    refused(
+        vault::deposit_open(&k, &addr(&other), good(), V, NOW, TREE),
+        "circuits/deposit.rs",
+        "require_eq(intent.owner(), *public_owner.owner());",
+    );
     // A repay intent, or a deposit in the debt mint (a junk-mint position).
     let repay = intent_full(&user, coll(), SOL, purpose::REPAY, 7);
-    assert!(vault::deposit_open(&k, &addr(&user), repay, V, NOW, TREE).is_err());
+    refused(
+        vault::deposit_open(&k, &addr(&user), repay, V, NOW, TREE),
+        "circuits/deposit.rs",
+        "require_eq(intent.purpose, purpose::DEPOSIT);",
+    );
     let junk = intent_full(&user, debt(), SOL, purpose::DEPOSIT, 7);
-    assert!(vault::deposit_open(&k, &addr(&user), junk, V, NOW, TREE).is_err());
+    refused(
+        vault::deposit_open(&k, &addr(&user), junk, V, NOW, TREE),
+        "circuits/notes.rs",
+        "require_eq(hi, mint_hi);",
+    );
     // Below the minimum, after expiry, an unknown vault.
     let small = intent_full(
         &user,
@@ -236,9 +256,20 @@ fn deposit_open_refusals() {
         purpose::DEPOSIT,
         7,
     );
-    assert!(vault::deposit_open(&k, &addr(&user), small, V, NOW, TREE).is_err());
-    assert!(vault::deposit_open(&k, &addr(&user), good(), V, EXPIRY + 1, TREE).is_err());
-    assert!(vault::deposit_open(&k, &addr(&user), good(), 2, NOW, TREE).is_err());
+    refused(
+        vault::deposit_open(&k, &addr(&user), small, V, NOW, TREE),
+        "circuits/deposit.rs",
+        "require(amount >= rules.min_collateral);",
+    );
+    refused(
+        vault::deposit_open(&k, &addr(&user), good(), V, EXPIRY + 1, TREE),
+        "circuits/deposit.rs",
+        "require(now <= intent.expiry);",
+    );
+    refused_because(
+        vault::deposit_open(&k, &addr(&user), good(), 2, NOW, TREE),
+        "no vault 2",
+    );
     assert!(vault::deposit_open(&k, &addr(&user), good(), V, EXPIRY, TREE).is_ok());
 }
 
@@ -266,22 +297,31 @@ fn deposit_add_only_into_the_named_position_of_the_maker() {
     );
     // An intent naming another position.
     let elsewhere = intent_full(&user, coll(), SOL / 2, purpose::DEPOSIT, 8);
-    assert!(
-        vault::deposit_add(&k, &addr(&user), position.clone(), elsewhere, V, NOW, TREE).is_err()
+    refused(
+        vault::deposit_add(&k, &addr(&user), position.clone(), elsewhere, V, NOW, TREE),
+        "circuits/notes.rs",
+        "require_eq(intent.target, target);",
     );
     // Someone else's intent into this position, either way round.
     let theirs = intent_full(&other, coll(), SOL / 2, purpose::DEPOSIT, 7);
-    assert!(vault::deposit_add(
-        &k,
-        &addr(&user),
-        position.clone(),
-        theirs.clone(),
-        V,
-        NOW,
-        TREE
-    )
-    .is_err());
-    assert!(vault::deposit_add(&k, &addr(&other), position, theirs, V, NOW, TREE).is_err());
+    refused(
+        vault::deposit_add(
+            &k,
+            &addr(&user),
+            position.clone(),
+            theirs.clone(),
+            V,
+            NOW,
+            TREE,
+        ),
+        "circuits/deposit.rs",
+        "require_eq(intent.owner(), *public_owner.owner());",
+    );
+    refused(
+        vault::deposit_add(&k, &addr(&other), position, theirs, V, NOW, TREE),
+        "circuits/vault.rs",
+        "require_eq(position.owner(), *user);",
+    );
 }
 
 #[test]
@@ -332,34 +372,61 @@ fn draw_refusals() {
     let position = || open(&user, SOL, 7);
     let big = || reserve(1_000 * USD);
     // Not the owner: the circuit ties the position to the signer's identity.
-    assert!(vault::draw(
-        &keeper(),
-        &addr(&other),
-        big(),
-        position(),
-        10 * USD,
-        0,
-        TSOL_TUSD.price_account,
-        V,
-        NOW,
-        P150,
-        SALT,
-        TREE,
-    )
-    .is_err());
+    refused(
+        vault::draw(
+            &keeper(),
+            &addr(&other),
+            big(),
+            position(),
+            10 * USD,
+            0,
+            TSOL_TUSD.price_account,
+            V,
+            NOW,
+            P150,
+            SALT,
+            TREE,
+        ),
+        "circuits/vault.rs",
+        "require_eq(position.owner(), *user);",
+    );
     // Past the collateral factor, at a lower bound.
-    assert!(draw(&user, big(), position(), 120 * USD + 1, 0, P150).is_err());
-    assert!(draw(&user, big(), position(), 100 * USD, 0, 120_000_000_000).is_err());
+    refused(
+        draw(&user, big(), position(), 120 * USD + 1, 0, P150),
+        "circuits/draw.rs",
+        "require(can_draw(",
+    );
+    refused(
+        draw(&user, big(), position(), 100 * USD, 0, 120_000_000_000),
+        "circuits/draw.rs",
+        "require(can_draw(",
+    );
     // Past the idle liquidity.
-    assert!(draw(&user, reserve(50 * USD), position(), 60 * USD, 0, P150).is_err());
+    refused(
+        draw(&user, reserve(50 * USD), position(), 60 * USD, 0, P150),
+        "circuits/draw.rs",
+        "require(p.borrow <= reserve.amount()?);",
+    );
     // Past the 95% utilisation cap (at it is fine).
-    assert!(draw(&user, reserve(100 * USD), position(), 96 * USD, 0, P150).is_err());
+    refused(
+        draw(&user, reserve(100 * USD), position(), 96 * USD, 0, P150),
+        "circuits/draw.rs",
+        "require(!(borrowing && over_cap));",
+    );
     assert!(draw(&user, reserve(100 * USD), position(), 95 * USD, 0, P150).is_ok());
     // Below the minimum debt.
-    assert!(draw(&user, big(), position(), TSOL_TUSD_MIN_DEBT - 1, 0, P150).is_err());
+    refused(
+        draw(&user, big(), position(), TSOL_TUSD_MIN_DEBT - 1, 0, P150),
+        "circuits/draw.rs",
+        "require(zero_or_at_least(debt, rules.min_debt));",
+    );
     // Withdrawing past the factor or below the minimum collateral.
     let (pos, r) = borrowed(&user, 100 * USD);
-    assert!(draw(&user, r.clone(), pos.clone(), 0, SOL / 5, P150).is_err());
+    refused(
+        draw(&user, r.clone(), pos.clone(), 0, SOL / 5, P150),
+        "circuits/draw.rs",
+        "require(can_draw(",
+    );
     assert!(draw(&user, r.clone(), pos.clone(), 0, SOL / 100, P150).is_ok());
     let p = draw(
         &user,
@@ -369,7 +436,11 @@ fn draw_refusals() {
         SOL - TSOL_TUSD_MIN_COLLATERAL + 1,
         P150,
     );
-    assert!(p.is_err());
+    refused(
+        p,
+        "circuits/draw.rs",
+        "require(zero_or_at_least(collateral, rules.min_collateral));",
+    );
     // All of it with no debt is fine, paid to the owner.
     let p = draw(&user, big(), position(), 0, SOL, P150).unwrap();
     assert_eq!(p.outputs[DRAW_COLLATERAL_SLOT].amount, SOL);
@@ -406,7 +477,11 @@ fn draw_accrues_first() {
     );
     // A reserve updated after `now` is refused.
     let future = reserve_with(1_000 * USD, |s| s.last_update = NOW + 1);
-    assert!(draw(&user, future, open(&user, SOL, 7), 10 * USD, 0, P150).is_err());
+    refused(
+        draw(&user, future, open(&user, SOL, 7), 10 * USD, 0, P150),
+        "circuits/math.rs",
+        "require(now >= state.last_update);",
+    );
 }
 
 fn repay(
@@ -472,15 +547,35 @@ fn repay_refusals() {
     let (pos, r) = borrowed(&user, 100 * USD);
     // Into another position, the wrong purpose, the wrong mint.
     let elsewhere = intent_full(&user, debt(), 10 * USD, purpose::REPAY, 8);
-    assert!(repay(&user, r.clone(), pos.clone(), elsewhere).is_err());
+    refused(
+        repay(&user, r.clone(), pos.clone(), elsewhere),
+        "circuits/notes.rs",
+        "require_eq(intent.target, target);",
+    );
     let deposit = intent_full(&user, debt(), 10 * USD, purpose::DEPOSIT, 7);
-    assert!(repay(&user, r.clone(), pos.clone(), deposit).is_err());
+    refused(
+        repay(&user, r.clone(), pos.clone(), deposit),
+        "circuits/notes.rs",
+        "require_eq(intent.purpose, purpose);",
+    );
     let junk = intent_full(&user, coll(), 10 * USD, purpose::REPAY, 7);
-    assert!(repay(&user, r.clone(), pos.clone(), junk).is_err());
+    refused(
+        repay(&user, r.clone(), pos.clone(), junk),
+        "circuits/notes.rs",
+        "require_eq(hi, mint_hi);",
+    );
     // Someone else's intent into this position.
     let theirs = intent_full(&other, debt(), 10 * USD, purpose::REPAY, 7);
-    assert!(repay(&user, r.clone(), pos.clone(), theirs.clone()).is_err());
-    assert!(repay(&other, r.clone(), pos.clone(), theirs).is_err());
+    refused(
+        repay(&user, r.clone(), pos.clone(), theirs.clone()),
+        "circuits/repay.rs",
+        "require_eq(intent.owner(), *user);",
+    );
+    refused(
+        repay(&other, r.clone(), pos.clone(), theirs),
+        "circuits/vault.rs",
+        "require_eq(position.owner(), *user);",
+    );
     // After expiry.
     let late = vault::repay(
         &keeper(),
@@ -493,7 +588,7 @@ fn repay_refusals() {
         SALT,
         TREE,
     );
-    assert!(late.is_err());
+    refused(late, "circuits/notes.rs", "require(now <= intent.expiry);");
 }
 
 fn liquidate_with(
@@ -581,9 +676,21 @@ fn liquidate_back_to_the_threshold() {
     assert_eq!(after.supply_shares, 1_000 * USD);
     // Less is fine; more takes the position below the threshold.
     assert!(liquidate_with(&user, r.clone(), pos.clone(), plan.repay / 2, bound).is_ok());
-    assert!(liquidate_with(&user, r.clone(), pos.clone(), plan.repay + USD, bound).is_err());
-    assert!(liquidate_with(&user, r.clone(), pos.clone(), 120 * USD, bound).is_err());
-    assert!(liquidate_with(&user, r, pos, 0, bound).is_err());
+    refused(
+        liquidate_with(&user, r.clone(), pos.clone(), plan.repay + USD, bound),
+        "circuits/liquidate.rs",
+        "require(absorb || at_or_past_threshold(left, worth_after, &v));",
+    );
+    refused(
+        liquidate_with(&user, r.clone(), pos.clone(), 120 * USD, bound),
+        "circuits/liquidate.rs",
+        "require(absorb || at_or_past_threshold(left, worth_after, &v));",
+    );
+    refused(
+        liquidate_with(&user, r, pos, 0, bound),
+        "circuits/liquidate.rs",
+        "require(x != 0 && x <= debt);",
+    );
 }
 
 #[test]
@@ -591,8 +698,15 @@ fn liquidate_refuses_healthy_and_takes_all_above_the_max_limit() {
     let user = keypair(7);
     let (pos, r) = borrowed(&user, 100 * USD);
     // Healthy at $150 (threshold 127.5) and at exactly the threshold.
-    assert!(liquidate_with(&user, r.clone(), pos.clone(), USD, P150).is_err());
-    assert!(liquidate(&user, r.clone(), pos.clone(), P150).is_err());
+    refused(
+        liquidate_with(&user, r.clone(), pos.clone(), USD, P150),
+        "circuits/liquidate.rs",
+        "require(is_liquidatable(debt, worth, &v));",
+    );
+    refused_because(
+        liquidate(&user, r.clone(), pos.clone(), P150),
+        "NotLiquidatable",
+    );
     let (pos, r) = borrowed(&user, 120 * USD);
     // $130: 120 > 0.9 x 130 = 117, past the max limit: all of it may go.
     let bound = 130_000_000_000;
@@ -601,7 +715,11 @@ fn liquidate_refuses_healthy_and_takes_all_above_the_max_limit() {
     let left: PositionState =
         decode(&pda_input(&user, &p.outputs[LIQUIDATE_POSITION_SLOT], 6)).unwrap();
     assert_eq!(left.debt_shares, 0);
-    assert!(liquidate_with(&user, r.clone(), pos.clone(), 120 * USD + 1, bound).is_err());
+    refused(
+        liquidate_with(&user, r.clone(), pos.clone(), 120 * USD + 1, bound),
+        "circuits/liquidate.rs",
+        "require(x != 0 && x <= debt);",
+    );
     // The payout caps at the collateral when the price has fallen far enough.
     let crash = 100_000_000_000;
     let (p, plan) = liquidate(&user, r, pos, crash).unwrap();
@@ -635,7 +753,306 @@ fn close_only_without_debt_and_only_by_the_owner() {
     let p = vault::close(&user, position.clone(), V, TREE).unwrap();
     let out = &p.outputs[CLOSE_PAYOUT_SLOT];
     assert_eq!((out.amount, out.owner_address), (SOL, Some(addr(&user))));
-    assert!(vault::close(&other, position, V, TREE).is_err());
+    refused(
+        vault::close(&other, position, V, TREE),
+        "circuits/vault.rs",
+        "require_eq(position.owner(), *user);",
+    );
     let (pos, _) = borrowed(&user, 10 * USD);
-    assert!(vault::close(&user, pos, V, TREE).is_err());
+    refused(
+        vault::close(&user, pos, V, TREE),
+        "circuits/close.rs",
+        "require_eq(position.debt_shares, 0u64);",
+    );
+}
+
+// --- the compiled circuits: valid inputs with one witness changed ---
+
+const LIQ: &str = "circuits/liquidate.rs";
+const VAULT_RS: &str = "circuits/vault.rs";
+
+fn position_leaves(state: &PositionState) -> Vec<(String, xark::prover::Fr)> {
+    state_leaves("position", NoteKind::Position, state, None)
+}
+
+fn intent_leaves(state: &IntentState) -> Vec<(String, xark::prover::Fr)> {
+    state_leaves("intent", NoteKind::Intent, state, None)
+}
+
+/// A direct `require` in the circuit's `execute`.
+const IN_EXECUTE: &str = "execute → require";
+const IN_EXECUTE_EQ: &str = "execute → require_eq";
+
+#[test]
+fn compiled_liquidate_refusals() {
+    let user = keypair(7);
+    let other = keypair(9);
+    let (pos, r) = borrowed(&user, 120 * USD);
+    let bound = 140_000_000_000;
+    let (p, plan) = liquidate(&user, r.clone(), pos.clone(), bound).unwrap();
+    let i = &p.proof_inputs;
+    let c = Compiled {
+        id: CircuitId::Liquidate,
+        inputs: i,
+        execute: Liquidate::execute,
+    };
+    // A healthy position: the same one at $150.
+    c.refuses(
+        field(i, "program.public.{now,bound}", 64, 64, P150.into()),
+        LIQ,
+        "require(is_liquidatable(",
+        IN_EXECUTE,
+    );
+    // Below the threshold: more than the plan. And zero.
+    let repay = |x: u64| field(i, "program.private.{repay,salt}", 0, 64, x.into());
+    c.refuses(
+        repay(plan.repay + USD),
+        LIQ,
+        "require(absorb || at_or_past_threshold(",
+        IN_EXECUTE,
+    );
+    c.refuses(repay(0), LIQ, "require(x != 0 && x <= debt)", IN_EXECUTE);
+    // A position of another vault, or another owner's user PDA as the target.
+    let mut state: PositionState = decode(&pos).unwrap();
+    state.vault = 2;
+    c.refuses(
+        position_leaves(&state),
+        VAULT_RS,
+        "require_eq(position.vault, vault)",
+        "assert_position → require_eq",
+    );
+    let (opos, or) = borrowed(&other, 120 * USD);
+    let (op, _) = liquidate(&other, or, opos, bound).unwrap();
+    c.refuses(
+        under(&op.proof_inputs, "program.public.user_owner"),
+        VAULT_RS,
+        "require_eq(position.owner(), *user)",
+        "assert_position → require_eq",
+    );
+    reserve_refusals(&c, &r, NOW);
+}
+
+#[test]
+fn liquidate_removes_at_least_one_debt_share() {
+    let user = keypair(7);
+    // Borrow price 1.5e12: a repay of 1 is less than one share's worth.
+    let r = reserve_with(1_000 * USD, |s| s.borrow_price = 1_500_000_000_000);
+    let p = draw(&user, r, open(&user, SOL, 7), 120 * USD, 0, P150).unwrap();
+    let pos = pda_input(&user, &p.outputs[DRAW_POSITION_SLOT], 4);
+    let r = reserve_out(&p, DRAW_RESERVE_SLOT);
+    let bound = 140_000_000_000;
+    refused(
+        liquidate_with(&user, r.clone(), pos.clone(), 1, bound),
+        LIQ,
+        "require(removed != 0)",
+    );
+    let (p, plan) = liquidate(&user, r.clone(), pos.clone(), bound).unwrap();
+    assert!(plan.repay > 1);
+    // Two units remove one share: accepted.
+    assert!(liquidate_with(&user, r, pos, 2, bound).is_ok());
+    Compiled {
+        id: CircuitId::Liquidate,
+        inputs: &p.proof_inputs,
+        execute: Liquidate::execute,
+    }
+    .refuses(
+        field(&p.proof_inputs, "program.private.{repay,salt}", 0, 64, 1),
+        LIQ,
+        "require(removed != 0)",
+        IN_EXECUTE,
+    );
+}
+
+#[test]
+fn compiled_draw_refusals() {
+    let user = keypair(7);
+    let other = keypair(9);
+    let r = reserve(1_000 * USD);
+    let p = draw(&user, r.clone(), open(&user, SOL, 7), 100 * USD, 0, P150).unwrap();
+    let i = &p.proof_inputs;
+    let c = Compiled {
+        id: CircuitId::Draw,
+        inputs: i,
+        execute: Draw::execute,
+    };
+    let borrow = |x: u64| field(i, "program.private.{borrow,withdraw}", 0, 64, x.into());
+    // Past the collateral factor: $150 x 80% is 120.
+    c.refuses(
+        borrow(120 * USD + 1),
+        "circuits/draw.rs",
+        "require(can_draw(",
+        IN_EXECUTE,
+    );
+    // The owner's PDA but another signer's identity: only the identity check.
+    c.refuses(
+        set("program.public.owner_identity", identity_of(&other)),
+        "circuits/draw.rs",
+        "require_eq(owner.key().identity()?, public.owner_identity)",
+        IN_EXECUTE_EQ,
+    );
+    // Another owner's PDA: the position is not theirs.
+    let op = draw(&other, r.clone(), open(&other, SOL, 7), 100 * USD, 0, P150).unwrap();
+    c.refuses(
+        under(&op.proof_inputs, "program.public.user_owner"),
+        VAULT_RS,
+        "require_eq(position.owner(), *user)",
+        "assert_position → require_eq",
+    );
+    reserve_refusals(&c, &r, NOW);
+
+    // Past the 95% utilisation cap (95 of 100 is at it).
+    let small = reserve(100 * USD);
+    let p = draw(&user, small, open(&user, SOL, 7), 95 * USD, 0, P150).unwrap();
+    let i = &p.proof_inputs;
+    Compiled {
+        id: CircuitId::Draw,
+        inputs: i,
+        execute: Draw::execute,
+    }
+    .refuses(
+        field(
+            i,
+            "program.private.{borrow,withdraw}",
+            0,
+            64,
+            (96 * USD).into(),
+        ),
+        "circuits/draw.rs",
+        "require(!(borrowing && over_cap))",
+        IN_EXECUTE,
+    );
+}
+
+#[test]
+fn compiled_repay_refusals() {
+    let user = keypair(7);
+    let other = keypair(9);
+    let (pos, r) = borrowed(&user, 100 * USD);
+    let intent = intent_full(&user, debt(), 10 * USD, purpose::REPAY, 7);
+    let p = repay(&user, r.clone(), pos, intent.clone()).unwrap();
+    let c = Compiled {
+        id: CircuitId::Repay,
+        inputs: &p.proof_inputs,
+        execute: Repay::execute,
+    };
+    // Into another position.
+    let mut state: IntentState = decode(&intent).unwrap();
+    state.target = 8;
+    c.refuses(
+        intent_leaves(&state),
+        "circuits/notes.rs",
+        "require_eq(intent.target, target)",
+        "assert_intent → require_eq",
+    );
+    // Made by someone other than the position's owner.
+    let mut state: IntentState = decode(&intent).unwrap();
+    let theirs: IntentState =
+        decode(&intent_full(&other, debt(), 10 * USD, purpose::REPAY, 7)).unwrap();
+    state.maker = theirs.maker;
+    c.refuses(
+        intent_leaves(&state),
+        "circuits/repay.rs",
+        "require_eq(position.owner, maker)",
+        IN_EXECUTE_EQ,
+    );
+    // An expiry other than the intent's.
+    c.refuses(
+        field(
+            &p.proof_inputs,
+            "program.public.{now,expiry}",
+            64,
+            64,
+            (EXPIRY + 1).into(),
+        ),
+        "circuits/repay.rs",
+        "require_eq(intent.expiry, public.expiry)",
+        IN_EXECUTE_EQ,
+    );
+    reserve_refusals(&c, &r, NOW);
+}
+
+#[test]
+fn compiled_deposit_refusals() {
+    let user = keypair(7);
+    let other = keypair(9);
+    let k = keeper();
+    // Open: a position for someone other than the maker.
+    let intent = intent_full(&user, coll(), SOL, purpose::DEPOSIT, 7);
+    let p = vault::deposit_open(&k, &addr(&user), intent, V, NOW, TREE).unwrap();
+    let theirs = intent_full(&other, coll(), SOL, purpose::DEPOSIT, 7);
+    let op = vault::deposit_open(&k, &addr(&other), theirs, V, NOW, TREE).unwrap();
+    Compiled {
+        id: CircuitId::DepositOpen,
+        inputs: &p.proof_inputs,
+        execute: DepositOpen::execute,
+    }
+    .refuses(
+        under(&op.proof_inputs, "program.public.user_owner"),
+        "circuits/deposit.rs",
+        "require_eq(intent.owner(), *public_owner.owner())",
+        "deposit_intent → require_eq",
+    );
+
+    // Add: into another position, or someone else's intent.
+    let intent = intent_full(&user, coll(), SOL / 2, purpose::DEPOSIT, 7);
+    let p = vault::deposit_add(
+        &k,
+        &addr(&user),
+        open(&user, SOL, 7),
+        intent.clone(),
+        V,
+        NOW,
+        TREE,
+    )
+    .unwrap();
+    let c = Compiled {
+        id: CircuitId::DepositAdd,
+        inputs: &p.proof_inputs,
+        execute: DepositAdd::execute,
+    };
+    let mut state: IntentState = decode(&intent).unwrap();
+    state.target = 8;
+    c.refuses(
+        intent_leaves(&state),
+        "circuits/notes.rs",
+        "require_eq(intent.target, target)",
+        "assert_intent → require_eq",
+    );
+    let mut state: IntentState = decode(&intent).unwrap();
+    let theirs: IntentState =
+        decode(&intent_full(&other, coll(), SOL / 2, purpose::DEPOSIT, 7)).unwrap();
+    state.maker = theirs.maker;
+    c.refuses(
+        intent_leaves(&state),
+        "circuits/deposit.rs",
+        "require_eq(position.owner, intent.maker)",
+        IN_EXECUTE_EQ,
+    );
+}
+
+#[test]
+fn compiled_close_refusals() {
+    let user = keypair(7);
+    let other = keypair(9);
+    let position = open(&user, SOL, 7);
+    let p = vault::close(&user, position.clone(), V, TREE).unwrap();
+    let c = Compiled {
+        id: CircuitId::Close,
+        inputs: &p.proof_inputs,
+        execute: Close::execute,
+    };
+    let mut state: PositionState = decode(&position).unwrap();
+    state.debt_shares = 1;
+    c.refuses(
+        position_leaves(&state),
+        "circuits/close.rs",
+        "require_eq(position.debt_shares, 0u64)",
+        IN_EXECUTE_EQ,
+    );
+    c.refuses(
+        set("program.public.owner_identity", identity_of(&other)),
+        "circuits/close.rs",
+        "require_eq(owner.key().identity()?, public.owner_identity)",
+        IN_EXECUTE_EQ,
+    );
 }

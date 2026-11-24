@@ -30,6 +30,8 @@ spr-transaction = { workspace = true }
 
 [dev-dependencies]
 serde_json = "1"
+# Editing packed proof-input leaves in the compiled-circuit tests.
+ark-ff = { version = "0.6", default-features = false }
 solana-keypair = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }

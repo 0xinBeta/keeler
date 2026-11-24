@@ -1,7 +1,12 @@
 //! The builders, natively (no network, no proofs): the refusals the circuits
 //! make, and every output's blinding and hash recomputed from its contents
 //! and the first nullifier.
+mod refusal;
 mod utxo;
+
+use keeler_lend::circuits::{CancelIntent, InitReserve, Intent};
+use keeler_lend_sdk::proof::CircuitId;
+use refusal::{field, identity_of, refused, set, Compiled};
 
 use keeler_lend_sdk::{
     builders::{self, Prepared},
@@ -110,35 +115,41 @@ fn intent_outputs_recompute_and_decode() {
         out.data_hash
     );
     // The wrong kind, or an address on a plain note, does not match or is refused.
-    assert!(note_data_hash(NoteKind::Intent, &bytes, Some(&[0; 32])).is_err());
+    assert_eq!(
+        note_data_hash(NoteKind::Intent, &bytes, Some(&[0; 32])).unwrap_err(),
+        "only the reserve has an address"
+    );
 }
 
 #[test]
 fn intent_refuses_wrong_asset_purpose_and_amount() {
     let user = keypair(7);
-    assert!(
+    refused(
         intent_with(
             &user,
             &Address::new_from_array([4; 32]),
             400,
-            purpose::SUPPLY
-        )
-        .is_err(),
-        "wrong asset"
+            purpose::SUPPLY,
+        ),
+        "circuits/notes.rs",
+        "require_eq(hi, mint_hi);",
     );
     for bad in [0, 4, u8::MAX] {
-        assert!(
-            intent_with(&user, &MINT.asset, 400, bad).is_err(),
-            "purpose {bad}"
+        refused(
+            intent_with(&user, &MINT.asset, 400, bad),
+            "circuits/intent.rs",
+            "require(purpose::is_valid(p.purpose));",
         );
     }
-    assert!(
-        intent_with(&user, &MINT.asset, 0, purpose::SUPPLY).is_err(),
-        "zero amount"
+    refused(
+        intent_with(&user, &MINT.asset, 0, purpose::SUPPLY),
+        "circuits/intent.rs",
+        "require(p.amount != 0);",
     );
-    assert!(
-        intent_with(&user, &MINT.asset, SOURCE + 1, purpose::SUPPLY).is_err(),
-        "more than the note"
+    refused(
+        intent_with(&user, &MINT.asset, SOURCE + 1, purpose::SUPPLY),
+        "utxo/balance.rs",
+        "crate::require_eq(high, u64::from(borrow));",
     );
     // A note someone else owns.
     let other = keypair(9);
@@ -154,7 +165,11 @@ fn intent_refuses_wrong_asset_purpose_and_amount() {
         keeper.viewing_pubkey(),
         TREE_ID,
     );
-    assert!(stolen.is_err(), "someone else's note");
+    refused(
+        stolen,
+        "circuits/intent.rs",
+        "require_eq(maker.key().identity()?, public.maker_identity);",
+    );
 }
 
 #[test]
@@ -176,13 +191,99 @@ fn only_the_maker_cancels() {
     );
 
     let other = keypair(9);
-    assert!(
-        builders::cancel_intent(&other, intent.clone(), keeper.viewing_pubkey(), TREE_ID).is_err(),
-        "someone else"
+    refused(
+        builders::cancel_intent(&other, intent.clone(), keeper.viewing_pubkey(), TREE_ID),
+        "circuits/cancel_intent.rs",
+        "require_eq(intent.owner(), *public.user_owner.owner());",
     );
     // The owner check is on the PDA, not the viewing key, which only says
     // whom new notes are encrypted to: any key cancels for the maker.
     assert!(builders::cancel_intent(&user, intent, other.viewing_pubkey(), TREE_ID).is_ok());
+}
+
+// The compiled circuits: valid inputs with one witness changed.
+
+const IN_EXECUTE: &str = "execute → require";
+const IN_EXECUTE_EQ: &str = "execute → require_eq";
+/// `{amount,purpose,target,expiry}`: u64, u8, u64, u64 from bit 0.
+const INTENT_PACKED: &str = "program.private.{amount,purpose,target,expiry}";
+
+#[test]
+fn compiled_intent_refusals() {
+    let user = keypair(7);
+    let p = intent_with(&user, &MINT.asset, 400, purpose::SUPPLY).unwrap();
+    let c = Compiled {
+        id: CircuitId::Intent,
+        inputs: &p.proof_inputs,
+        execute: Intent::execute,
+    };
+    // Another maker's identity: only the identity check.
+    c.refuses(
+        set("program.public.maker_identity", identity_of(&keypair(9))),
+        "circuits/intent.rs",
+        "require_eq(maker.key().identity()?, public.maker_identity);",
+        IN_EXECUTE_EQ,
+    );
+    c.refuses(
+        field(&p.proof_inputs, INTENT_PACKED, 64, 8, 4),
+        "circuits/intent.rs",
+        "require(purpose::is_valid(p.purpose));",
+        IN_EXECUTE,
+    );
+    c.refuses(
+        field(&p.proof_inputs, INTENT_PACKED, 0, 64, 0),
+        "circuits/intent.rs",
+        "require(p.amount != 0);",
+        "→ check program.private.{amount,purpose,target,expiry}",
+    );
+}
+
+#[test]
+fn compiled_cancel_intent_refusals() {
+    let user = keypair(7);
+    let keeper = keypair(1);
+    let p = intent_with(&user, &MINT.asset, 400, purpose::DEPOSIT).unwrap();
+    let owner = user_pda(&user.shielded_address().unwrap().solana_address().unwrap()).owner;
+    let intent = owner
+        .input(&p.outputs[keeler_lend::circuits::INTENT_SLOT], TREE_ID, 1)
+        .unwrap();
+    let cancel = builders::cancel_intent(&user, intent, keeper.viewing_pubkey(), TREE_ID).unwrap();
+    let c = Compiled {
+        id: CircuitId::CancelIntent,
+        inputs: &cancel.proof_inputs,
+        execute: CancelIntent::execute,
+    };
+    c.refuses(
+        set("program.public.maker_identity", identity_of(&keypair(9))),
+        "circuits/cancel_intent.rs",
+        "require_eq(maker.key().identity()?, public.maker_identity);",
+        IN_EXECUTE_EQ,
+    );
+    // The program checks the clock against the public expiry, so it must be
+    // the intent's.
+    c.refuses(
+        set("program.public.expiry", 1_000_000_000u64),
+        "circuits/cancel_intent.rs",
+        "require_eq(intent.expiry, public.expiry);",
+        IN_EXECUTE_EQ,
+    );
+}
+
+#[test]
+fn compiled_init_reserve_refusals() {
+    let p = builders::init_reserve(&keypair(1), ADMIN, MINT, 1_800_000_000, 42, TREE_ID).unwrap();
+    let c = Compiled {
+        id: CircuitId::InitReserve,
+        inputs: &p.proof_inputs,
+        execute: InitReserve::execute,
+    };
+    // A reserve of one mint published as another's.
+    c.refuses(
+        set("program.public.mint_hi", 5u64),
+        "circuits/notes.rs",
+        "require_eq(hi, mint_hi);",
+        "assert_mint → require_eq",
+    );
 }
 
 #[test]
@@ -211,7 +312,10 @@ fn init_reserve_output_recomputes_with_its_address() {
         Some(note_data_hash(NoteKind::Reserve, &bytes, Some(&address)).unwrap()),
         out.data_hash
     );
-    assert!(note_data_hash(NoteKind::Reserve, &bytes, None).is_err());
+    assert_eq!(
+        note_data_hash(NoteKind::Reserve, &bytes, None).unwrap_err(),
+        "the reserve's hash needs its address"
+    );
     // The address depends only on the mint: a second init proves the same one.
     let again = builders::init_reserve(&keeper, ADMIN, MINT, 1_800_000_100, 43, TREE_ID).unwrap();
     let out2 = &again.outputs[data[0]];
