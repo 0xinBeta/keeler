@@ -16,7 +16,7 @@ use keeler_lend::circuits::{
     SupplyPublicInputsClient, REDEEM_BLINDING_DOMAIN, SUPPLY_BLINDING_DOMAIN,
 };
 
-use super::{wallet_address, Args, Prepared};
+use super::{wallet_address, Args, Prepared, OWNER_TX_SECS};
 use crate::{
     decode, err, identity, mint_halves, pool_pda, proof::CircuitId, tag, user_pda, IntentState,
     ReceiptState, RedeemArgs, ReserveState, SupplyArgs,
@@ -183,7 +183,7 @@ pub fn redeem(
     let state: ReceiptState = decode(&receipt)?;
     let first_nullifier = receipt.nullifier;
     let seed = earn_blinding_seed(REDEEM_BLINDING_DOMAIN, &receipt)?;
-    let transaction = RedeemClient {
+    let mut transaction = RedeemClient {
         private: RedeemPrivateInputsClient {
             tx_context: context(seed, tree_id),
             receipt_utxo: receipt,
@@ -210,6 +210,9 @@ pub fn redeem(
     }
     .prepare(&keeper.shielded_address().map_err(err)?, keeper_key)
     .map_err(err)?;
+    transaction.finalized = transaction
+        .finalized
+        .with_expiry_unix_ts(now + OWNER_TX_SECS);
     let (mint_bytes, pool_bump, user_bump) = (mint.asset.to_bytes(), pool.bump, user.bump);
     let owner_viewing = *owner.viewing_pubkey.as_bytes();
     let args: Args = Box::new(move |proof| {

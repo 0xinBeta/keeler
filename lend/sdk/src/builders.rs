@@ -36,6 +36,11 @@ fn wallet_address(wallet: &ShieldedKeypair) -> Result<Address> {
 
 pub(crate) type Args = Box<dyn FnOnce(CompressedProof) -> Result<Vec<u8>>>;
 
+/// How long after its `now` an owner-signed transaction (redeem, draw) stays
+/// valid. The page refuses one that expires more than 300 s past chain time
+/// or never (`docs/lend-api.md`); `now` may trail the chain by up to 60 s.
+pub const OWNER_TX_SECS: u64 = 240;
+
 /// A built transaction, ready to prove.
 pub struct Prepared {
     circuit: CircuitId,
