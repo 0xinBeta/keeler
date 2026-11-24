@@ -138,18 +138,6 @@ fn dispatch_refuses_empty_and_unknown_tags() {
 }
 
 #[test]
-fn unbuilt_instructions_refuse_with_their_own_code() {
-    let (mollusk, id) = setup();
-    for (ix, err) in [
-        (tag::SUPPLY, LendError::SupplyNotBuilt),
-        (tag::REDEEM, LendError::RedeemNotBuilt),
-    ] {
-        let ix = Instruction::new_with_bytes(id, &[ix], vec![]);
-        expect_err_exact(&mollusk, &ix, &[], code(err));
-    }
-}
-
-#[test]
 fn init_reserve_needs_the_keeper_and_the_admin() {
     let (mollusk, _) = setup();
     let (keeper, admin, other) = (pk(&KEEPER), pk(&ADMIN), Pubkey::new_unique());

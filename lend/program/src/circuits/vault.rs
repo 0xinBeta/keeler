@@ -21,6 +21,22 @@ pub const POSITION_BLINDING_DOMAIN: u32 = u32::from_be_bytes(*b"LPOS");
 /// `deposit_open`, which spends no position.
 pub const DEPOSIT_BLINDING_DOMAIN: u32 = u32::from_be_bytes(*b"LDEP");
 
+/// `floor(a x b / d)` for `a x b < 2^NB`, `0 < d < 2^DB`: the same check as
+/// `math`'s private one (a hinted quotient from the two factors, pinned by
+/// `q x d + r == a x b` and `r < d`). A copy, not `math`'s made public:
+/// sharing its instantiations changes the Earn circuits' witness programs.
+pub fn div_floor<const NB: usize, const DB: usize>(a: Field, b: Field, d: Field) -> Field {
+    const { assert!(NB + DB <= 252) };
+    let zero = d == Field::zero();
+    require(!zero);
+    let d = if zero { Field::from(1u8) } else { d };
+    let ([q], [r]) = Field::hint_mulmod_divmod::<1>([a], [b], [d], 128);
+    require_eq(q * d + r, a * b);
+    require(r.lt::<DB>(d));
+    let _ = q.to_bits::<128>();
+    q
+}
+
 /// A vault's rules: its factors and minimums.
 pub struct VaultRules {
     pub params: VaultParams,

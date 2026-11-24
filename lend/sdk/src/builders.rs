@@ -23,6 +23,9 @@ use crate::{
     prove_transact, tag, user_pda, CancelIntentArgs, InitReserveArgs, IntentArgs, IntentState,
 };
 
+mod earn;
+pub use earn::*;
+
 fn wallet_address(wallet: &ShieldedKeypair) -> Result<Address> {
     wallet
         .shielded_address()
@@ -79,6 +82,11 @@ impl Prepared {
             outputs,
             first_nullifier,
         })
+    }
+
+    /// The instruction's own accounts, ahead of the SPP transact accounts.
+    pub fn head(&self) -> &[AccountMeta] {
+        &self.head
     }
 
     /// Proves the SPP side through `indexer` (`wallet` completes its own

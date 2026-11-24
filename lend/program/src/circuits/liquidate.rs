@@ -18,11 +18,12 @@ use spr_program::{
 use super::{
     assert_mint, assert_note,
     math::{
-        accrue, add, debt_of, div_floor, refresh, repay_shares, sub, to_u64, BPS, PRICE_SCALE,
+        accrue, add, debt_of, refresh, repay_shares, sub, to_u64, BPS, PRICE_SCALE,
         TUSD_POOL,
     },
     reserve_address,
     vault::{
+        div_floor,
         above_max_limit, assert_first_nullifier, assert_position, assert_seed,
         at_or_past_threshold, is_liquidatable, value, vault_rules, POSITION_BLINDING_DOMAIN,
     },
