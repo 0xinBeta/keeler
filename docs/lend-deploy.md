@@ -73,9 +73,13 @@ others see or use. Nothing here is done by the deploy script.
    `NETWORK` (`devnet`), `key` the dealer's Keychain item, `admin_key` the `keeler-devnet-deploy`
    item, `state_file`, `pause_file`, `price: "test"`, `price_refresh_secs` (45), `limits`. Check
    that `limits.min_*` are not below the vault's minimums in `LEND_VAULTS`.
-2. **Reserve** (**SOL**, once): `keeler lend-init-reserve <config>`. The keeper pays the fee and the
+2. **Reserve** (**SOL**, once): `keeler lend-init-reserve <keeper config>`. This command and
+   `lend-set-price` take a keeper config, not the dealer config (which they refuse): a file with
+   only the dealer config's `network`, `key`, `http` and `lend`, and the same `state_file`, run with
+   the binary and `KEELER_LEND_KEYS_DIR` that `scripts/run-dealer.sh` uses
+   (`target/devnet-<name>/dealer-cargo/release/keeler`, `target/devnet-<name>/keys`). The keeper pays the fee and the
    admin co-signs. A second run refuses: the reserve exists.
-3. **First test price** (**SOL**: the account's rent and a fee): `keeler lend-set-price <config> 1
+3. **First test price** (**SOL**: the account's rent and a fee): `keeler lend-set-price <keeper config> 1
    <price> <confidence>`, for example `150000000000 150000000` for 150 tUSD per tSOL with 0.1 %
    confidence. It also writes the control file the keeper keeps posting.
 4. **Start the keeper** (**SOL**: a fee per price refresh, about one every 45 s, and the fees of
