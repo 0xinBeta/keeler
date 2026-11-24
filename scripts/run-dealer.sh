@@ -9,8 +9,8 @@
 # Needs cloudflared, wrangler logged in, the config from deploy-devnet.sh and
 # the .tools build for the config's program_id. A config with a `lend`
 # section (docs/lend-keeper.md) also runs the keeper on the same port and
-# tunnel; it needs the lend deploy (target/devnet-<name>/program-id) and the
-# Keychain item keeler-devnet-deploy. The Worker still gets only DEALERS.
+# tunnel; it needs the lend deploy (target/devnet-<name>/: program-id,
+# build-params.json and keys/). The Worker still gets only DEALERS.
 # Pause quoting without stopping settlement: touch the config's pause_file;
 # pause new lending: touch lend.pause_file.
 set -euo pipefail
@@ -59,24 +59,21 @@ if [[ -n $lend_program ]]; then
         if [[ -f $d/program-id && $(cat "$d/program-id") == "$lend_program" ]]; then deployment=${d%/}; fi
     done
     [[ -n $deployment ]] || { echo "no target/devnet-*/program-id holds $lend_program: deploy it with scripts/deploy-lend-devnet.sh first" >&2; exit 1; }
-    swap=$root/target/devnet/deploy-summary.json
-    summary_field() { python3 -c 'import json, sys; s = json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, {"s": s}))' "$swap" "$1"; }
-    [[ $(summary_field 's["dealer"]') == "$dealer" ]] || { echo "$swap's dealer is not $dealer, the keeper the lend program was built for" >&2; exit 1; }
-    # The admin's public key: bytes 32..64 of the deploy keypair, read from a
-    # pipe, never a file or the command line.
-    admin=$(security find-generic-password -s keeler-devnet-deploy -w | python3 -c '
-import json, sys
-b = bytes(json.load(sys.stdin))[32:64]
-n = int.from_bytes(b, "big")
-abc = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-s = ""
-while n:
-    n, r = divmod(n, 58)
-    s = abc[r] + s
-print("1" * (len(b) - len(b.lstrip(b"\0"))) + s)')
-    KEELER_LEND_PROGRAM_ID=$lend_program KEELER_LEND_ADMIN=$admin KEELER_LEND_KEEPER=$dealer \
-        KEELER_LEND_VAULT1_COLLATERAL_MINT=$(summary_field '{m: a for m, a, _ in s["mints"]}["tSOL"]') \
-        KEELER_LEND_VAULT1_DEBT_MINT=$(summary_field '{m: a for m, a, _ in s["mints"]}["tUSD"]') \
+    # The values the deployed program was built with, as deploy-lend-devnet.sh
+    # recorded them: re-deriving them here could pick up a Keychain item or a
+    # swap deploy changed since.
+    params=$deployment/build-params.json
+    [[ -f $params ]] || { echo "no $params: rerun scripts/deploy-lend-devnet.sh --estimate to record it" >&2; exit 1; }
+    param() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$params" "$1"; }
+    [[ $(param program_id) == "$lend_program" ]] || { echo "$params is for another program than $lend_program" >&2; exit 1; }
+    [[ $(param keeper) == "$dealer" ]] || { echo "$params: the lend program's keeper is not the dealer $dealer" >&2; exit 1; }
+    [[ -d $deployment/keys ]] || { echo "no $deployment/keys: rerun scripts/deploy-lend-devnet.sh --estimate" >&2; exit 1; }
+    # The keeper proves with the deployment's own copy of the keys, so a
+    # rebuild of lend/target under a running keeper cannot change them.
+    export KEELER_LEND_KEYS_DIR=$deployment/keys
+    KEELER_LEND_PROGRAM_ID=$lend_program KEELER_LEND_ADMIN=$(param admin) KEELER_LEND_KEEPER=$dealer \
+        KEELER_LEND_VAULT1_COLLATERAL_MINT=$(param collateral_mint) \
+        KEELER_LEND_VAULT1_DEBT_MINT=$(param debt_mint) \
         CARGO_TARGET_DIR=$deployment/dealer-cargo \
         cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
     bin=$deployment/dealer-cargo/release/keeler

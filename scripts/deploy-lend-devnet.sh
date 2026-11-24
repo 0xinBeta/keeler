@@ -19,7 +19,11 @@
 #    holds less than the deploy still needs.
 #
 # Writes only target/devnet-<name>/: plan.json, summary.json, program-id,
-# keeler_lend.so, deploy.log, and the build directories build/ and cargo/.
+# keeler_lend.so, build-params.json (the addresses compiled in), keys/ (the
+# proving keys the keeper reads), deploy.log, and the build directories
+# build/ and cargo/. --estimate writes all but
+# summary.json, so it also records build-params.json and keys/ for a
+# deployment made before they existed.
 # Needs: security (macOS), python3, the main checkout's .tools/env, and the
 # Helius key in the Keychain item keeler-helius-api-key.
 set -euo pipefail
@@ -111,6 +115,38 @@ if [[ ! -f $so ]]; then
     mv "$so.tmp" "$so"
     printf '%s\n' "$program_id" >"$out/program-id"
 fi
+
+# The build parameters the kept .so was built with, recorded for
+# scripts/run-dealer.sh (a keeper built with other values fails every
+# instruction) and checked on each rerun: the Keychain or the swap deploy
+# may have changed since the .so was built.
+python3 - "$out/build-params.json" "$program_id" "$admin" "$keeper" "$collateral" "$debt" <<'EOF'
+import json, os, sys
+path = sys.argv[1]
+names = ["program_id", "admin", "keeper", "collateral_mint", "debt_mint"]
+params = dict(zip(names, sys.argv[2:]))
+if os.path.exists(path) and json.load(open(path)) != params:
+    sys.exit(f"{path} records other build parameters than these; use another deployment name")
+open(path + ".tmp", "w").write(json.dumps(params, indent=2) + "\n")
+os.replace(path + ".tmp", path)
+EOF
+
+# The keeper's proving keys, kept with the deployment: setup-lend.sh rebuilds
+# lend/target in place, under a running keeper.
+keys=$out/keys
+if [[ ! -d $keys ]]; then
+    src=$root/lend/target/zk/keeler-lend
+    (cd "$src" && shasum -a 256 -c --quiet "$root/lend/lend-keys.CHECKSUM") ||
+        { echo "$src does not match lend/lend-keys.CHECKSUM: run scripts/setup-lend.sh" >&2; exit 1; }
+    rm -rf "$keys.tmp"
+    while read -r _ file; do
+        mkdir -p "$keys.tmp/$(dirname "$file")"
+        cp "$src/$file" "$keys.tmp/$file"
+    done <"$root/lend/lend-keys.CHECKSUM"
+    mv "$keys.tmp" "$keys"
+fi
+(cd "$keys" && shasum -a 256 -c --quiet "$root/lend/lend-keys.CHECKSUM") ||
+    { echo "$keys does not match lend/lend-keys.CHECKSUM" >&2; exit 1; }
 
 python3 - "$out/plan.json" "$name" "$so" <<'EOF'
 import json, sys
