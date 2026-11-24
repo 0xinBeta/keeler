@@ -904,9 +904,22 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         let bound = u64::try_from((u128::from(q.high) * (10_000 + m)).div_ceil(10_000))?;
         for p in indebted {
             let s: PositionState = p.state()?;
+            // Sized as the builder will size it; a position left just past
+            // the threshold by the last one is not worth another proof.
+            let plan = core::liquidate(
+                s.debt_shares,
+                r.borrow_price,
+                p.amount,
+                bound,
+                &core::TSOL_TUSD_VAULT,
+            );
             let debt = core::debt_of(s.debt_shares, r.borrow_price).map_err(|e| anyhow!("{e}"))?;
             let value = core::collateral_value(p.amount, bound).map_err(|e| anyhow!("{e}"))?;
-            if core::is_liquidatable(debt, value, &core::TSOL_TUSD_VAULT) {
+            let worth = plan.is_ok_and(|l| {
+                l.repay >= self.cfg.limits.min_repay
+                    || core::above_max_limit(debt, value, &core::TSOL_TUSD_VAULT)
+            });
+            if worth {
                 return Ok(Some(Job::Liquidate {
                     position: p.clone(),
                     bound,
