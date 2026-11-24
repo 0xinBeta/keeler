@@ -1,0 +1,36 @@
+[package]
+name = "keeler-lend-sdk"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+keeler-lend = { path = "../program", features = ["circuits"] }
+xark = { workspace = true }
+xark-groth16 = { workspace = true }
+# xark-groth16 leaves its MSM and FFT crates sequential; unify the features so
+# native proofs use Rayon (as the swap SDK does).
+ark-ec = { version = "0.6", default-features = false, features = ["std", "parallel"] }
+ark-poly = { version = "0.6", default-features = false, features = ["std", "parallel"] }
+sha2 = "0.10"
+tempfile = "3"
+anyhow = { workspace = true }
+borsh = { workspace = true }
+solana-address = { workspace = true, features = ["curve25519"] }
+solana-instruction = { workspace = true }
+wincode = { workspace = true }
+spr-client = { workspace = true }
+spr-hasher = { workspace = true }
+spr-interface = { workspace = true }
+spr-keypair = { workspace = true }
+spr-program = { workspace = true, features = ["client"] }
+spr-transaction = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+solana-keypair = { workspace = true }
+solana-signature = { workspace = true }
+solana-signer = { workspace = true }
+spr-client = { workspace = true, features = ["reqwest", "solana-rpc"] }
+spr-program-test = { workspace = true, features = ["localnet"] }
+

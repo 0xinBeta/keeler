@@ -1,0 +1,224 @@
+//! The builders, natively (no network, no proofs): the refusals the circuits
+//! make, and every output's blinding and hash recomputed from its contents
+//! and the first nullifier.
+#[allow(dead_code)]
+mod utxo;
+
+use keeler_lend_sdk::{
+    builders::{self, Prepared},
+    decode, note_data_hash, output_blinding, output_hash, pool_pda, purpose, user_pda, IntentState,
+    NoteKind, ReserveState, ADMIN,
+};
+use solana_address::Address;
+use solana_keypair::Keypair;
+use spr_keypair::ShieldedKeypair;
+use spr_program::DataUtxo;
+use spr_transaction::{Data, Mint, Utxo, WalletUtxo};
+
+const TREE_ID: u16 = 0;
+const MINT: Mint = Mint::new(Address::new_from_array([3; 32]), 2);
+const SOURCE: u64 = 1_000;
+
+fn keypair(seed: u8) -> ShieldedKeypair {
+    ShieldedKeypair::from_keypair(&Keypair::new_from_array([seed; 32])).unwrap()
+}
+
+fn note(owner: &ShieldedKeypair, mint: Mint, amount: u64) -> WalletUtxo {
+    utxo::wallet_utxo(
+        Utxo {
+            owner: owner.signing_pubkey(),
+            asset: mint,
+            amount,
+            blinding: [5; 32],
+            ring_program_id: None,
+            data: Data::default(),
+        },
+        &owner.nullifier_key,
+        TREE_ID,
+        0,
+    )
+}
+
+fn intent_with(
+    user: &ShieldedKeypair,
+    mint: &Address,
+    amount: u64,
+    purpose: u8,
+) -> anyhow::Result<Prepared> {
+    let keeper = keypair(1);
+    builders::intent(
+        user,
+        note(user, MINT, SOURCE),
+        mint,
+        amount,
+        purpose,
+        7,
+        2_000_000_000,
+        keeper.viewing_pubkey(),
+        TREE_ID,
+    )
+}
+
+/// Every output's blinding and hash recompute; returns the data outputs.
+fn check_outputs(p: &Prepared) -> Vec<usize> {
+    let mut data = Vec::new();
+    for (slot, out) in p.outputs.iter().enumerate() {
+        let Some(owner) = out.owner_address else {
+            continue;
+        };
+        let blinding =
+            output_blinding(&p.first_nullifier, &p.spp.blinding_seed, slot as u32).unwrap();
+        assert_eq!(blinding, out.blinding, "slot {slot} blinding");
+        let hash = output_hash(
+            owner,
+            out.asset.asset.as_array(),
+            out.amount,
+            out.data_hash,
+            blinding,
+            TREE_ID,
+        )
+        .unwrap();
+        assert_eq!(hash, out.hash(TREE_ID).unwrap(), "slot {slot} hash");
+        if out.data_hash.is_some() {
+            data.push(slot);
+        }
+    }
+    data
+}
+
+#[test]
+fn intent_outputs_recompute_and_decode() {
+    let user = keypair(7);
+    let p = intent_with(&user, &MINT.asset, 400, purpose::SUPPLY).unwrap();
+    let data = check_outputs(&p);
+    assert_eq!(data, vec![keeler_lend::circuits::INTENT_SLOT]);
+    let out = &p.outputs[data[0]];
+    assert_eq!(out.amount, 400);
+    assert_eq!(
+        p.outputs[keeler_lend::circuits::INTENT_CHANGE_SLOT].amount,
+        SOURCE - 400
+    );
+    let owner = user_pda(&user.shielded_address().unwrap().solana_address().unwrap()).owner;
+    let intent = owner.input(out, TREE_ID, 1).unwrap();
+    let state: IntentState = decode(&intent).unwrap();
+    assert_eq!(
+        (state.purpose, state.target, state.expiry),
+        (purpose::SUPPLY, 7, 2_000_000_000)
+    );
+    let bytes = borsh::to_vec(&state).unwrap();
+    assert_eq!(
+        Some(note_data_hash(NoteKind::Intent, &bytes, None).unwrap()),
+        out.data_hash
+    );
+    // The wrong kind, or an address on a plain note, does not match or is refused.
+    assert!(note_data_hash(NoteKind::Intent, &bytes, Some(&[0; 32])).is_err());
+}
+
+#[test]
+fn intent_refuses_wrong_asset_purpose_and_amount() {
+    let user = keypair(7);
+    assert!(
+        intent_with(
+            &user,
+            &Address::new_from_array([4; 32]),
+            400,
+            purpose::SUPPLY
+        )
+        .is_err(),
+        "wrong asset"
+    );
+    for bad in [0, 4, u8::MAX] {
+        assert!(
+            intent_with(&user, &MINT.asset, 400, bad).is_err(),
+            "purpose {bad}"
+        );
+    }
+    assert!(
+        intent_with(&user, &MINT.asset, 0, purpose::SUPPLY).is_err(),
+        "zero amount"
+    );
+    assert!(
+        intent_with(&user, &MINT.asset, SOURCE + 1, purpose::SUPPLY).is_err(),
+        "more than the note"
+    );
+    // A note someone else owns.
+    let other = keypair(9);
+    let keeper = keypair(1);
+    let stolen = builders::intent(
+        &user,
+        note(&other, MINT, SOURCE),
+        &MINT.asset,
+        400,
+        purpose::SUPPLY,
+        7,
+        2_000_000_000,
+        keeper.viewing_pubkey(),
+        TREE_ID,
+    );
+    assert!(stolen.is_err(), "someone else's note");
+}
+
+#[test]
+fn only_the_maker_cancels() {
+    let user = keypair(7);
+    let keeper = keypair(1);
+    let p = intent_with(&user, &MINT.asset, 400, purpose::DEPOSIT).unwrap();
+    let out = &p.outputs[keeler_lend::circuits::INTENT_SLOT];
+    let owner = user_pda(&user.shielded_address().unwrap().solana_address().unwrap()).owner;
+    let intent = owner.input(out, TREE_ID, 1).unwrap();
+
+    let cancel =
+        builders::cancel_intent(&user, intent.clone(), keeper.viewing_pubkey(), TREE_ID).unwrap();
+    check_outputs(&cancel);
+    let refund = &cancel.outputs[keeler_lend::circuits::CANCEL_REFUND_SLOT];
+    assert_eq!(
+        (refund.amount, refund.owner_address),
+        (400, Some(user.shielded_address().unwrap()))
+    );
+
+    let other = keypair(9);
+    assert!(
+        builders::cancel_intent(&other, intent.clone(), keeper.viewing_pubkey(), TREE_ID).is_err(),
+        "someone else"
+    );
+    // The owner check is on the PDA, not the viewing key, which only says
+    // whom new notes are encrypted to: any key cancels for the maker.
+    assert!(builders::cancel_intent(&user, intent, other.viewing_pubkey(), TREE_ID).is_ok());
+}
+
+#[test]
+fn init_reserve_output_recomputes_with_its_address() {
+    let keeper = keypair(1);
+    let p = builders::init_reserve(&keeper, ADMIN, MINT, 1_800_000_000, 42, TREE_ID).unwrap();
+    let data = check_outputs(&p);
+    assert_eq!(data.len(), 1);
+    let out = &p.outputs[data[0]];
+    let reserve = pool_pda(&MINT.asset).owner.input(out, TREE_ID, 1).unwrap();
+    let decoded = DataUtxo::<ReserveState>::try_from(reserve).unwrap();
+    let state = &decoded.data;
+    assert_eq!(
+        (
+            state.supply_price,
+            state.borrow_price,
+            state.last_update,
+            state.salt
+        ),
+        (1_000_000_000_000, 1_000_000_000_000, 1_800_000_000, 42)
+    );
+    assert_eq!((state.supply_shares, state.debt_shares), (0, 0));
+    let address = decoded.address.expect("the reserve has an address");
+    let bytes = borsh::to_vec(state).unwrap();
+    assert_eq!(
+        Some(note_data_hash(NoteKind::Reserve, &bytes, Some(&address)).unwrap()),
+        out.data_hash
+    );
+    assert!(note_data_hash(NoteKind::Reserve, &bytes, None).is_err());
+    // The address depends only on the mint: a second init proves the same one.
+    let again = builders::init_reserve(&keeper, ADMIN, MINT, 1_800_000_100, 43, TREE_ID).unwrap();
+    let out2 = &again.outputs[data[0]];
+    let decoded2 = DataUtxo::<ReserveState>::try_from(
+        pool_pda(&MINT.asset).owner.input(out2, TREE_ID, 2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded2.address, Some(address));
+}
