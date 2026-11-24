@@ -56,12 +56,13 @@ mkdir -p "$web_lend"
 cp -R "$wasm/." "$web_lend/"
 
 out=${KEELER_LEND_OUT:-$lend/target}
+# Local networks and devnet: the keeper's test price account (test-price).
 if [[ $out == "$lend/target" ]]; then
-    cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 --sbf-out-dir target/deploy -- --locked --features bpf-entrypoint
+    cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 --sbf-out-dir target/deploy -- --locked --features bpf-entrypoint,test-price
 else
     # Its own cargo target too: the build parameters are compiled in.
     mkdir -p "$out"
-    CARGO_TARGET_DIR=$out/cargo cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 --sbf-out-dir "$out/deploy" -- --locked --features bpf-entrypoint
+    CARGO_TARGET_DIR=$out/cargo cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 --sbf-out-dir "$out/deploy" -- --locked --features bpf-entrypoint,test-price
 fi
 so=$out/deploy/keeler_lend.so
 [[ -f $so ]] || { echo "build-sbf left no $so" >&2; exit 1; }

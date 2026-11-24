@@ -35,8 +35,10 @@ see `SPIKE.md`); take tag 11 for the second one.
 - `circuits::{reserve_seed, reserve_address, assert_mint, assert_note,
   assert_intent}`: every circuit that spends a reserve rebuilds its address
   from the mint, never takes it as a witness.
-- `circuits::math`: `refresh(state, pool, salt)` (accrue then store the new
-  rate), share conversions, `assert_borrow_cap`, `VaultParams`. It passes
+- `circuits::math`: `accrue(state, fee_bps, now)`, then the operation, then
+  `refresh(state, pool, salt)`, which only stores the new rate and salt: it
+  does not accrue, so every circuit that spends a reserve calls `accrue`
+  itself first. Also share conversions, `assert_borrow_cap`, `VaultParams`. It passes
   `web/tests/fixtures/lend-vectors.json` (`cargo test -p keeler-lend
   --features build-circuits --lib`).
 
@@ -56,10 +58,19 @@ see `SPIKE.md`); take tag 11 for the second one.
   the owner (PDA identity), so the viewing key only says whom new notes are
   encrypted to.
 
+## Known limits (not enforced by the circuits)
+
+- `liquidate` seeds its blindings from the position, so the liquidated owner
+  can derive the blinding of the liquidator's change note. The keeper should
+  liquidate from a note of exactly `x + buffer` (empty change slot).
+- An intent's expiry is private and unbounded: a far-future expiry locks the
+  maker's funds until then. The keeper's ticket fixes the expiry and the page
+  uses it; nothing stops an intent made by hand.
+
 ## Build and test
 
 ```sh
-scripts/setup-lend.sh                     # circuits, keys check, wasm, .so, lend/target/keeler-lend-env
+scripts/setup-lend.sh                     # circuits, keys check, wasm, .so (with test-price), lend/target/keeler-lend-env
 cd lend
 cargo test --release -p keeler-lend --features build-circuits --lib   # maths and vectors
 cargo test -p keeler-lend --test program  # Mollusk, on target/deploy/keeler_lend.so
@@ -67,5 +78,10 @@ cargo test --release -p keeler-lend-sdk   # native builder tests
 scripts/run-chain-test.sh                 # local network, port offset 2100
 ```
 
-Local networks: a port offset in 2100-2500 (`ZOLANA_PORT_OFFSET`, prover on
+Features: exactly one of `insecure-test-setup` (the default) and `mainnet`.
+`test-price` is not a default: `scripts/setup-lend.sh` passes it for the
+local and devnet `.so`, and it cannot build with `mainnet`. A `mainnet`
+build refuses any default build parameter (`program/build.rs`).
+
+Local networks: a port offset in 2100-2700 (`ZOLANA_PORT_OFFSET`, prover on
 3001 + offset / 100), and stop what you start.

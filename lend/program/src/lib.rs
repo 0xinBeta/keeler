@@ -1,7 +1,17 @@
 //! Keeler Lend: a pool with private amounts (`docs/plan-lend.md`). See
 //! `../AGENTS.md` for which files belong to which piece of work.
-#[cfg(all(not(feature = "build-circuits"), not(feature = "insecure-test-setup")))]
-compile_error!("the lend verifying keys require the insecure-test-setup feature");
+// Exactly one of `insecure-test-setup` (local networks and devnet) and
+// `mainnet`. A mainnet build also needs verifying keys from a real setup
+// (the committed ones refuse to compile without insecure-test-setup) and
+// every build parameter set (build.rs).
+#[cfg(all(
+    not(feature = "build-circuits"),
+    not(feature = "insecure-test-setup"),
+    not(feature = "mainnet")
+))]
+compile_error!("enable exactly one of the insecure-test-setup and mainnet features");
+#[cfg(all(feature = "insecure-test-setup", feature = "mainnet"))]
+compile_error!("enable exactly one of the insecure-test-setup and mainnet features");
 
 #[cfg(any(feature = "circuits", feature = "wasm"))]
 pub mod circuits;
@@ -52,6 +62,8 @@ pub const USER_SEED: &[u8] = b"user";
 /// Pool ids (`ReceiptState::pool`, a `SUPPLY` intent's target).
 pub mod pool {
     pub const TUSD: u64 = 1;
+    /// The tUSD pool's mint, the only one with a reserve: vault 1's debt mint.
+    pub const TUSD_MINT: solana_address::Address = crate::VAULT1_DEBT_MINT;
 }
 
 /// Vault ids (`PositionState::vault`).

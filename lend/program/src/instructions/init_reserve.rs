@@ -5,7 +5,10 @@ use spr_account_checks::AccountIterator;
 use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
-use super::{check_now, cpi, mint_halves, parse, require_admin, require_keeper, verified, Pda};
+use super::{
+    check_now, cpi, mint_halves, parse, require_admin, require_keeper, require_pool_mint, verified,
+    Pda,
+};
 use crate::{verifier::init_reserve as v, POOL_SEED};
 
 #[derive(SchemaRead, SchemaWrite)]
@@ -26,6 +29,7 @@ pub fn process(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     require_admin(iter.next_signer("admin")?)?;
     let (args, transact, bytes) = parse::<InitReserveArgs>(data)?;
     check_now(args.now)?;
+    require_pool_mint(&args.mint)?;
     let pool = Pda::new(POOL_SEED, &args.mint, args.pool_bump)?;
     let (mint_hi, mint_lo) = mint_halves(&args.mint);
     verified(

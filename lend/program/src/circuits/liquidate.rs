@@ -3,8 +3,9 @@
 //! buffer of `floor(x x penalty / 1e4)` into the reserve (with no shares),
 //! and takes `floor((x + buffer) x 1e12 / bound)` of collateral, capped at
 //! the position's. Unless the position was above the max limit, it may not be
-//! left healthier than the threshold. The circuit does not prove `x` is the
-//! largest: the keeper computes it with `core::lend::liquidate`. No owner
+//! left healthier than the threshold, and `x` must remove at least one debt
+//! share. The circuit does not prove `x` is the largest: the keeper computes
+//! it with `core::lend::liquidate`. No owner
 //! signature; the rest of the collateral stays in the position.
 use spr_program::{
     circuit::{
@@ -146,6 +147,9 @@ impl Liquidate {
         // Debt shares follow the repay rule for x (x <= debt: no change).
         let (shares, _) = repay_shares(position.debt_shares, x, reserve.borrow_price);
         let removed = sub(position.debt_shares, shares);
+        // No collateral without less debt: a dust `x` below one share's worth
+        // would take collateral and remove nothing.
+        require(removed != 0);
         reserve.debt_shares = sub(reserve.debt_shares, removed);
         position.debt_shares = shares;
         funds.transfer(&mut reserve, &paid_in)?;

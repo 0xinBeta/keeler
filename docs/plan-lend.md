@@ -158,10 +158,14 @@ Rules:
 - **Liquidation**: the liquidator repays `x` and receives collateral worth
   `x` at the bound. A further `x × penalty` of collateral is sold the same way
   and its proceeds stay in the reserve as a buffer against bad debt, so the
-  keeper earns nothing from liquidating. The size is fixed by the circuit: the
-  largest `x` that leaves the position at the threshold, or the whole debt
-  when the position is above the max limit, with what is left returned to the
-  owner. Debt left on a position with no collateral stays on the books and
+  keeper earns nothing from liquidating. The circuit bounds the size, it does
+  not fix it: `0 < x <= debt`; `x` removes at least one debt share (or clears
+  the debt), so collateral is never taken without reducing the debt; and,
+  unless the position is above the max limit, the position is left at or
+  past the threshold, never healthier. Within that the keeper chooses `x`:
+  it takes the largest that leaves the position at the threshold, or the
+  whole debt above the max limit (`core::lend::liquidate`), with what is left
+  returned to the owner. Debt left on a position with no collateral stays on the books and
   keeps accruing; the buffer covers it first, then the last suppliers to
   leave bear it.
 - **Seeds**: an instruction that spends a position seeds its blindings from
@@ -219,6 +223,17 @@ instruction, a different payout).
 - **Other pool users** learn the price indices at their own operations, so
   they can estimate utilisation over time and notice very large operations.
 - **The keeper** sees all amounts of all pool users.
+- **A liquidated owner** can derive the blinding of the liquidator's change
+  note: `liquidate` seeds every output's blinding from the position, whose
+  opening the owner holds. The keeper therefore liquidates from a note of
+  exactly `x + buffer`, so the change slot is empty and the owner learns
+  nothing about the keeper's other funds.
+- **Intent expiry** is a private value with no upper bound in the circuit:
+  a far-future expiry locks the maker's own funds until then, since
+  `cancel_intent` waits for it and the keeper fills only an intent matching
+  one of its tickets. The ticket fixes the expiry (`now + ticket_secs`) and
+  the page uses the ticket's; an intent made outside the page with another
+  expiry is the maker's own risk.
 
 ### Differences from Jupiter Lend
 

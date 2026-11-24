@@ -2,10 +2,14 @@
 //! with no borrows (prices stay, `last_update` moves), the keeper recovers a
 //! receipt from the chain with its writer key, a partial redeem (keeper signs
 //! first, the owner co-signs) and a full redeem, with compute units and sizes.
+//! The first supply proof is resent with one argument changed (maker, now,
+//! expiry, a bump) and refused with the expected error.
 //!
 //! Run through `lend/scripts/run-chain-test.sh` (`ZOLANA_PORT_OFFSET`, the
 //! tool paths from `.tools/env`, the SBF build in `lend/target/deploy`).
 //! Ignored in a plain `cargo test`.
+#[path = "tamper.rs"]
+mod tamper;
 #[path = "wallet.rs"]
 mod wallet;
 
@@ -20,6 +24,7 @@ use keeler_lend::circuits::{
     REDEEM_PAYOUT_SLOT, REDEEM_RECEIPT_SLOT, REDEEM_RESERVE_SLOT, SUPPLY_RECEIPT_SLOT,
     SUPPLY_RESERVE_SLOT,
 };
+use keeler_lend::{instructions::supply::SupplyArgs, POOL_SEED, USER_SEED};
 use keeler_lend_sdk::{
     builders::{self, recover_output},
     decode, note_data_hash, pool_pda, purpose, user_pda, NoteKind, ReceiptState, ReserveState,
@@ -38,6 +43,7 @@ use spr_program_test::{
     SprProgramTest,
 };
 use spr_transaction::{AssetRegistry, Mint, SppProofOutputUtxo, WalletUtxo};
+use tamper::{canonical, non_canonical, refused_with, tampered, INVALID_PROOF, INVALID_SEEDS};
 use wallet::{deposit, send, wait_for_merkle_proof, TestWallet};
 
 const USER_FUNDS: u64 = 10_000_000;
@@ -332,7 +338,10 @@ fn supply_accrue_and_redeem() -> Result<()> {
     // 3. The keeper supplies both.
     let mut supply_sigs = Vec::new();
     let mut receipt_outs = Vec::new();
-    for (user, intent, amount) in [(&a, &intents[0], SUPPLY_A), (&b, &intents[1], SUPPLY_B)] {
+    for (i, (user, intent, amount)) in [(&a, &intents[0], SUPPLY_A), (&b, &intents[1], SUPPLY_B)]
+        .into_iter()
+        .enumerate()
+    {
         let now = chain_now(&localnet)?;
         let p = builders::supply(
             &keeper,
@@ -348,6 +357,39 @@ fn supply_accrue_and_redeem() -> Result<()> {
             p.outputs[SUPPLY_RECEIPT_SLOT].clone(),
         );
         let ix = p.prove(indexer, tree, &keeper)?;
+        if i == 0 {
+            // The proof resent with one argument changed is refused.
+            let b_wallet = b_key.pubkey().to_bytes();
+            type Edit = Box<dyn FnOnce(&mut SupplyArgs)>;
+            let cases: [(&str, Edit, &str); 4] = [
+                (
+                    "supply for another maker",
+                    Box::new(move |a| {
+                        a.maker = b_wallet;
+                        a.user_bump = canonical(USER_SEED, &b_wallet);
+                    }),
+                    INVALID_PROOF,
+                ),
+                (
+                    "supply at another now",
+                    Box::new(|a| a.now -= 1),
+                    INVALID_PROOF,
+                ),
+                (
+                    "supply with another expiry",
+                    Box::new(|a| a.expiry += 1),
+                    INVALID_PROOF,
+                ),
+                (
+                    "supply with a non-canonical pool bump",
+                    Box::new(move |a| a.pool_bump = non_canonical(POOL_SEED, mint.as_array())),
+                    INVALID_SEEDS,
+                ),
+            ];
+            for (what, edit, code) in cases {
+                refused_with(what, send(rpc, &[&keeper_key], tampered(&ix, edit)), code)?;
+            }
+        }
         let sig = send(rpc, &[&keeper_key], ix.clone())?;
         report(&rpc_url, "supply", &keeper_key.pubkey(), &ix, &sig)?;
         reserve = indexed(&localnet, &pool, &res_out)?;

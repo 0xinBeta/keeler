@@ -11,7 +11,8 @@
 //!   fixture's SPL mint, Pyth's SOL/USD account) and
 //!   `KEELER_LEND_VAULT1_FEED_ID` (64 hex; default: Pyth's SOL/USD feed)
 //!
-//! Each is base58 unless noted. They land in `$OUT_DIR/ids.rs`.
+//! Each is base58 unless noted. They land in `$OUT_DIR/ids.rs`. A `mainnet`
+//! build refuses any of the six addresses left at its default.
 use std::{env, fs, path::Path};
 
 const DEFAULTS: [(&str, &str); 6] = [
@@ -47,9 +48,15 @@ const FEED_ID: (&str, &str) = (
 
 fn main() {
     let mut out = String::new();
+    let mainnet = env::var_os("CARGO_FEATURE_MAINNET").is_some();
     for (name, default) in DEFAULTS {
         println!("cargo:rerun-if-env-changed={name}");
         let value = env::var(name).unwrap_or_else(|_| default.to_owned());
+        // The defaults are local test keys (the admin and keeper are public).
+        assert!(
+            !mainnet || value != default,
+            "a mainnet build needs {name} set to a value other than its local default"
+        );
         // Base58 of 32 bytes is 32 to 44 characters; anything else is a typo.
         assert!(
             (32..=44).contains(&value.len())

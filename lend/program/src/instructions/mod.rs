@@ -82,8 +82,12 @@ pub(crate) struct Pda {
 
 impl Pda {
     pub fn new(seed: &'static [u8], key: &[u8; 32], bump: u8) -> Result<Self, ProgramError> {
-        let address = Address::create_program_address(&[seed, key, &[bump]], &crate::ID)
-            .map_err(|_| LendError::InvalidSeeds)?;
+        // Only the canonical bump: another one derives another PDA for the
+        // same key (a second pool PDA would own a second reserve of the mint).
+        let (address, canonical) = Address::find_program_address(&[seed, key], &crate::ID);
+        if bump != canonical {
+            return Err(LendError::InvalidSeeds.into());
+        }
         Ok(Self {
             address,
             key: *key,
@@ -172,6 +176,15 @@ fn require_signer(account: &AccountView, expected: &Address, error: LendError) -
 /// key against.
 pub(crate) fn identity(wallet: &Address) -> Result<[u8; 32], ProgramError> {
     solana_owner_identity(wallet.as_array()).map_err(|_| LendError::InvalidInstructionData.into())
+}
+
+/// Requires `mint` to be the pool's: the circuits hard-code the tUSD pool's
+/// curve, fee and minimum, so no other mint may have a reserve.
+pub(crate) fn require_pool_mint(mint: &[u8; 32]) -> ProgramResult {
+    if mint != crate::pool::TUSD_MINT.as_array() {
+        return Err(LendError::UnknownMint.into());
+    }
+    Ok(())
 }
 
 /// The mint as two big-endian `u128` halves, as the circuits take it.

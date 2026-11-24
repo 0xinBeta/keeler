@@ -25,12 +25,14 @@ pub enum LendError {
     NotAdmin = 20_004,
     /// The public `now` is not in `[clock - NOW_WINDOW, clock]`.
     StaleNow = 20_005,
-    /// A PDA bump that does not derive a PDA.
+    /// A PDA bump that is not the canonical one.
     InvalidSeeds = 20_006,
     /// A signer the instruction needs did not sign.
     MissingSignature = 20_007,
     /// The account list is not the expected layout.
     InvalidAccounts = 20_008,
+    /// A mint other than the pool's.
+    UnknownMint = 20_009,
 
     // cancel_intent.
     /// Cancel is allowed only after the intent's expiry.

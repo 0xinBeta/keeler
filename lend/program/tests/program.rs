@@ -24,7 +24,7 @@ use spr_interface::{
 use spr_program::CompressedProof;
 
 const SBF_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/deploy");
-const MINT: [u8; 32] = [9; 32];
+const MINT: [u8; 32] = keeler_lend::pool::TUSD_MINT.to_bytes();
 const NOW: i64 = 1_800_000_000;
 
 fn setup() -> (Mollusk, Pubkey) {
@@ -193,23 +193,80 @@ fn init_reserve_refuses_truncated_data() {
     );
 }
 
+/// A bump below the canonical one that still derives a PDA: another address
+/// for the same seeds.
+fn non_canonical(seed: &[u8], key: &[u8; 32]) -> u8 {
+    let id = pk(&keeler_lend::ID);
+    (0..bump(seed, key))
+        .rev()
+        .find(|b| Pubkey::create_program_address(&[seed, key, &[*b]], &id).is_ok())
+        .unwrap()
+}
+
 #[test]
-fn init_reserve_refuses_a_bump_with_no_pda() {
+fn init_reserve_refuses_any_bump_but_the_canonical_one() {
     let (mollusk, _) = setup();
     let (mut ix, accounts) = init_reserve(pk(&KEEPER), pk(&ADMIN), true, NOW as u64);
     let id = pk(&keeler_lend::ID);
-    let bad = (0..=u8::MAX)
+    let no_pda = (0..=u8::MAX)
         .rev()
         .find(|b| Pubkey::create_program_address(&[POOL_SEED, &MINT, &[*b]], &id).is_err())
         .unwrap();
+    // A second pool PDA (and so a second reserve) for the same mint: refused.
+    for bad in [no_pda, non_canonical(POOL_SEED, &MINT)] {
+        let args = InitReserveArgs {
+            proof: proof(),
+            mint: MINT,
+            pool_viewing: [2; 33],
+            pool_bump: bad,
+            now: NOW as u64,
+        };
+        ix.data = data(tag::INIT_RESERVE, wincode::serialize(&args).unwrap());
+        expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidSeeds));
+    }
+}
+
+#[test]
+fn init_reserve_refuses_a_mint_other_than_the_pools() {
+    let (mollusk, _) = setup();
+    let (mut ix, accounts) = init_reserve(pk(&KEEPER), pk(&ADMIN), true, NOW as u64);
+    let foreign = [9; 32];
     let args = InitReserveArgs {
         proof: proof(),
-        mint: MINT,
+        mint: foreign,
         pool_viewing: [2; 33],
-        pool_bump: bad,
+        pool_bump: bump(POOL_SEED, &foreign),
         now: NOW as u64,
     };
     ix.data = data(tag::INIT_RESERVE, wincode::serialize(&args).unwrap());
+    expect_err_exact(&mollusk, &ix, &accounts, code(LendError::UnknownMint));
+}
+
+#[test]
+fn intent_and_cancel_refuse_a_non_canonical_user_bump() {
+    let (mollusk, _) = setup();
+    let user = Pubkey::new_unique();
+    let bad = non_canonical(USER_SEED, &user.to_bytes());
+    let intent = IntentArgs {
+        proof: proof(),
+        mint: MINT,
+        viewing: [2; 33],
+        user_bump: bad,
+    };
+    let mut ix = Instruction {
+        program_id: pk(&keeler_lend::ID),
+        accounts: vec![AccountMeta::new(user, true)],
+        data: data(tag::INTENT, wincode::serialize(&intent).unwrap()),
+    };
+    let accounts = [(user, account())];
+    expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidSeeds));
+    let cancel = CancelIntentArgs {
+        proof: proof(),
+        viewing: [2; 33],
+        user_bump: bad,
+        expiry: NOW as u64 - 1,
+    };
+    ix.data = data(tag::CANCEL_INTENT, wincode::serialize(&cancel).unwrap());
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidSeeds));
 }
 

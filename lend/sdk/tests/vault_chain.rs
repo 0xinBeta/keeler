@@ -5,12 +5,16 @@
 //! liquidates back to the threshold; a second drop takes it past the max
 //! limit and the keeper liquidates all of the debt; the borrower closes it.
 //! A second position borrows, repays all with change, and closes. Prints
-//! compute units and sizes.
+//! compute units and sizes. Draw, repay and liquidate proofs are first
+//! resent with one argument changed (bound, vault, owner, now, expiry, a
+//! bump) and refused with the expected error.
 //!
 //! Run through `lend/scripts/run-chain-test.sh` with
 //! `LEND_CHAIN_TESTS=vault_chain` (`ZOLANA_PORT_OFFSET`, the tool paths from
 //! `.tools/env`, the SBF build in `lend/target/deploy`). Ignored in a plain
 //! `cargo test`.
+#[path = "tamper.rs"]
+mod tamper;
 #[path = "wallet.rs"]
 mod wallet;
 
@@ -29,7 +33,9 @@ use keeler_lend::{
         LIQUIDATE_POSITION_SLOT, LIQUIDATE_RESERVE_SLOT, REPAY_CHANGE_SLOT, REPAY_POSITION_SLOT,
         REPAY_RESERVE_SLOT, SUPPLY_RESERVE_SLOT,
     },
+    instructions::{draw::DrawArgs, liquidate::LiquidateArgs, repay::RepayArgs},
     vaults::TSOL_TUSD,
+    USER_SEED,
 };
 use keeler_lend_sdk::{
     builders::{self, recover_output, Prepared},
@@ -51,6 +57,9 @@ use spr_program_test::{
     SprProgramTest,
 };
 use spr_transaction::{AssetRegistry, Mint, SppProofOutputUtxo, WalletUtxo};
+use tamper::{
+    canonical, non_canonical, refused_with, tampered, INVALID_PROOF, INVALID_SEEDS, UNKNOWN_VAULT,
+};
 use wallet::{deposit, send, wait_for_merkle_proof, TestWallet};
 
 const BUDGET: u32 = 1_400_000;
@@ -135,8 +144,20 @@ impl Env {
 
     /// Proves and sends a keeper-built transaction; the keeper alone signs.
     fn keeper_sends(&self, name: &str, p: Prepared) -> Result<Signature> {
+        self.keeper_sends_after(name, p, |_| Ok(()))
+    }
+
+    /// [`Self::keeper_sends`], with `first` run on the proved instruction
+    /// before it is sent.
+    fn keeper_sends_after(
+        &self,
+        name: &str,
+        p: Prepared,
+        first: impl FnOnce(&Instruction) -> Result<()>,
+    ) -> Result<Signature> {
         let (tree, _) = self.tree();
         let ix = p.prove(self.localnet.client.indexer(), tree, &self.keeper)?;
+        first(&ix)?;
         let sig = send(self.localnet.client.rpc(), &[&self.keeper_key], ix.clone())?;
         self.confirm(sig)?;
         self.report(name, &self.keeper_key.pubkey(), &ix, &sig)?;
@@ -488,6 +509,16 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
             p.outputs[DRAW_DEBT_SLOT].clone(),
         );
         let ix = p.prove(indexer, tree, keeper)?;
+        // The proof resent with one argument changed is refused.
+        let resend = |edit: fn(&mut DrawArgs)| {
+            keeper_then_owner(rpc, &env.keeper_key, &borrower_key, tampered(&ix, edit))
+        };
+        refused_with(
+            "draw at a lower bound",
+            resend(|a| a.bound -= 1),
+            INVALID_PROOF,
+        )?;
+        refused_with("draw on vault 2", resend(|a| a.vault = 2), UNKNOWN_VAULT)?;
         let sig = keeper_then_owner(rpc, &env.keeper_key, &borrower_key, ix.clone())?;
         env.confirm(sig)?;
         env.report("draw (borrow)", &env.keeper_key.pubkey(), &ix, &sig)?;
@@ -529,7 +560,35 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
         p.outputs[REPAY_RESERVE_SLOT].clone(),
     );
     ensure!(p.outputs[REPAY_CHANGE_SLOT].amount == 0, "no change");
-    env.keeper_sends("repay (partial)", p)?;
+    let lender = lender_key.pubkey().to_bytes();
+    env.keeper_sends_after("repay (partial)", p, |ix| {
+        let resend = |edit: &dyn Fn(&mut RepayArgs)| {
+            send(rpc, &[&env.keeper_key], tampered(ix, |a| edit(a)))
+        };
+        refused_with(
+            "repay for another owner",
+            resend(&|a| {
+                a.owner = lender;
+                a.user_bump = canonical(USER_SEED, &lender);
+            }),
+            INVALID_PROOF,
+        )?;
+        refused_with(
+            "repay at another now",
+            resend(&|a| a.now -= 1),
+            INVALID_PROOF,
+        )?;
+        refused_with(
+            "repay with another expiry",
+            resend(&|a| a.expiry += 1),
+            INVALID_PROOF,
+        )?;
+        refused_with(
+            "repay with a non-canonical user bump",
+            resend(&|a| a.user_bump = non_canonical(USER_SEED, &a.owner)),
+            INVALID_SEEDS,
+        )
+    })?;
     (position, reserve) = (env.indexed(&user, &pos)?, env.indexed(&pool, &res)?);
     let r: ReserveState = decode(&reserve)?;
     ensure!(
@@ -575,7 +634,17 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
             p.outputs[LIQUIDATE_PAYOUT_SLOT].clone(),
         );
         ensure!(payout.amount == plan.payout, "payout");
-        env.keeper_sends("liquidate", p)?;
+        env.keeper_sends_after("liquidate", p, |ix| {
+            refused_with(
+                "liquidate at a higher bound",
+                send(
+                    rpc,
+                    &[&env.keeper_key],
+                    tampered(ix, |a: &mut LiquidateArgs| a.bound += 1),
+                ),
+                INVALID_PROOF,
+            )
+        })?;
         env.wait(&change)?;
         env.wait(&payout)?;
         Ok((env.indexed(&user, &pos)?, env.indexed(&pool, &res)?, plan))

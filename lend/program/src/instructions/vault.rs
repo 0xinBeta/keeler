@@ -238,8 +238,10 @@ pub fn set_test_price(accounts: &mut [AccountView], data: &[u8]) -> ProgramResul
         return Err(VaultError::WrongTestPriceAccount.into());
     }
     if !account.owned_by(&crate::ID) {
-        // Create it: the keeper pays the rent, the PDA signs for itself. The
-        // system program must be among the transaction's accounts.
+        // Create it: the keeper tops it up to the rent, then the PDA signs to
+        // allocate and assign itself. Not create-account, which refuses an
+        // address someone already sent lamports to. The system program must
+        // be among the transaction's accounts.
         let id = args.vault.to_le_bytes();
         let bump = [bump];
         let seeds = [
@@ -247,24 +249,32 @@ pub fn set_test_price(accounts: &mut [AccountView], data: &[u8]) -> ProgramResul
             Seed::from(&id),
             Seed::from(&bump),
         ];
-        let lamports = Rent::get()?.try_minimum_balance(TEST_PRICE_LEN)?;
-        let mut create = [0u8; 52];
-        create[4..12].copy_from_slice(&lamports.to_le_bytes());
-        create[12..20].copy_from_slice(&(TEST_PRICE_LEN as u64).to_le_bytes());
-        create[20..52].copy_from_slice(crate::ID.as_array());
-        let metas = [
-            InstructionAccount::writable_signer(keeper.address()),
-            InstructionAccount::writable_signer(account.address()),
-        ];
-        pinocchio::cpi::invoke_signed(
-            &InstructionView {
-                program_id: &SYSTEM_PROGRAM,
-                data: &create,
-                accounts: &metas,
-            },
-            &[*keeper, *account],
-            &[Signer::from(&seeds)],
-        )?;
+        let rent = Rent::get()?.try_minimum_balance(TEST_PRICE_LEN)?;
+        let short = rent.saturating_sub(account.lamports());
+        if short > 0 {
+            let mut transfer = [0u8; 12];
+            transfer[0] = 2;
+            transfer[4..].copy_from_slice(&short.to_le_bytes());
+            system(
+                &transfer,
+                &[
+                    InstructionAccount::writable_signer(keeper.address()),
+                    InstructionAccount::writable(account.address()),
+                ],
+                &[*keeper, *account],
+                &[],
+            )?;
+        }
+        let pda = [InstructionAccount::writable_signer(account.address())];
+        let signer = [Signer::from(&seeds)];
+        let mut allocate = [0u8; 12];
+        allocate[0] = 8;
+        allocate[4..].copy_from_slice(&(TEST_PRICE_LEN as u64).to_le_bytes());
+        system(&allocate, &pda, &[*account], &signer)?;
+        let mut assign = [0u8; 36];
+        assign[0] = 1;
+        assign[4..].copy_from_slice(crate::ID.as_array());
+        system(&assign, &pda, &[*account], &signer)?;
     }
     let mut bytes = account.try_borrow_mut()?;
     let out = bytes
@@ -274,6 +284,24 @@ pub fn set_test_price(accounts: &mut [AccountView], data: &[u8]) -> ProgramResul
     out[8..16].copy_from_slice(&args.confidence.to_le_bytes());
     out[16..].copy_from_slice(&args.published.to_le_bytes());
     Ok(())
+}
+
+/// A system program instruction (`data` starts with its u32 LE index).
+fn system(
+    data: &[u8],
+    metas: &[InstructionAccount],
+    accounts: &[AccountView],
+    signers: &[Signer],
+) -> ProgramResult {
+    pinocchio::cpi::invoke_signed_with_bounds::<2, _>(
+        &InstructionView {
+            program_id: &SYSTEM_PROGRAM,
+            data,
+            accounts: metas,
+        },
+        accounts,
+        signers,
+    )
 }
 
 const SYSTEM_PROGRAM: Address = Address::new_from_array([0; 32]);

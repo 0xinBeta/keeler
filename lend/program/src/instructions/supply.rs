@@ -5,7 +5,9 @@ use spr_account_checks::AccountIterator;
 use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
-use super::{check_now, clock, cpi, mint_halves, parse, require_keeper, verified, Pda};
+use super::{
+    check_now, clock, cpi, mint_halves, parse, require_keeper, require_pool_mint, verified, Pda,
+};
 use crate::{error::LendError, verifier::supply as v, POOL_SEED, USER_SEED};
 
 #[derive(SchemaRead, SchemaWrite)]
@@ -37,6 +39,7 @@ pub fn process(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     if clock()? > expiry {
         return Err(LendError::IntentExpired.into());
     }
+    require_pool_mint(&args.mint)?;
     let pool = Pda::new(POOL_SEED, &args.mint, args.pool_bump)?;
     let user = Pda::new(USER_SEED, &args.maker, args.user_bump)?;
     let (mint_hi, mint_lo) = mint_halves(&args.mint);

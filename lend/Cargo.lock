@@ -2829,6 +2829,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ark-ec 0.6.0",
+ "ark-ff 0.6.0",
  "ark-poly 0.6.0",
  "borsh",
  "keeler-core",

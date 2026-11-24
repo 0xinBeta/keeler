@@ -3,7 +3,12 @@
 //! output recomputed by its owner from the user note and the first nullifier.
 //! Pool-owned notes with chosen states are forged here: native execution does
 //! not check the tree, only the note's contents.
+mod refusal;
 mod utxo;
+
+use keeler_lend::circuits::{Redeem, Supply};
+use keeler_lend_sdk::{proof::CircuitId, IntentState};
+use refusal::{identity_of, refused, reserve_refusals, state_leaves, under, Compiled};
 
 use keeler_lend::circuits::{
     REDEEM_BLINDING_DOMAIN, REDEEM_PAYOUT_SLOT, REDEEM_RECEIPT_SLOT, REDEEM_RESERVE_SLOT,
@@ -328,32 +333,58 @@ fn supply_refuses_another_owner_pool_purpose_mint_and_expiry() {
     let ok = supply_intent(&user, 2_000_000);
     assert!(supply(&address(&user), reserve.clone(), ok.clone(), NOW).is_ok());
     // A receipt minted to someone other than the maker.
-    assert!(
-        supply(&address(&other), reserve.clone(), ok.clone(), NOW).is_err(),
-        "receipt to another wallet"
+    refused(
+        supply(&address(&other), reserve.clone(), ok.clone(), NOW),
+        "circuits/supply.rs",
+        "require_eq(intent.owner(), *public.user_owner.owner());",
     );
     // Another pool, or a deposit / repay intent.
-    for (purpose, target) in [
-        (purpose::SUPPLY, TUSD + 1),
-        (purpose::DEPOSIT, TUSD),
-        (purpose::REPAY, TUSD),
+    for (purpose, target, needle) in [
+        (
+            purpose::SUPPLY,
+            TUSD + 1,
+            "require_eq(intent.target, target);",
+        ),
+        (
+            purpose::DEPOSIT,
+            TUSD,
+            "require_eq(intent.purpose, purpose);",
+        ),
+        (purpose::REPAY, TUSD, "require_eq(intent.purpose, purpose);"),
     ] {
         let intent = intent_of(&user, MINT, 2_000_000, purpose, target);
-        assert!(
-            supply(&address(&user), reserve.clone(), intent, NOW).is_err(),
-            "purpose {purpose} target {target}"
+        refused(
+            supply(&address(&user), reserve.clone(), intent, NOW),
+            "circuits/notes.rs",
+            needle,
         );
     }
     // An intent of another mint into this pool.
     let wrong = intent_of(&user, OTHER_MINT, 2_000_000, purpose::SUPPLY, TUSD);
-    assert!(supply(&address(&user), reserve.clone(), wrong, NOW).is_err());
+    refused(
+        supply(&address(&user), reserve.clone(), wrong, NOW),
+        "circuits/notes.rs",
+        "require_eq(hi, mint_hi);",
+    );
     // Filled after its expiry, or with `now` before the reserve's last update.
     assert!(supply(&address(&user), reserve.clone(), ok.clone(), EXPIRY).is_ok());
-    assert!(supply(&address(&user), reserve.clone(), ok.clone(), EXPIRY + 1).is_err());
-    assert!(supply(&address(&user), reserve.clone(), ok, NOW - 1).is_err());
+    refused(
+        supply(&address(&user), reserve.clone(), ok.clone(), EXPIRY + 1),
+        "circuits/notes.rs",
+        "require(now <= intent.expiry);",
+    );
+    refused(
+        supply(&address(&user), reserve.clone(), ok, NOW - 1),
+        "circuits/math.rs",
+        "require(now >= state.last_update);",
+    );
     // Below the pool's minimum.
     let small = supply_intent(&user, TUSD_MIN_SUPPLY - 1);
-    assert!(supply(&address(&user), reserve.clone(), small, NOW).is_err());
+    refused(
+        supply(&address(&user), reserve.clone(), small, NOW),
+        "circuits/supply.rs",
+        "require(amount >= TUSD_MIN_SUPPLY);",
+    );
     let min = supply_intent(&user, TUSD_MIN_SUPPLY);
     assert!(supply(&address(&user), reserve, min, NOW).is_ok());
 }
@@ -381,7 +412,11 @@ fn supply_refuses_a_fake_reserve() {
     .is_ok());
     // Another mint's reserve.
     let (_, other) = fresh_reserve(OTHER_MINT);
-    assert!(supply(&address(&user), other, intent.clone(), NOW).is_err());
+    refused(
+        supply(&address(&user), other, intent.clone(), NOW),
+        "circuits/notes.rs",
+        "require_eq(hi, mint_hi);",
+    );
     // A second "reserve" of this mint at another address.
     let elsewhere = reserve_address(OTHER_MINT);
     let fake = forge(
@@ -391,7 +426,11 @@ fn supply_refuses_a_fake_reserve() {
         [elsewhere.to_vec(), bytes.clone()].concat(),
         note_data_hash(NoteKind::Reserve, &bytes, Some(&elsewhere)).unwrap(),
     );
-    assert!(supply(&address(&user), fake, intent.clone(), NOW).is_err());
+    refused(
+        supply(&address(&user), fake, intent.clone(), NOW),
+        "utxo/data.rs",
+        "require_eq(input.data_hash, expected);",
+    );
     // A plain data note with the reserve's state, at no address.
     let plain = forge(
         &pool,
@@ -401,7 +440,11 @@ fn supply_refuses_a_fake_reserve() {
         spr_program::hasher::data_hash(&spr_program::hasher::DataHasher::hash(&state).unwrap())
             .unwrap(),
     );
-    assert!(supply(&address(&user), plain, intent.clone(), NOW).is_err());
+    refused(
+        supply(&address(&user), plain, intent.clone(), NOW),
+        "utxo/data.rs",
+        "require_eq(input.data_hash, expected);",
+    );
     // The reserve's address and state under another owner (the user's PDA).
     let address_ = reserve_address(MINT);
     let mut template_user = template.clone();
@@ -418,7 +461,11 @@ fn supply_refuses_a_fake_reserve() {
         [address_.to_vec(), bytes.clone()].concat(),
         note_data_hash(NoteKind::Reserve, &bytes, Some(&address_)).unwrap(),
     );
-    assert!(supply(&address(&user), foreign, intent, NOW).is_err());
+    refused(
+        supply(&address(&user), foreign, intent, NOW),
+        "circuits/notes.rs",
+        "require_eq(note.owner(), *owner);",
+    );
 }
 
 #[test]
@@ -534,7 +581,11 @@ fn supply_and_redeem_pass_the_shared_vectors() {
             now,
         );
         if c["out"].is_null() {
-            assert!(got.is_err(), "{name}");
+            refused(
+                got,
+                "circuits/supply.rs",
+                "require(amount >= TUSD_MIN_SUPPLY);",
+            );
             continue;
         }
         let p = got.unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -562,7 +613,12 @@ fn supply_and_redeem_pass_the_shared_vectors() {
             state.last_update,
         );
         if c["out"].is_null() {
-            assert!(got.is_err(), "{name}");
+            let (file, needle) = match name {
+                "more than held" => ("circuits/math.rs", "require(a >= b);"),
+                "more than idle" => ("utxo/balance.rs", "require_eq(high, u64::from(borrow));"),
+                _ => ("circuits/redeem.rs", "require(p.amount != 0);"),
+            };
+            refused(got, file, needle);
             continue;
         }
         let p = got.unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -628,34 +684,44 @@ fn redeem_refuses_non_owner_overdraw_and_stale_now() {
     let (_, reserve, receipt) = supplied(&user, 3_000_000);
     assert!(redeem(&address(&user), reserve.clone(), receipt.clone(), 1, NOW).is_ok());
     // Someone else redeeming the user's receipt.
-    assert!(redeem(&address(&other), reserve.clone(), receipt.clone(), 1, NOW).is_err());
+    refused(
+        redeem(&address(&other), reserve.clone(), receipt.clone(), 1, NOW),
+        "circuits/redeem.rs",
+        "require_eq(receipt.owner(), *public.user_owner.owner());",
+    );
     // More than the receipt holds, though the pool has it.
     let (_, big_reserve, _) = supplied(&other, 50_000_000);
     let big = ReserveState {
         supply_shares: 53_000_000,
         ..decode(&big_reserve).unwrap()
     };
-    assert!(redeem(
-        &address(&user),
-        reserve_with(&big, 53_000_000),
-        receipt.clone(),
-        3_000_001,
-        NOW
-    )
-    .is_err());
+    refused(
+        redeem(
+            &address(&user),
+            reserve_with(&big, 53_000_000),
+            receipt.clone(),
+            3_000_001,
+            NOW,
+        ),
+        "circuits/math.rs",
+        "require(a >= b);",
+    );
     // More than the reserve's idle balance, though the receipt holds it.
     let thin = ReserveState {
         supply_shares: 3_000_000,
         ..decode(&reserve).unwrap()
     };
-    assert!(redeem(
-        &address(&user),
-        reserve_with(&thin, 2_999_999),
-        receipt.clone(),
-        3_000_000,
-        NOW
-    )
-    .is_err());
+    refused(
+        redeem(
+            &address(&user),
+            reserve_with(&thin, 2_999_999),
+            receipt.clone(),
+            3_000_000,
+            NOW,
+        ),
+        "utxo/balance.rs",
+        "crate::require_eq(high, u64::from(borrow));",
+    );
     assert!(redeem(
         &address(&user),
         reserve_with(&thin, 3_000_000),
@@ -665,18 +731,29 @@ fn redeem_refuses_non_owner_overdraw_and_stale_now() {
     )
     .is_ok());
     // Zero, and `now` before the reserve's last update.
-    assert!(redeem(&address(&user), reserve.clone(), receipt.clone(), 0, NOW).is_err());
-    assert!(redeem(
-        &address(&user),
-        reserve.clone(),
-        receipt.clone(),
-        1,
-        NOW - 1
-    )
-    .is_err());
+    refused(
+        redeem(&address(&user), reserve.clone(), receipt.clone(), 0, NOW),
+        "circuits/redeem.rs",
+        "require(p.amount != 0);",
+    );
+    refused(
+        redeem(
+            &address(&user),
+            reserve.clone(),
+            receipt.clone(),
+            1,
+            NOW - 1,
+        ),
+        "circuits/math.rs",
+        "require(now >= state.last_update);",
+    );
     // Another mint's reserve.
     let (_, other_reserve) = fresh_reserve(OTHER_MINT);
-    assert!(redeem(&address(&user), other_reserve, receipt, 1, NOW).is_err());
+    refused(
+        redeem(&address(&user), other_reserve, receipt, 1, NOW),
+        "circuits/notes.rs",
+        "require_eq(hi, mint_hi);",
+    );
 }
 
 #[test]
@@ -703,14 +780,17 @@ fn redeem_rounds_for_the_pool() {
         receipt_out(&p, &user, REDEEM_RECEIPT_SLOT).1.supply_shares,
         2
     );
-    assert!(redeem(
-        &address(&user),
-        reserve_with(&state, 10),
-        receipt_with(&user, 3),
-        5,
-        NOW
-    )
-    .is_err());
+    refused(
+        redeem(
+            &address(&user),
+            reserve_with(&state, 10),
+            receipt_with(&user, 3),
+            5,
+            NOW,
+        ),
+        "circuits/math.rs",
+        "require(a >= b);",
+    );
     let p = redeem(
         &address(&user),
         reserve_with(&state, 10),
@@ -738,4 +818,102 @@ fn redeem_instruction_has_the_keeper_paying_and_the_owner_read_only() {
     assert_eq!(head[1].pubkey, wallet(&user));
     assert!(head[1].is_signer && !head[1].is_writable);
     assert_eq!(p.spp.payer, wallet(&keeper()), "the keeper pays SPP");
+}
+
+// The compiled circuits: valid inputs with one witness changed.
+
+const IN_EXECUTE_EQ: &str = "execute → require_eq";
+
+#[test]
+fn compiled_supply_refusals() {
+    let user = keypair(7);
+    let other = keypair(9);
+    let (_, reserve) = fresh_reserve(MINT);
+    let intent = supply_intent(&user, 2_000_000);
+    let p = supply(&address(&user), reserve.clone(), intent.clone(), NOW).unwrap();
+    let c = Compiled {
+        id: CircuitId::Supply,
+        inputs: &p.proof_inputs,
+        execute: Supply::execute,
+    };
+    // A receipt for someone other than the intent's maker.
+    let op = supply(
+        &address(&other),
+        reserve.clone(),
+        supply_intent(&other, 2_000_000),
+        NOW,
+    )
+    .unwrap();
+    c.refuses(
+        under(&op.proof_inputs, "program.public.user_owner"),
+        "circuits/supply.rs",
+        "require_eq(intent.owner(), *public.user_owner.owner());",
+        IN_EXECUTE_EQ,
+    );
+    // An intent for another pool.
+    let mut state: IntentState = decode(&intent).unwrap();
+    state.target = TUSD + 1;
+    c.refuses(
+        state_leaves("intent", NoteKind::Intent, &state, None),
+        "circuits/notes.rs",
+        "require_eq(intent.target, target);",
+        "assert_intent → require_eq",
+    );
+    reserve_refusals(&c, &reserve, NOW);
+}
+
+#[test]
+fn compiled_redeem_refusals() {
+    let user = keypair(7);
+    let other = keypair(9);
+    let (_, reserve, receipt) = supplied(&user, 3_000_000);
+    let p = redeem(
+        &address(&user),
+        reserve.clone(),
+        receipt.clone(),
+        1_000_000,
+        NOW,
+    )
+    .unwrap();
+    let c = Compiled {
+        id: CircuitId::Redeem,
+        inputs: &p.proof_inputs,
+        execute: Redeem::execute,
+    };
+    // More than the receipt's shares. The compiled chain shows `sub` inlined
+    // into `execute`; the native run pins the line.
+    let mut state: ReceiptState = decode(&receipt).unwrap();
+    state.supply_shares = 999_999;
+    c.refuses(
+        state_leaves("receipt", NoteKind::Receipt, &state, None),
+        "circuits/math.rs",
+        "require(a >= b);",
+        "execute → require",
+    );
+    // A receipt of another pool.
+    let mut state: ReceiptState = decode(&receipt).unwrap();
+    state.pool = TUSD + 1;
+    c.refuses(
+        state_leaves("receipt", NoteKind::Receipt, &state, None),
+        "circuits/redeem.rs",
+        "require_eq(receipt.pool, pool::TUSD);",
+        IN_EXECUTE_EQ,
+    );
+    // The owner's PDA with another signer's identity: only that check.
+    c.refuses(
+        refusal::set("program.public.owner_identity", identity_of(&other)),
+        "circuits/redeem.rs",
+        "require_eq(owner.key().identity()?, public.owner_identity);",
+        IN_EXECUTE_EQ,
+    );
+    // Another signer's PDA: the receipt is not theirs.
+    let (_, oreserve, oreceipt) = supplied(&other, 3_000_000);
+    let op = redeem(&address(&other), oreserve, oreceipt, 1_000_000, NOW).unwrap();
+    c.refuses(
+        under(&op.proof_inputs, "program.public.user_owner"),
+        "circuits/redeem.rs",
+        "require_eq(receipt.owner(), *public.user_owner.owner());",
+        IN_EXECUTE_EQ,
+    );
+    reserve_refusals(&c, &reserve, NOW);
 }
