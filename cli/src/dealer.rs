@@ -9,10 +9,10 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Mutex,
     },
-    thread::{self, sleep},
+    thread::{self, sleep, Scope},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -34,6 +34,7 @@ use crate::{
     chain::{hex, shielded, Chain, Status},
     config::{parse_address, DealerConfig, Pricer, Prover, SellLimit},
     faucet::{Claims, Faucet, Limits},
+    keeper::LendRoutes,
     trader::{fair_amount, sign_quote, signed_by},
 };
 
@@ -45,6 +46,12 @@ const MAX_HEAD: usize = 8192;
 const HTTP_POLL: Duration = Duration::from_millis(100);
 /// Time one HTTP request may take from accept to reply.
 const HTTP_DEADLINE: Duration = Duration::from_secs(3);
+/// Largest `/lend/*` body: signed requests carry a session authorisation.
+const MAX_LEND_BODY: usize = 16_384;
+/// A `/lend/build` proves a transaction; the Worker waits 30 s.
+const LEND_DEADLINE: Duration = Duration::from_secs(30);
+/// `/lend/*` requests served at once, each on its own thread.
+const MAX_LEND_THREADS: usize = 8;
 const HOUR: u64 = 3_600;
 const DEFAULT_AUTO_PAUSE: u32 = 3;
 const DEFAULT_MIN_FEE: u64 = 10_000_000;
@@ -324,12 +331,30 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
         }
         None => None,
     };
+    let parts = cfg
+        .lend
+        .as_ref()
+        .map(|l| crate::keeper::connect(l, &c.network, &c.key))
+        .transpose()?;
+    let keeper = match (&cfg.lend, &parts) {
+        (Some(l), Some(p)) => Some(crate::keeper::Keeper::open(
+            l,
+            &p.chain,
+            &p.signer,
+            p.state.clone(),
+        )?),
+        _ => None,
+    };
+    let lend = keeper.as_ref().map(|k| k as &dyn LendRoutes);
     let api = &api;
     thread::scope(|s| {
         let server = s.spawn(|| serve(listener, stop, |rfq| api.quote(rfq)));
         s.spawn(|| api.pay_claims(queue, stop));
-        let web =
-            http.map(|(l, key)| s.spawn(move || serve_http(l, &key, stop, api, HTTP_DEADLINE)));
+        if let Some(k) = &keeper {
+            s.spawn(|| k.run(stop));
+        }
+        let web = http
+            .map(|(l, key)| s.spawn(move || serve_http(l, &key, stop, api, lend, HTTP_DEADLINE)));
         let mut seen = HashSet::new();
         let mut bound = HashMap::new();
         while !stop.load(Ordering::Relaxed)
@@ -473,19 +498,19 @@ impl Api for DealerApi<'_> {
 }
 
 /// A read that fails once `until` passes, however slowly bytes arrive.
-struct Deadline<'a> {
-    stream: &'a TcpStream,
+struct Deadline {
+    stream: TcpStream,
     until: Instant,
 }
 
-impl Read for Deadline<'_> {
+impl Read for Deadline {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let left = self.until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
         self.stream.set_read_timeout(Some(left))?;
-        (&mut &*self.stream).read(buf)
+        (&self.stream).read(buf)
     }
 }
 
@@ -549,44 +574,85 @@ fn read_head(r: &mut impl BufRead) -> io::Result<Option<Head>> {
     }
 }
 
-/// Serves the HTTP API one connection at a time until `stop` is set. Each
-/// connection gets `deadline` from accept to reply, no body is read before
-/// the key and the declared length pass, and every reply closes.
-fn serve_http(
+/// Serves the HTTP API until `stop` is set: swap routes one connection at a
+/// time, `/lend/*` (when `lend` is set) on threads of their own. Each
+/// connection gets `deadline` from accept to its head and swap reply (lend:
+/// `LEND_DEADLINE`), no body is read before the key and the declared length
+/// pass, and every reply closes.
+pub fn serve_http(
     listener: TcpListener,
     key: &str,
     stop: &AtomicBool,
     api: &impl Api,
+    lend: Option<&dyn LendRoutes>,
     deadline: Duration,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
-    while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, remote)) => one_request(stream, remote, key, api, deadline),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => sleep(HTTP_POLL),
-            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
-            Err(e) => return Err(e.into()),
+    let busy = AtomicUsize::new(0);
+    thread::scope(|s| {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, remote)) => {
+                    one_request(s, stream, remote, key, api, lend, &busy, deadline)
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => sleep(HTTP_POLL),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
+                Err(e) => return Err(e.into()),
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
-fn one_request(
+#[allow(clippy::too_many_arguments)]
+fn one_request<'s>(
+    scope: &'s Scope<'s, '_>,
     stream: TcpStream,
     remote: SocketAddr,
-    key: &str,
+    key: &'s str,
     api: &impl Api,
+    lend: Option<&'s dyn LendRoutes>,
+    busy: &'s AtomicUsize,
     deadline: Duration,
 ) {
     if stream.set_nonblocking(false).is_err() || stream.set_write_timeout(Some(deadline)).is_err() {
         return;
     }
+    let Ok(clone) = stream.try_clone() else {
+        return;
+    };
     let mut reader = BufReader::new(Deadline {
-        stream: &stream,
+        stream: clone,
         until: Instant::now() + deadline,
     });
     let (status, body) = match read_head(&mut reader) {
         Ok(Some(h)) if h.chunked => error(400, "bad request"),
+        Ok(Some(h)) if h.path.starts_with("/lend/") && lend.is_some() => {
+            let Some(lend) = lend else { return };
+            if busy.fetch_add(1, Ordering::SeqCst) >= MAX_LEND_THREADS {
+                busy.fetch_sub(1, Ordering::SeqCst);
+                return reply(&stream, error(503, "busy; try again shortly"));
+            }
+            reader.get_mut().until = Instant::now() + LEND_DEADLINE;
+            let _ = stream.set_write_timeout(Some(LEND_DEADLINE));
+            scope.spawn(move || {
+                let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
+                let out = match read_body(
+                    key,
+                    Some(remote),
+                    h.key.as_deref(),
+                    h.length,
+                    &mut body,
+                    MAX_LEND_BODY,
+                ) {
+                    Ok(buf) => lend.lend(&h.method, &h.path, &buf),
+                    Err(e) => e,
+                };
+                reply(&stream, out);
+                busy.fetch_sub(1, Ordering::SeqCst);
+            });
+            return;
+        }
         Ok(Some(h)) => {
             let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
             handle(
@@ -603,6 +669,10 @@ fn one_request(
         Ok(None) => error(400, "bad request"),
         Err(_) => error(408, "request timeout"),
     };
+    reply(&stream, (status, body));
+}
+
+fn reply(stream: &TcpStream, (status, body): (u16, Value)) {
     let text = body.to_string();
     let reason = match status {
         200 => "OK",
@@ -612,7 +682,11 @@ fn one_request(
         404 => "Not Found",
         408 => "Request Timeout",
         409 => "Conflict",
+        410 => "Gone",
+        412 => "Precondition Failed",
         413 => "Payload Too Large",
+        422 => "Unprocessable Content",
+        423 => "Locked",
         429 => "Too Many Requests",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -623,7 +697,7 @@ fn one_request(
         text.len()
     );
     // A client that hung up only loses its own reply.
-    let _ = (&stream).write_all(reply.as_bytes());
+    let _ = (&mut &*stream).write_all(reply.as_bytes());
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
@@ -658,6 +732,35 @@ fn error(status: u16, msg: &str) -> (u16, Value) {
     (status, json!({ "error": msg }))
 }
 
+/// The body, once the remote is loopback, the key matches and the declared
+/// length is at most `max`.
+fn read_body(
+    key: &str,
+    remote: Option<SocketAddr>,
+    given_key: Option<&str>,
+    length: Option<usize>,
+    body: &mut dyn Read,
+    max: usize,
+) -> Result<Vec<u8>, (u16, Value)> {
+    if !remote.is_some_and(|r| r.ip().is_loopback()) {
+        return Err(error(403, "loopback only"));
+    }
+    if !given_key.is_some_and(|g| same_key(g.as_bytes(), key.as_bytes())) {
+        return Err(error(401, "bad key"));
+    }
+    if length.is_some_and(|l| l > max) {
+        return Err(error(413, "body too large"));
+    }
+    let mut buf = Vec::new();
+    if body.take(max as u64 + 1).read_to_end(&mut buf).is_err() {
+        return Err(error(400, "bad request"));
+    }
+    if buf.len() > max {
+        return Err(error(413, "body too large"));
+    }
+    Ok(buf)
+}
+
 /// One HTTP request. The key and the declared length are checked before any
 /// body byte is read.
 #[allow(clippy::too_many_arguments)]
@@ -671,26 +774,10 @@ fn handle(
     length: Option<usize>,
     body: &mut dyn Read,
 ) -> (u16, Value) {
-    if !remote.is_some_and(|r| r.ip().is_loopback()) {
-        return error(403, "loopback only");
-    }
-    if !given_key.is_some_and(|g| same_key(g.as_bytes(), key.as_bytes())) {
-        return error(401, "bad key");
-    }
-    if length.is_some_and(|l| l > MAX_BODY) {
-        return error(413, "body too large");
-    }
-    let mut buf = Vec::new();
-    if body
-        .take(MAX_BODY as u64 + 1)
-        .read_to_end(&mut buf)
-        .is_err()
-    {
-        return error(400, "bad request");
-    }
-    if buf.len() > MAX_BODY {
-        return error(413, "body too large");
-    }
+    let buf = match read_body(key, remote, given_key, length, body, MAX_BODY) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
     let path = url.split('?').next().unwrap_or_default();
     match (method, path) {
         ("GET", "/health") => match api.now() {
@@ -1233,8 +1320,8 @@ mod tests {
         let stop = AtomicBool::new(false);
         let api = fake();
         thread::scope(|s| {
-            let server =
-                s.spawn(|| serve_http(listener, KEY, &stop, &api, Duration::from_millis(400)));
+            let server = s
+                .spawn(|| serve_http(listener, KEY, &stop, &api, None, Duration::from_millis(400)));
             test(at);
             stop.store(true, Ordering::Relaxed);
             server.join().unwrap().unwrap();
@@ -1258,6 +1345,66 @@ mod tests {
     fn health(at: SocketAddr) -> String {
         let raw = format!("GET /health HTTP/1.1\r\nHost: x\r\nx-keeler-key: {KEY}\r\n\r\n");
         exchange(at, raw.as_bytes(), None).0
+    }
+
+    /// Lend routes that echo the body size, slowly for `/lend/slow`.
+    struct Echo;
+
+    impl LendRoutes for Echo {
+        fn lend(&self, _: &str, url: &str, body: &[u8]) -> (u16, Value) {
+            if url == "/lend/slow" {
+                sleep(Duration::from_millis(1500));
+            }
+            (200, json!({ "len": body.len() }))
+        }
+    }
+
+    #[test]
+    fn lend_routes_have_their_own_threads_and_a_16k_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let stop = AtomicBool::new(false);
+        let api = fake();
+        let post = |path: &str, key: &str, len: usize| {
+            format!(
+                "POST {path} HTTP/1.1\r\nx-keeler-key: {key}\r\nContent-Length: {len}\r\n\r\n{}",
+                "x".repeat(len)
+            )
+        };
+        thread::scope(|s| {
+            let server = s.spawn(|| {
+                serve_http(
+                    listener,
+                    KEY,
+                    &stop,
+                    &api,
+                    Some(&Echo),
+                    Duration::from_millis(400),
+                )
+            });
+            let (r, _) = exchange(at, post("/lend/ticket", KEY, 16_384).as_bytes(), None);
+            assert!(r.ends_with(r#"{"len":16384}"#), "{r}");
+            let (r, _) = exchange(at, post("/lend/ticket", KEY, 16_385).as_bytes(), None);
+            assert!(r.starts_with("HTTP/1.1 413"), "{r}");
+            let (r, _) = exchange(at, post("/lend/ticket", "nope", 10).as_bytes(), None);
+            assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+            // The swap cap stays 4 KiB.
+            let (r, _) = exchange(at, post("/quote", KEY, 4_097).as_bytes(), None);
+            assert!(r.starts_with("HTTP/1.1 413"), "{r}");
+            // A slow lend request does not hold up the swap routes.
+            let slow = s.spawn(move || exchange(at, post("/lend/slow", KEY, 2).as_bytes(), None));
+            sleep(Duration::from_millis(100));
+            let started = Instant::now();
+            assert!(health(at).starts_with("HTTP/1.1 200"));
+            assert!(started.elapsed() < Duration::from_millis(1000));
+            let (r, took) = slow.join().unwrap();
+            assert!(
+                r.ends_with(r#"{"len":2}"#) && took >= Duration::from_millis(1500),
+                "{r}"
+            );
+            stop.store(true, Ordering::Relaxed);
+            server.join().unwrap().unwrap();
+        });
     }
 
     #[test]

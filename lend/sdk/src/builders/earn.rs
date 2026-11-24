@@ -242,3 +242,35 @@ pub fn redeem(
     );
     Ok(prepared)
 }
+
+/// The payout that burns exactly `shares` at `now`: `assets_of(shares,
+/// supply price accrued to now)`. The circuit burns `ceil(amount x 1e12 /
+/// supply_price)`, which gives back exactly `shares` because the supply
+/// price never falls below 1e12; this checks it.
+pub fn redeem_amount_for_shares(reserve: &ReserveState, shares: u64, now: u64) -> Result<u64> {
+    let price = crate::vault::accrued(reserve, now)?.supply_price;
+    let amount = keeler_core::lend::assets_of(shares, price).map_err(err)?;
+    ensure!(amount > 0, "those shares are worth nothing");
+    ensure!(
+        keeler_core::lend::shares_to_burn(amount, price).map_err(err)? == shares,
+        "these shares cannot be redeemed exactly"
+    );
+    Ok(amount)
+}
+
+/// [`redeem`] burning exactly `shares` of `receipt` (the page's "withdraw
+/// everything" leaves a receipt of zero shares).
+#[allow(clippy::too_many_arguments)]
+pub fn redeem_shares(
+    keeper: &ShieldedKeypair,
+    owner: &ShieldedAddress,
+    reserve: WalletUtxo,
+    receipt: WalletUtxo,
+    shares: u64,
+    now: u64,
+    salt: u128,
+    tree_id: u16,
+) -> Result<Prepared> {
+    let amount = redeem_amount_for_shares(&decode(&reserve)?, shares, now)?;
+    redeem(keeper, owner, reserve, receipt, amount, now, salt, tree_id)
+}

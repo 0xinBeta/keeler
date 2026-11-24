@@ -3,12 +3,15 @@ use std::{process::ExitCode, sync::atomic::AtomicBool};
 use anyhow::{bail, Result};
 use keeler::{
     config::{parse_address, DealerConfig, TraderConfig},
-    dealer, trader,
+    dealer, keeper, lend_chain, trader,
 };
 
 const USAGE: &str = "usage: keeler swap <config> <sell_mint> <buy_mint> <amount>
        keeler dealer <config>
-       keeler refund <config>";
+       keeler refund <config>
+       keeler keeper <keeper config>
+       keeler lend-init-reserve <keeper config>
+       keeler lend-set-price <keeper config> <vault> <price x1e12> <confidence x1e12>";
 
 fn main() -> ExitCode {
     // A panic in any thread ends the process, so the supervisor restarts the
@@ -44,6 +47,35 @@ fn run(args: &[String]) -> Result<()> {
         }
         [cmd, cfg] if cmd == "dealer" => {
             dealer::run(&DealerConfig::load(cfg)?, &AtomicBool::new(false))?;
+        }
+        [cmd, cfg] if cmd == "keeper" => {
+            keeper::run_standalone(&keeper::KeeperConfig::load(cfg)?, &AtomicBool::new(false))?;
+        }
+        [cmd, cfg] if cmd == "lend-init-reserve" => {
+            let cfg = keeper::KeeperConfig::load(cfg)?;
+            let admin = cfg
+                .lend
+                .admin_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lend.admin_key is not set"))?
+                .keypair()?;
+            let p = keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
+            println!(
+                "reserve created: {}",
+                lend_chain::init_reserve(&p.chain, &admin)?
+            );
+        }
+        [cmd, cfg, vault, price, confidence] if cmd == "lend-set-price" => {
+            let cfg = keeper::KeeperConfig::load(cfg)?;
+            keeper::require_test_network(&cfg.lend)?;
+            let p = keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
+            let sig = lend_chain::set_test_price(
+                &p.chain,
+                vault.parse()?,
+                price.parse()?,
+                confidence.parse()?,
+            )?;
+            println!("test price set: {sig}");
         }
         [cmd, cfg] if cmd == "refund" => {
             let done = trader::refund(&TraderConfig::load(cfg)?.common)?;

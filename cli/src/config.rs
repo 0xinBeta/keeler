@@ -254,6 +254,9 @@ pub struct DealerConfig {
     /// No quotes while the dealer's fee SOL is below this; default 0.01 SOL.
     #[serde(default)]
     pub min_fee_lamports: Option<u64>,
+    /// The Keeler Lend keeper, served on the same HTTP server (`/lend/*`).
+    #[serde(default)]
+    pub lend: Option<crate::keeper::Lend>,
 }
 
 /// Limits on what traders sell to the dealer in `mint`.
@@ -347,6 +350,13 @@ impl DealerConfig {
             for t in &f.tokens {
                 parse_address(&t.mint)?;
             }
+        }
+        if let Some(l) = &self.lend {
+            ensure!(
+                self.http.is_some(),
+                "the lend keeper needs the http section"
+            );
+            l.check()?;
         }
         for l in &self.limits {
             parse_address(&l.mint)?;

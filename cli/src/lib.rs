@@ -10,4 +10,7 @@ pub mod config;
 pub mod dealer;
 pub mod deploy;
 pub mod faucet;
+pub mod keeper;
+pub mod lend_auth;
+pub mod lend_chain;
 pub mod trader;
