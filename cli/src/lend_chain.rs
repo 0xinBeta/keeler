@@ -27,7 +27,9 @@ use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use spr_client::{compile_message, user_registry, ComputeBudgetConfig, HistoryFilters, Rpc};
+use spr_client::{
+    compile_message, user_registry, ComputeBudgetConfig, HistoryFilters, PaginationToken, Rpc,
+};
 use spr_interface::event::OutputDataEncoding;
 use spr_keypair::{ShieldedAddress, ShieldedKeypair};
 use spr_program::ProgramOwner;
@@ -43,7 +45,7 @@ use crate::{
     chain::{shielded, Chain},
     config::Network,
     keeper::{
-        Built, Intent, Job, Ledger, LendPrice, Note, Op, Pending, Quote, KIND_INTENT,
+        Built, Intent, Job, Ledger, LendPrice, Note, Op, Pending, Quote, Rejected, KIND_INTENT,
         KIND_POSITION, KIND_RECEIPT, KIND_RESERVE,
     },
     lend_auth::to_hex,
@@ -217,10 +219,13 @@ impl LendChain {
 
     /// The smallest keeper note of the debt token worth `need`, merging
     /// notes with a self-transfer when none is.
+    /// Every note it picks is claimed, so the swap dealer (same wallet, same
+    /// process) leaves it alone.
     fn funds(&self, need: u64) -> Result<WalletUtxo> {
         let mut notes = self.chain.notes(&self.kp, TSOL_TUSD.debt_mint)?;
         notes.sort_by_key(|u| u.utxo.amount);
         if let Some(n) = notes.iter().find(|u| u.utxo.amount >= need) {
+            crate::chain::claim(n);
             return Ok(n.clone());
         }
         let top: Vec<WalletUtxo> = notes.into_iter().rev().take(MAX_MERGE).collect();
@@ -230,6 +235,7 @@ impl LendChain {
             "the keeper holds too little of the debt token to liquidate"
         );
         log!("lend: merging {} keeper notes for a liquidation", top.len());
+        top.iter().for_each(crate::chain::claim);
         let payer = self.kp.pubkey();
         let me = self.kp.shielded_address().map_err(err)?;
         let mut tx = ConfidentialTransaction::new(top, payer).map_err(err)?;
@@ -241,17 +247,31 @@ impl LendChain {
         spr_client::Submission::new(&signed, payer, &self.kp)
             .send_sync(&self.chain.client, &[&self.kp])
             .map_err(|e| anyhow!("merge: {e:?}"))?;
-        self.chain
+        let merged = self
+            .chain
             .notes(&self.kp, TSOL_TUSD.debt_mint)?
             .into_iter()
             .find(|u| u.utxo.amount >= need)
-            .context("the merged note was not found")
+            .context("the merged note was not found")?;
+        crate::chain::claim(&merged);
+        Ok(merged)
+    }
+
+    /// Proves `p`: the SPP side through the network's configured prover
+    /// (Helius on devnet), as the swap dealer does, the lend side here.
+    fn prove(&self, p: Prepared) -> Result<solana_instruction::Instruction> {
+        let client = &self.chain.client;
+        p.prove_with(self.chain.tree, |spp| {
+            client
+                .prove_transact(spp, None, &keeler_lend_sdk::Authority(&self.kp))
+                .map_err(|e| anyhow!("prove transact: {e:?}"))
+        })
     }
 
     /// Proves `p`, compiles it with the keeper paying and signs as the
     /// keeper; other signers' slots stay empty for them to fill.
     fn finish(&self, p: Prepared) -> Result<Vec<u8>> {
-        let ix = p.prove(self.chain.client.indexer(), self.chain.tree, &self.kp)?;
+        let ix = self.prove(p)?;
         let (blockhash, _) = self.rpc().get_latest_blockhash()?;
         let message = compile_message(
             &self.key.pubkey(),
@@ -302,62 +322,15 @@ impl LendChain {
     }
 
     /// The lend instruction of transaction `sig`: its tag and the wallet it
-    /// acts for.
+    /// acts for. A transaction the RPC does not have is an error: skipping
+    /// it could drop a note.
     fn lend_instruction(&self, sig: &str) -> Result<Option<(u8, Address)>> {
         let tx = self.rpc_call(
             "getTransaction",
             json!([sig, { "encoding": "json", "maxSupportedTransactionVersion": 1, "commitment": "confirmed" }]),
         )?;
-        if tx.is_null() || !tx["meta"]["err"].is_null() {
-            return Ok(None);
-        }
-        let msg = &tx["transaction"]["message"];
-        let keys: Vec<Address> = msg["accountKeys"]
-            .as_array()
-            .context("no account keys")?
-            .iter()
-            .filter_map(|k| Address::from_str(k.as_str()?).ok())
-            .collect();
-        for ix in msg["instructions"].as_array().context("no instructions")? {
-            let program = ix["programIdIndex"]
-                .as_u64()
-                .and_then(|i| keys.get(i as usize));
-            if program != Some(&keeler_lend::ID) {
-                continue;
-            }
-            let data = bs58::decode(ix["data"].as_str().unwrap_or_default()).into_vec()?;
-            let Some((&t, mut rest)) = data.split_first() else {
-                continue;
-            };
-            let account = |i: usize| {
-                ix["accounts"][i]
-                    .as_u64()
-                    .and_then(|k| keys.get(k as usize).copied())
-            };
-            let wallet = match t {
-                tag::INIT_RESERVE => Some(Address::default()),
-                tag::SUPPLY => wincode::deserialize_from::<SupplyArgs>(&mut rest)
-                    .ok()
-                    .map(|a| Address::new_from_array(a.maker)),
-                tag::DEPOSIT | tag::DEPOSIT_ADD => {
-                    wincode::deserialize_from::<DepositArgs>(&mut rest)
-                        .ok()
-                        .map(|a| Address::new_from_array(a.owner))
-                }
-                tag::REPAY => wincode::deserialize_from::<RepayArgs>(&mut rest)
-                    .ok()
-                    .map(|a| Address::new_from_array(a.owner)),
-                tag::LIQUIDATE => wincode::deserialize_from::<LiquidateArgs>(&mut rest)
-                    .ok()
-                    .map(|a| Address::new_from_array(a.owner)),
-                tag::REDEEM | tag::DRAW => account(1),
-                _ => None,
-            };
-            if let Some(w) = wallet {
-                return Ok(Some((t, w)));
-            }
-        }
-        Ok(None)
+        ensure!(!tx.is_null(), "the RPC does not have transaction {sig}");
+        lend_instruction_of(&tx, &self.key.pubkey())
     }
 }
 
@@ -370,6 +343,74 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
 
 fn hex_array<const N: usize>(s: &str) -> Result<[u8; N]> {
     crate::lend_auth::hex_bytes(s).ok_or_else(|| anyhow!("bad hex"))
+}
+
+/// The lend instruction of a `getTransaction` reply, when the keeper paid
+/// for it: only the keeper's own transactions carry its notes. Anyone can
+/// name the keeper's address in a transaction, and with the public test
+/// keys anyone can prove a lend note under their own PDA.
+pub(crate) fn lend_instruction_of(tx: &Value, keeper: &Address) -> Result<Option<(u8, Address)>> {
+    if !tx["meta"]["err"].is_null() {
+        return Ok(None);
+    }
+    let msg = &tx["transaction"]["message"];
+    let keys: Vec<Address> = msg["accountKeys"]
+        .as_array()
+        .context("no account keys")?
+        .iter()
+        .filter_map(|k| Address::from_str(k.as_str()?).ok())
+        .collect();
+    if keys.first() != Some(keeper) {
+        return Ok(None);
+    }
+    for ix in msg["instructions"].as_array().context("no instructions")? {
+        let program = ix["programIdIndex"]
+            .as_u64()
+            .and_then(|i| keys.get(i as usize));
+        if program != Some(&keeler_lend::ID) {
+            continue;
+        }
+        let data = bs58::decode(ix["data"].as_str().unwrap_or_default()).into_vec()?;
+        let Some((&t, mut rest)) = data.split_first() else {
+            continue;
+        };
+        let account = |i: usize| {
+            ix["accounts"][i]
+                .as_u64()
+                .and_then(|k| keys.get(k as usize).copied())
+        };
+        let wallet = match t {
+            tag::INIT_RESERVE => Some(Address::default()),
+            tag::SUPPLY => wincode::deserialize_from::<SupplyArgs>(&mut rest)
+                .ok()
+                .map(|a| Address::new_from_array(a.maker)),
+            tag::DEPOSIT | tag::DEPOSIT_ADD => wincode::deserialize_from::<DepositArgs>(&mut rest)
+                .ok()
+                .map(|a| Address::new_from_array(a.owner)),
+            tag::REPAY => wincode::deserialize_from::<RepayArgs>(&mut rest)
+                .ok()
+                .map(|a| Address::new_from_array(a.owner)),
+            tag::LIQUIDATE => wincode::deserialize_from::<LiquidateArgs>(&mut rest)
+                .ok()
+                .map(|a| Address::new_from_array(a.owner)),
+            tag::REDEEM | tag::DRAW => account(1),
+            _ => None,
+        };
+        if let Some(w) = wallet {
+            return Ok(Some((t, w)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a send error (its debug text) says the transaction can never
+/// land: refused at preflight, failed on chain, or not confirmed before its
+/// blockhash expired. Anything else (a timeout, a lost connection) may still.
+// shortcut: matches spr-client 0.10's error text; recheck on an upgrade.
+pub(crate) fn never_lands(error: &str) -> bool {
+    error.contains("SendTransactionPreflightFailure")
+        || error.contains("kind: TransactionError")
+        || error.contains("before its blockhash expired")
 }
 
 /// Data-bearing confidential slots with their decryption index, as the swap
@@ -459,7 +500,12 @@ impl Ledger for LendChain {
             }))
     }
 
-    fn intents(&self, wallet: &Address) -> Result<Vec<Intent>> {
+    fn intents(
+        &self,
+        wallet: &Address,
+        after: Option<&str>,
+        pages: usize,
+    ) -> Result<(Vec<Intent>, Option<String>)> {
         let pda = user_pda(wallet).owner;
         let tag = pda
             .address(self.kp.viewing_pubkey())
@@ -468,8 +514,12 @@ impl Ledger for LendChain {
             .confidential_view_tag()
             .map_err(err)?;
         let mut found = Vec::new();
-        let mut cursor = None;
-        loop {
+        // Pages run oldest first; the cursor is the last transaction read.
+        let mut cursor: Option<PaginationToken> = after
+            .map(|a| a.parse().map_err(|_| anyhow!("bad intent cursor")))
+            .transpose()?;
+        let mut last = cursor;
+        for _ in 0..pages {
             let page = self
                 .chain
                 .client
@@ -481,6 +531,9 @@ impl Ledger for LendChain {
                     HistoryFilters::default(),
                     None,
                 )?;
+            if let Some(g) = page.data.last() {
+                last = Some(PaginationToken::new(g.slot, g.signature));
+            }
             for tx in page.data.iter().flat_map(|g| &g.events) {
                 for (index, hash, leaf, view_tag, body, _) in slots(tx) {
                     if view_tag != tag {
@@ -512,20 +565,7 @@ impl Ledger for LendChain {
                 break;
             }
         }
-        let nullifiers: Vec<[u8; 32]> = found
-            .iter()
-            .map(|i| i.note.nullifier())
-            .collect::<Result<_>>()?;
-        if nullifiers.is_empty() {
-            return Ok(found);
-        }
-        let spent = self.spent(&nullifiers)?;
-        Ok(found
-            .into_iter()
-            .zip(spent)
-            .filter(|(_, s)| !s)
-            .map(|(i, _)| i)
-            .collect())
+        Ok((found, cursor.or(last).map(|t| t.to_string())))
     }
 
     fn quote(&self, vault_id: u64) -> Result<Quote> {
@@ -547,9 +587,13 @@ impl Ledger for LendChain {
                     "not a test price account"
                 );
                 let (price, conf) = (u64_at(0)?, u64_at(8)?);
+                // The program refuses these, so the keeper must not act on them.
+                ensure!(price > 0 && conf < price, "the test price is refused");
                 Ok(Quote {
-                    low: price.saturating_sub(conf),
-                    high: price.saturating_add(conf),
+                    low: price - conf,
+                    high: price
+                        .checked_add(conf)
+                        .context("the test price is refused")?,
                     published: u64_at(16)? as i64,
                 })
             }
@@ -568,7 +612,11 @@ impl Ledger for LendChain {
                 let conf = u64_at(81)?;
                 let expo = i32::from_le_bytes(d.get(89..93).context("short price")?.try_into()?);
                 let published = u64_at(93)? as i64;
-                ensure!(price > 0, "no price");
+                // The program refuses a confidence as wide as the price.
+                ensure!(
+                    price > 0 && u128::from(conf) < price as u128,
+                    "no usable price"
+                );
                 let shift = expo + 12 + i32::from(TSOL_TUSD.debt_decimals)
                     - i32::from(TSOL_TUSD.collateral_decimals);
                 let scale = |x: u128, up: bool| -> Result<u64> {
@@ -725,12 +773,21 @@ impl Ledger for LendChain {
                 let w = position.wallet.clone().context("position without wallet")?;
                 let (r, ru) = res()?;
                 let s: PositionState = position.state()?;
-                let owed = keeler_core::lend::debt_of(
+                // The circuit takes the repay plus the penalty buffer from
+                // the funds note: sized as the builder sizes it.
+                let plan = keeler_core::lend::liquidate(
                     s.debt_shares,
                     vault::accrued(&r.state()?, now)?.borrow_price,
+                    position.amount,
+                    *bound,
+                    &keeler_core::lend::TSOL_TUSD_VAULT,
                 )
                 .map_err(|e| anyhow!("{e}"))?;
-                let funds = self.funds(owed)?;
+                let funds = self.funds(
+                    plan.repay
+                        .checked_add(plan.buffer)
+                        .context("liquidation funds")?,
+                )?;
                 let funds_nullifier = to_hex(&funds.nullifier);
                 let (p, _plan) = vault::liquidate(
                     kp,
@@ -863,16 +920,32 @@ impl Ledger for LendChain {
 
     fn send(&self, tx: &[u8]) -> Result<String> {
         let tx: VersionedTransaction = wincode::deserialize(tx)?;
-        Ok(self.rpc().process_transaction(tx)?.to_string())
+        match self.rpc().process_transaction(tx) {
+            Ok(sig) => Ok(sig.to_string()),
+            Err(e) => {
+                let text = format!("{e:?}");
+                Err(if never_lands(&text) {
+                    anyhow::Error::new(Rejected(text))
+                } else {
+                    anyhow!("{text}")
+                })
+            }
+        }
     }
 
-    fn history(&self) -> Result<Vec<Note>> {
+    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
         let mut sigs = Vec::new();
+        // The mark moves only to a finalized signature: one merely confirmed
+        // could still be dropped, and is read again next time.
+        let mut newest = None;
         let mut before: Option<String> = None;
         loop {
             let mut opts = json!({ "limit": 1000, "commitment": "confirmed" });
             if let Some(b) = &before {
                 opts["before"] = json!(b);
+            }
+            if let Some(a) = after {
+                opts["until"] = json!(a);
             }
             let page = self.rpc_call(
                 "getSignaturesForAddress",
@@ -880,6 +953,9 @@ impl Ledger for LendChain {
             )?;
             let page = page.as_array().context("no signatures")?.clone();
             for s in &page {
+                if newest.is_none() && s["confirmationStatus"] == "finalized" {
+                    newest = s["signature"].as_str().map(str::to_owned);
+                }
                 if s["err"].is_null() {
                     if let Some(sig) = s["signature"].as_str() {
                         sigs.push(sig.to_owned());
@@ -936,7 +1012,7 @@ impl Ledger for LendChain {
                 }
             }
         }
-        Ok(found)
+        Ok((found, newest))
     }
 }
 
@@ -955,7 +1031,7 @@ pub fn init_reserve(chain: &LendChain, admin: &Keypair) -> Result<String> {
         u128::from(now),
         TREE_ID,
     )?;
-    let ix = p.prove(chain.chain.client.indexer(), chain.chain.tree, &chain.kp)?;
+    let ix = chain.prove(p)?;
     let sig = chain.rpc().create_and_send_transaction(
         std::slice::from_ref(&ix),
         chain.key.pubkey(),
@@ -981,4 +1057,62 @@ pub fn set_test_price(
         ComputeBudgetConfig::new(200_000),
     )?;
     Ok(sig.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `getTransaction` reply: one lend `redeem` for `wallet`, paid by `payer`.
+    fn redeem_tx(payer: &Address, wallet: &Address) -> Value {
+        json!({
+            "meta": { "err": null },
+            "transaction": { "message": {
+                "accountKeys": [payer.to_string(), wallet.to_string(), keeler_lend::ID.to_string()],
+                "instructions": [{
+                    "programIdIndex": 2,
+                    "accounts": [0, 1],
+                    "data": bs58::encode([tag::REDEEM]).into_string(),
+                }],
+            }},
+        })
+    }
+
+    #[test]
+    fn only_keeper_paid_transactions_carry_notes() {
+        let keeper = Keypair::new().pubkey();
+        let wallet = Keypair::new().pubkey();
+        assert_eq!(
+            lend_instruction_of(&redeem_tx(&keeper, &wallet), &keeper).unwrap(),
+            Some((tag::REDEEM, wallet))
+        );
+        // Anyone may name the keeper in a transaction they pay for, with a
+        // note proved under their own PDA: it is not the keeper's.
+        let mut forged = redeem_tx(&wallet, &keeper);
+        assert_eq!(lend_instruction_of(&forged, &keeper).unwrap(), None);
+        forged["transaction"]["message"]["accountKeys"][1] = json!(keeper.to_string());
+        assert_eq!(lend_instruction_of(&forged, &keeper).unwrap(), None);
+        // A failed one is not either.
+        let mut failed = redeem_tx(&keeper, &wallet);
+        failed["meta"]["err"] = json!({ "InstructionError": [0, "Custom"] });
+        assert_eq!(lend_instruction_of(&failed, &keeper).unwrap(), None);
+    }
+
+    #[test]
+    fn sends_that_can_never_land() {
+        assert!(never_lands(
+            "SolanaRpcTransaction { operation: \"process_transaction\", source: Error { request: \
+             Some(SendTransaction), kind: RpcError(RpcResponseError { code: -32002, message: \"x\", \
+             data: SendTransactionPreflightFailure(..) }) } }"
+        ));
+        assert!(never_lands(
+            "Error { request: None, kind: TransactionError(InstructionError(0, Custom(1))) }"
+        ));
+        assert!(never_lands(
+            "Rpc(\"transaction 1 was not confirmed before its blockhash expired\")"
+        ));
+        assert!(!never_lands(
+            "Error { request: Some(SendTransaction), kind: Reqwest(timed out) }"
+        ));
+    }
 }

@@ -3,7 +3,13 @@
 What the web page (`web/src/keeler/lend*.ts`) sends to the keeper and what it accepts back. The
 Worker (`worker/src/index.ts`, `worker/README.md`) sits between them: it checks the shape of every
 request and reply, rate-limits, and forwards `/api/lend/<route>` to the keeper's `/lend/<route>`.
-It verifies no signature; the keeper verifies all of them.
+Before it charges a global limit or forwards a signed request, it checks `sessionAuth` (the
+authorisation text rebuilt from its own `NETWORK` and `LEND_PROGRAM_ID`) and the request
+`signature` exactly as the keeper does (steps 2 and 3 below), and answers 401 when either fails.
+Expiry, freshness and replay need chain time and the nonce store, so only the keeper checks them;
+the keeper also checks everything the Worker did. Every `LEND_POOLS` mint and `LEND_VAULTS`
+collateral and debt mint must be in `ASSETS` (the page reads lend amounts with its decimals), or
+every lend route and `/api/config` answer 500.
 
 `web/tests/fixtures/lend-requests.json` holds signed requests and a signed ticket made from fixed
 keys, with every intermediate byte string in hex, so a Rust keeper can test its verifier against
@@ -184,14 +190,14 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | 401 | `network` | Session or signature refused (the page retries once with a new session) |
 | 403 | `paused` | Lending paused at the keeper (new supply, new positions, borrowing) |
 | 404 | `storage` | No such position or receipt |
-| 409 | `busy` | The reserve is in use; try again shortly |
-| 410 | `no-liquidity` | Not enough in the pool |
+| 409 | `busy` | The reserve is in use, or this wallet let its reservation lapse unused within `reservation_secs`; try again shortly |
+| 410 | `no-liquidity` | Not enough in the pool (checked last, at the amount rounded up to two significant figures) |
 | 412 | `price-stale` | The oracle price is too old |
 | 422 | `below-minimum` | Under a minimum |
 | 423 | `unhealthy` | The position would be unhealthy |
-| 429 | `rate-limited` | Too many requests |
+| 429 | `rate-limited` | Too many requests: tickets or builds per wallet per hour, open tickets per wallet, open intents in all, or the 8 receipts or positions a wallet may hold (open tickets count) |
 | 502, 504 | `keeper-offline` | The keeper did not answer (Worker) |
-| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured (Worker) |
+| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured (Worker); the keeper still starting or failing to start inside the dealer; a build that took over 25 s |
 | other | `network` | |
 
 ## Layouts the page checks

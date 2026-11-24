@@ -1209,3 +1209,30 @@ fn liquidation_price_is_the_edge() {
         );
     }
 }
+
+#[test]
+fn a_liquidation_always_removes_a_debt_share() {
+    // Past 1.0 a share is worth more than one base unit, so a tiny repay can
+    // remove none; the circuit refuses that, so `liquidate` must too.
+    let bp = 3 * PRICE_SCALE + 1;
+    let (mut ok, mut dust) = (0, 0);
+    for shares in 1..=60u64 {
+        for c in 1..=40u64 {
+            for price in [PRICE_SCALE, SOL_150 / 100, 7 * PRICE_SCALE] {
+                match liquidate(shares, bp, c, price, &V) {
+                    Ok(l) => {
+                        ok += 1;
+                        assert!(l.debt_shares < shares, "{shares} {c} {price}");
+                        assert_eq!(
+                            l.debt_shares,
+                            repay_shares(shares, l.repay, bp).unwrap().shares
+                        );
+                    }
+                    Err(NothingToLiquidate) => dust += 1,
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    assert!(ok > 100 && dust > 0, "{ok} {dust}");
+}

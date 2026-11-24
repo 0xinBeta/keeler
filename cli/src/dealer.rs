@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Mutex,
+        mpsc, Mutex, OnceLock,
     },
     thread::{self, sleep, Scope},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -331,27 +331,21 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
         }
         None => None,
     };
-    let parts = cfg
-        .lend
-        .as_ref()
-        .map(|l| crate::keeper::connect(l, &c.network, &c.key))
-        .transpose()?;
-    let keeper = match (&cfg.lend, &parts) {
-        (Some(l), Some(p)) => Some(crate::keeper::Keeper::open(
-            l,
-            &p.chain,
-            &p.signer,
-            p.state.clone(),
-        )?),
-        _ => None,
-    };
-    let lend = keeper.as_ref().map(|k| k as &dyn LendRoutes);
+    // The keeper starts in the background once the swap servers are up, and
+    // a keeper that cannot start leaves them serving.
+    let parts = OnceLock::new();
+    let keeper = OnceLock::new();
+    let slot = crate::keeper::Slot(&keeper);
+    let lend = cfg.lend.as_ref().map(|_| &slot as &dyn LendRoutes);
     let api = &api;
     thread::scope(|s| {
         let server = s.spawn(|| serve(listener, stop, |rfq| api.quote(rfq)));
         s.spawn(|| api.pay_claims(queue, stop));
-        if let Some(k) = &keeper {
-            s.spawn(|| k.run(stop));
+        if let Some(l) = &cfg.lend {
+            let (parts, keeper) = (&parts, &keeper);
+            s.spawn(move || {
+                crate::keeper::run_in_dealer(l, &c.network, &c.key, parts, keeper, stop)
+            });
         }
         let web = http
             .map(|(l, key)| s.spawn(move || serve_http(l, &key, stop, api, lend, HTTP_DEADLINE)));
@@ -1402,6 +1396,18 @@ mod tests {
                 r.ends_with(r#"{"len":2}"#) && took >= Duration::from_millis(1500),
                 "{r}"
             );
+            // Eight at once; a ninth is turned away, and swaps still answer.
+            let slow: Vec<_> = (0..MAX_LEND_THREADS)
+                .map(|_| s.spawn(move || exchange(at, post("/lend/slow", KEY, 2).as_bytes(), None)))
+                .collect();
+            sleep(Duration::from_millis(400));
+            let (r, _) = exchange(at, post("/lend/ticket", KEY, 2).as_bytes(), None);
+            assert!(r.starts_with("HTTP/1.1 503"), "{r}");
+            assert!(health(at).starts_with("HTTP/1.1 200"));
+            for h in slow {
+                let (r, _) = h.join().unwrap();
+                assert!(r.ends_with(r#"{"len":2}"#), "{r}");
+            }
             stop.store(true, Ordering::Relaxed);
             server.join().unwrap().unwrap();
         });
