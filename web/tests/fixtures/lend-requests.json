@@ -1,0 +1,88 @@
+{
+  "about": "Signed keeper requests from fixed keys (docs/lend-api.md). wallet and keeper are Ed25519 keys from the 32-byte seeds below. session_seed = SHA-256(\"keeler-lend-session-v1\" || derivation_signature), where derivation_signature is the wallet's signature over the SPR key-derivation message. sessionAuth is the wallet's signature over authorisation_text (UTF-8). Each request's signature is the session key's over signed_message_hex. The ticket signature is the keeper's over its message_hex.",
+  "network": "devnet",
+  "program_id": "A7qaBKJ1gJRcKwMWyyRdr9YhmbBmnMaemM9Sijah3EbC",
+  "now": 1800000000,
+  "wallet": {
+    "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "address": "F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4",
+    "derivation_signature_hex": "5faa08bb2bdd4f70c39a7aeb212a1c2fddea5dfe6cd272b5255a2b35ebb47251041886580510c2665f1704003682a4d77218790b8a79be2329e6db4c59368005"
+  },
+  "session": {
+    "seed_hex": "689d08e4b74d86330a13e6f64ab497df587dabb2a2548c2f6410ac48d8f8832a",
+    "key": "GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71",
+    "expiry": 1800086000,
+    "authorisation_text": "Keeler Lend: allow this browser session\n\nThis lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.\n\nNetwork: devnet\nProgram: A7qaBKJ1gJRcKwMWyyRdr9YhmbBmnMaemM9Sijah3EbC\nWallet: F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4\nSession key: GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71\nExpires: 1800086000 (2027-01-16T07:53:20Z)",
+    "auth_hex": "073f5ee5adcba10491ec31670b1df3733acaa57a046139b22bd1c4c091dfc4defa57a8206303f34235b57faeb3c90d9ace627ee630cdb92ce165599e27cedc0c"
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/lend/account",
+      "fields": {
+        "wallet": "F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4",
+        "sessionKey": "GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71",
+        "sessionExpiry": 1800086000,
+        "sessionAuth": "073f5ee5adcba10491ec31670b1df3733acaa57a046139b22bd1c4c091dfc4defa57a8206303f34235b57faeb3c90d9ace627ee630cdb92ce165599e27cedc0c",
+        "nonce": "01010101010101010101010101010101",
+        "timestamp": 1800000000,
+        "signature": "aaab410c029fc6519d73490c09f3dbee449bc79fc8477c2d18e4f1f15c48b26f72323a225139234e44291cc6f3345bbcc98dfc87c9cb4d383d0af1c449317b0e"
+      },
+      "canonical": "sessionAuth=073f5ee5adcba10491ec31670b1df3733acaa57a046139b22bd1c4c091dfc4defa57a8206303f34235b57faeb3c90d9ace627ee630cdb92ce165599e27cedc0c\nsessionExpiry=1800086000\nsessionKey=GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71\nwallet=F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4\n",
+      "signed_message_hex": "6b65656c65722d6c656e642d726571756573742d76310a4745540a2f6c656e642f6163636f756e740a0101010101010101010101010101010100d2496b00000000e9c52e98333e670064aa81b77ff5e77284db2cb3fe19b7af032b14994a011bc1"
+    },
+    {
+      "method": "POST",
+      "path": "/lend/ticket",
+      "fields": {
+        "purpose": "supply",
+        "amount": "250000000",
+        "pool": "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+        "wallet": "F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4",
+        "sessionKey": "GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71",
+        "sessionExpiry": 1800086000,
+        "sessionAuth": "073f5ee5adcba10491ec31670b1df3733acaa57a046139b22bd1c4c091dfc4defa57a8206303f34235b57faeb3c90d9ace627ee630cdb92ce165599e27cedc0c",
+        "nonce": "02020202020202020202020202020202",
+        "timestamp": 1800000000,
+        "signature": "1e50f3bae2c9404e5287053b584410a5591b4d16e2dd19cf00e3bb437e9d827edc7cf6d73222728bf5099bd5842654475634ce2eb63d8553262f426c2161ba01"
+      },
+      "canonical": "amount=250000000\npool=CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8\npurpose=supply\nsessionAuth=073f5ee5adcba10491ec31670b1df3733acaa57a046139b22bd1c4c091dfc4defa57a8206303f34235b57faeb3c90d9ace627ee630cdb92ce165599e27cedc0c\nsessionExpiry=1800086000\nsessionKey=GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71\nwallet=F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4\n",
+      "signed_message_hex": "6b65656c65722d6c656e642d726571756573742d76310a504f53540a2f6c656e642f7469636b65740a0202020202020202020202020202020200d2496b0000000050341b02ee3e0044327dbb609b5f89b20820dfa48755bf545b07ac47dc1d6fa8"
+    },
+    {
+      "method": "POST",
+      "path": "/lend/build",
+      "fields": {
+        "op": "draw",
+        "vault": 1,
+        "position": "7",
+        "borrow": "100000000",
+        "withdraw": "0",
+        "wallet": "F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4",
+        "sessionKey": "GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71",
+        "sessionExpiry": 1800086000,
+        "sessionAuth": "073f5ee5adcba10491ec31670b1df3733acaa57a046139b22bd1c4c091dfc4defa57a8206303f34235b57faeb3c90d9ace627ee630cdb92ce165599e27cedc0c",
+        "nonce": "03030303030303030303030303030303",
+        "timestamp": 1800000000,
+        "signature": "5b81380856e2a466963a8b346a81eda6a947b3ad4435f963c0ac4e0dacaf91482ac52b744d277ae9c9f6de092217fe490c78823c801b906e2f23ac13c52bd90e"
+      },
+      "canonical": "borrow=100000000\nop=draw\nposition=7\nsessionAuth=073f5ee5adcba10491ec31670b1df3733acaa57a046139b22bd1c4c091dfc4defa57a8206303f34235b57faeb3c90d9ace627ee630cdb92ce165599e27cedc0c\nsessionExpiry=1800086000\nsessionKey=GNREkMpRhp13A1Z5kbvDQUWuub5bGGcnvNNRn4YAkX71\nvault=1\nwallet=F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4\nwithdraw=0\n",
+      "signed_message_hex": "6b65656c65722d6c656e642d726571756573742d76310a504f53540a2f6c656e642f6275696c640a0303030303030303030303030303030300d2496b00000000c71739447f7ab74496ba81ce22c0da5a00d32b3fe9fc35ca1e45641ce74446a7"
+    }
+  ],
+  "ticket": {
+    "keeper_seed_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "keeper": "Bow1CGKGDB9mNxeWdw85E2aCthQ1oZX4oFEe7fYT17ew",
+    "fields": {
+      "programId": "A7qaBKJ1gJRcKwMWyyRdr9YhmbBmnMaemM9Sijah3EbC",
+      "wallet": "F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4",
+      "id": "abababababababababababababababab",
+      "purpose": 1,
+      "target": "1",
+      "amount": "250000000",
+      "expiry": 1800000300
+    },
+    "message_hex": "6b65656c65722d6c656e642d7469636b65742d763187799677a658b9ae69cbd5952ac190fd746f825d4a58f3cd2a1dcc7015aed903d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737abababababababababababababababab01010000000000000080b2e60e000000002cd3496b00000000",
+    "signature_hex": "174523c9c5dc94133edcf9b9f5a2f3452722ef8053f48e7080381e2ee7fed6fc357322563524781dc922f56fbb8c52cc4561791fdccebbc23abc87cf8fe03101"
+  }
+}

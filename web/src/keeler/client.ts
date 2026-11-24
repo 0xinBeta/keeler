@@ -43,9 +43,18 @@ import { verifyQuote } from "./quote-sig";
 import { nextRecord, refreshAll, refundRefusal, type ChainReads } from "./status";
 import { orderStore, type OrderRecord } from "./storage";
 import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
+import { createLend, type LendServerConfig } from "./lend";
+import { sessionSeed } from "./lend-auth";
+import { createLendSeams } from "./lend-chain";
+import { lendStore } from "./lend-store";
+import type { KeelerLend } from "./index";
 import { createInPageWallet, IN_PAGE_WALLET_NAME } from "./wallet";
 
-type ServerConfig = Config & { rpcPath: string; sprPath: string };
+type ServerConfig = Config & { rpcPath: string; sprPath: string; lend?: LendServerConfig };
+
+/** The lend program and keeper compiled into the site; lending stays hidden without both. */
+const LEND_PROGRAM_ID: string | undefined = import.meta.env.VITE_LEND_PROGRAM_ID;
+const LEND_KEEPER: string | undefined = import.meta.env.VITE_LEND_KEEPER;
 type QuoteReply = { dealer: string; quote: { buy_amount: string; expiry: number; signature?: string } | null }[];
 type Prices = Record<string, { price: string; expo: number; publishTime: number }>;
 /** A quote with the dealer signature it was verified against. */
@@ -143,11 +152,17 @@ export function createKeeler(): Keeler {
   let wallet: Wallet | undefined;
   let account: WalletAccount | undefined;
   let unlocked: { keys: LocalKeys; spr: SprWallet } | undefined;
+  /** The lending session-key seed, derived at unlock from the key-derivation signature; memory only. */
+  let lendSeed: Uint8Array | undefined;
+  let lendImpl: KeelerLend | undefined;
   /** "swap", or "refund:<order id>": a stuck swap prompt never blocks a refund. */
   const running = new Set<string>();
 
   const config = () =>
-    (cfg ??= getJson<Record<string, unknown>>("/api/config").then(parseConfig).catch((e) => {
+    (cfg ??= getJson<Record<string, unknown>>("/api/config").then(parseConfig).then((c) => {
+      lendImpl ??= lendFor(c);
+      return c;
+    }).catch((e) => {
       cfg = undefined;
       throw e;
     }));
@@ -390,7 +405,58 @@ export function createKeeler(): Keeler {
     }
   };
 
+  /** Lending, only when the service's lend program is the one this site was built for; otherwise it stays hidden. */
+  const lendFor = (c: ServerConfig): KeelerLend | undefined => {
+    if (!c.lend) return undefined;
+    if (!LEND_PROGRAM_ID || !LEND_KEEPER || c.lend.programId !== LEND_PROGRAM_ID) {
+      console.warn("Lending is hidden: the service's lend program differs from the one this site was built with, or the build has none.");
+      return undefined;
+    }
+    const programId = address(LEND_PROGRAM_ID);
+    const keeper = address(LEND_KEEPER);
+    const seams = createLendSeams(async () => ({ ...(await ctx()), programId, keeper }));
+    return createLend({
+      network: c.network,
+      programId,
+      keeper,
+      config: c.lend,
+      assets: c.assets,
+      wallet: owner,
+      paused: async () => (await quotingConfig()).paused,
+      http: (path, init) => fetch(path, init),
+      chainNow,
+      sessionSeed: () => {
+        if (!lendSeed) throw err("not-registered", "Unlock first: sign the key derivation message.");
+        return lendSeed;
+      },
+      signMessage: async (message) => {
+        const feature = (wallet!.features as SolanaSignMessageFeature)["solana:signMessage"];
+        try {
+          const [out] = await walletAnswer(feature.signMessage({ account: account!, message }), "nothing was sent");
+          return new Uint8Array(out!.signature);
+        } catch (e) {
+          if (e instanceof KeelerError) throw e;
+          if (isRejection(e)) throw err("wallet-rejected", "You declined the lending authorisation in your wallet. Nothing was sent.");
+          throw err("wallet-unsupported", `The wallet could not sign the lending authorisation (${String(e)}).`);
+        }
+      },
+      sign: signTx,
+      send,
+      sync: () => sync(),
+      notes: (mint) => notes(address(mint)).map((u) => ({ amount: u.utxo.amount, utxo: u })),
+      owners: seams.owners,
+      chain: seams.chain,
+      build: seams.build,
+      wasm: seams.wasm,
+      store: () => lendStore(c.network, programId, owner()),
+    });
+  };
+
   const keeler: Keeler = {
+    get lend() {
+      return lendImpl;
+    },
+
     config: async () => {
       const { rpcPath: _r, sprPath: _s, ...rest } = await config();
       return { ...rest, assets: rest.assets.map((a) => ({ ...a })) };
@@ -425,6 +491,8 @@ export function createKeeler(): Keeler {
       if (!first) throw err("wallet-rejected", `${w.name} shared no account.`);
       unlocked?.keys.destroy();
       unlocked = undefined;
+      lendSeed?.fill(0);
+      lendSeed = undefined;
       wallet = w;
       account = first;
       return { address: first.address };
@@ -470,6 +538,8 @@ export function createKeeler(): Keeler {
         await as("network", "Reading the asset registry", () => backfillAssetRegistry(spr, c));
         unlocked?.keys.destroy();
         unlocked = { keys: derived, spr };
+        lendSeed?.fill(0);
+        lendSeed = await sessionSeed(a);
       } finally {
         a.fill(0);
         b.fill(0);

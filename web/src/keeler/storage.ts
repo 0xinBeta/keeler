@@ -43,8 +43,11 @@ function reviver(_key: string, v: unknown): unknown {
   return v;
 }
 
-export const encodeRecord = (r: OrderRecord) => JSON.stringify(r, replacer);
-export const decodeRecord = (s: string) => JSON.parse(s, reviver) as OrderRecord;
+/** JSON that keeps bigints and bytes; the lend records use it too. */
+export const encodeJson = (v: unknown) => JSON.stringify(v, replacer);
+export const decodeJson = <T>(s: string) => JSON.parse(s, reviver) as T;
+export const encodeRecord = (r: OrderRecord) => encodeJson(r);
+export const decodeRecord = (s: string) => decodeJson<OrderRecord>(s);
 
 /** Orders of one wallet on one network. */
 export function orderStore(network: string, owner: string, storage: Storage = localStorage) {

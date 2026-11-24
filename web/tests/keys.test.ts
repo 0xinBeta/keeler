@@ -33,3 +33,16 @@ describe("circuit and verifying-key pins", () => {
     expect(() => pinnedArtifacts("cancel", { make: { xbc: hex, vk: hex } })).toThrow();
   });
 });
+
+describe("lend pins", () => {
+  it("never fall back to the swap package's pins", () => {
+    // These tests run without vite.config.ts, so the build defines no lend pins: lend circuits must refuse, not borrow swap ones.
+    expect(() => pinnedKey("intent")).toThrow(/no proving-key pin for intent/);
+    expect(() => pinnedArtifacts("cancel_intent")).toThrow(/no circuit and verifying-key pins/);
+  });
+  it("follow the same mainnet rule as the swap", () => {
+    const pin = pinnedKey("intent", { intent: { provingKeySha256: Array(32).fill(1), insecureTestSetup: true } });
+    expect(() => checkPinForNetwork("intent", pin, "mainnet")).toThrow(/real setup ceremony/);
+    expect(() => checkPinForNetwork("intent", pin, "devnet")).not.toThrow();
+  });
+});

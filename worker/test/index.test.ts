@@ -509,7 +509,7 @@ describe("/api/lend/*", () => {
     LEND_PROGRAM_ID: PROGRAM, LEND_POOLS: JSON.stringify(POOLS), LEND_VAULTS: JSON.stringify(VAULTS),
     ...Object.fromEntries(LIMITS.map((n) => [n, allow])), ...over,
   });
-  const SIGNED = { wallet: TRADER, nonce: "0f".repeat(16), timestamp: 1_800_000_000, signature: SIG };
+  const SIGNED = { wallet: TRADER, nonce: "0f".repeat(16), timestamp: 1_800_000_000, sessionKey: MINT_A, sessionExpiry: 1_800_086_340, sessionAuth: SIG, signature: SIG };
   const query = (o: Record<string, unknown>) => "?" + new URLSearchParams(Object.entries(o).map(([k, v]) => [k, String(v)]));
   const TICKET = { ...SIGNED, purpose: "supply", pool: MINT_B, amount: "5000000" };
   const BUILD = { ...SIGNED, op: "draw", vault: 0, position: "7", borrow: "1000000", withdraw: "0" };
@@ -564,7 +564,7 @@ describe("/api/lend/*", () => {
       "/lend/pools": POOLS_REPLY,
       "/lend/account": ACCOUNT_REPLY,
       "/lend/ticket": { id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG },
-      "/lend/build": { transaction: TX, outputs: [OUT, OUT], now: 1_800_000_000, bound: "150000000000000" },
+      "/lend/build": { transaction: TX, outputs: [OUT, OUT], now: 1_800_000_000, bound: "150000000000000", index: "1000000000000" },
     };
     mockFetch((url) => Response.json(replies[new URL(url).pathname]));
     const timeouts = vi.spyOn(AbortSignal, "timeout");
@@ -603,6 +603,11 @@ describe("/api/lend/*", () => {
       post("/api/lend/ticket", { ...TICKET, signature: SIG.toUpperCase() }),
       post("/api/lend/ticket", { ...TICKET, nonce: "0f" }),
       post("/api/lend/ticket", { ...TICKET, timestamp: -1 }),
+      post("/api/lend/ticket", { ...TICKET, sessionKey: undefined }),
+      post("/api/lend/ticket", { ...TICKET, sessionKey: "nope" }),
+      post("/api/lend/ticket", { ...TICKET, sessionExpiry: "1800086340" }),
+      post("/api/lend/ticket", { ...TICKET, sessionAuth: "ab" }),
+      req("/api/lend/account" + query({ ...SIGNED, sessionExpiry: "later" })),
       post("/api/lend/ticket", { ...TICKET, wallet: undefined }),
       post("/api/lend/ticket", "[]"),
       post("/api/lend/build", { ...BUILD, op: "liquidate" }),
@@ -628,6 +633,7 @@ describe("/api/lend/*", () => {
       [Response.json({ transaction: "not base64!", outputs: [OUT], now: 1 }), 502],
       [new Response("not json"), 502],
       [new Response(JSON.stringify({ transaction: TX, outputs: [OUT], now: 1, bound: "1".padEnd(17 * 1024, " ") })), 502], // over 16 KiB
+      [Response.json({ transaction: TX, outputs: [OUT], now: 1, index: 5 }), 502],
       [Response.json({ error: "x" }, { status: 500 }), 502],
       [() => { throw new Error(`refused ${DKEY}`); }, 502],
       [Response.json({ error: "The reserve is busy for 12 s." }, { status: 409 }), 409],

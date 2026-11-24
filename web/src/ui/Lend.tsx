@@ -4,16 +4,7 @@ import { useState } from "react";
 import type { Asset, Balance, KeelerLend, LendAccount, LendKind, LendOperation, LendStep, Pool, Position, Vault } from "../keeler/index";
 import type { MockLendControls } from "../keeler/mock-lend";
 import { countdown, formatUnits, parseUnits } from "./format";
-import {
-  accrue,
-  healthBps,
-  liquidatable,
-  liquidationPrice,
-  maxBorrow,
-  maxWithdraw,
-  pct,
-  priceText,
-} from "./lend-math";
+import { grow, healthBps, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceText } from "./lend-view";
 import { Amount, ErrorNote, errorText, useChainNow } from "./shared";
 
 export type Market = { pools: Pool[]; vaults: Vault[] };
@@ -73,7 +64,7 @@ export function kindLabel(o: Pick<LendOperation, "kind" | "amounts">, collateral
 }
 
 /** A value growing at `rateBps` a year since `asOf`, recomputed each second from chain time. */
-const grown = (value: bigint, rateBps: number, asOf: number, now: number | null) => (now === null ? value : accrue(value, rateBps, now - asOf));
+const grown = (value: bigint, rateBps: number, asOf: number, now: number | null) => (now === null ? value : grow(value, rateBps, now - asOf));
 
 const largest = (balances: Balance[] | null, asset: Asset) => balances?.find((b) => b.asset.mint === asset.mint)?.largestNote ?? null;
 const plain = (v: bigint, a: Asset) => formatUnits(v, a.decimals).replace(/,/g, "");
@@ -531,7 +522,7 @@ export function BorrowTab(p: LendProps) {
   const lp2 = liquidationPrice(c2, d2, vault.liquidationThresholdBps);
   const st = healthState(h, vault);
   // Repaying "all": the debt plus two minutes of interest; anything above the debt comes back as change.
-  const repayAll = accrue(d, pool.borrowAprBps, 120) + 1n;
+  const repayAll = grow(d, pool.borrowAprBps, 120) + 1n;
 
   const submit = () => {
     setShown(true);

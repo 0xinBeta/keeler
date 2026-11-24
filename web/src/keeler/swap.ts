@@ -67,9 +67,9 @@ export type OrderOpening = {
 };
 
 export const toHex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
-const decimal = (b: Uint8Array) => BigInt(`0x${toHex(b) || "0"}`).toString();
+export const decimal = (b: Uint8Array) => BigInt(`0x${toHex(b) || "0"}`).toString();
 const equal = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
-const addressBytes = (a: Address) => new Uint8Array(getAddressEncoder().encode(a));
+export const addressBytes = (a: Address) => new Uint8Array(getAddressEncoder().encode(a));
 
 export async function orderAuthority(maker: Address, programId: Address) {
   const [pda, bump] = await getProgramDerivedAddress({
@@ -130,7 +130,7 @@ export function markerData(orderHash: Uint8Array, maker: Address): Uint8Array {
   return Uint8Array.of(...orderHash, ...addressBytes(maker));
 }
 
-async function prove(ctx: SwapContext, circuit: Circuit, raw: RawProgramTransaction): Promise<Uint8Array> {
+export async function prove(ctx: SwapContext, circuit: Circuit, raw: RawProgramTransaction): Promise<Uint8Array> {
   if (BigInt(`0x${toHex(raw.publicHash)}`) >= BN254_ORDER) throw new Error("public hash is not a field element");
   const { proof, ms } = await callWorker<{ proof: Uint8Array; ms: number }>({
     op: "prove",
@@ -145,7 +145,7 @@ async function prove(ctx: SwapContext, circuit: Circuit, raw: RawProgramTransact
 export let lastProofMs = 0;
 
 /** Decodes and checks a WASM transaction: sender, payer, commitments. */
-async function decode(ctx: SwapContext, raw: RawProgramTransaction) {
+export async function decode(ctx: SwapContext, raw: RawProgramTransaction) {
   const tx = await decodeProgramTransaction(raw.finalizedTx, ctx.wallet.registry);
   if (tx.payer !== ctx.payer) throw new Error("the swap transaction names another payer");
   if (!equal(tx.sender.toBytes(), ctx.keys.address().toBytes())) throw new Error("the swap transaction names another sender");
@@ -155,7 +155,7 @@ async function decode(ctx: SwapContext, raw: RawProgramTransaction) {
 type Decoded = Awaited<ReturnType<typeof decode>>;
 
 /** The SPP inputs with the outputs encrypted, plus `messages` (the SDK's own encrypt sends none). */
-async function sppInputs(ctx: SwapContext, tx: Decoded, messages: { viewTag: ReturnType<typeof bytes32>; data: Uint8Array }[]) {
+export async function sppInputs(ctx: SwapContext, tx: Decoded, messages: { viewTag: ReturnType<typeof bytes32>; data: Uint8Array }[]) {
   const [key] = await ctx.keys.transactionKeys([
     { viewingPublicKey: tx.sender.viewingPublicKey, firstNullifier: tx.firstNullifier },
   ]);
@@ -186,7 +186,7 @@ async function sppInputs(ctx: SwapContext, tx: Decoded, messages: { viewTag: Ret
   }
 }
 
-async function proveSpp(ctx: SwapContext, tx: Decoded, spp: SppProofInputs, authority: Parameters<SprClient["proveTransact"]>[1]) {
+export async function proveSpp(ctx: SwapContext, tx: Decoded, spp: SppProofInputs, authority: Parameters<SprClient["proveTransact"]>[1]) {
   const data = await ctx.client.proveTransact(spp, authority);
   if (!equal(data.privateTxHash, tx.paddingIndependentPrivateTxHash)) {
     throw new Error("the SPP proof and the swap proof cover different transactions");
@@ -195,7 +195,7 @@ async function proveSpp(ctx: SwapContext, tx: Decoded, spp: SppProofInputs, auth
 }
 
 /** The transaction and the last block height at which it can still land. */
-async function compile(ctx: SwapContext, ix: Instruction): Promise<{ transaction: Transaction; lastValidBlockHeight: bigint }> {
+export async function compile(ctx: SwapContext, ix: Instruction): Promise<{ transaction: Transaction; lastValidBlockHeight: bigint }> {
   const lifetime = await ctx.client.getLatestBlockhash();
   const transaction = await compileUnsignedTransaction({ feePayer: ctx.payer, lifetime, instructions: [ix], computeUnitLimit: COMPUTE_UNIT_LIMIT });
   return { transaction, lastValidBlockHeight: lifetime.lastValidBlockHeight };

@@ -15,7 +15,7 @@ network peer, so the Helius key and the dealer key never reach the browser.
 | `/api/quotes` | POST | `{sell_mint, buy_mint, sell_amount, trader}` sent to every dealer's `/quote` (3 s each) → `[{dealer, quote: {buy_amount, expiry, signature}\|null}]`. A signature that is not 128 lowercase hex makes the quote `null`; the Worker never verifies it. 503 while paused |
 | `/api/faucet` | POST | `{wallet}` sent to the first dealer's `/faucet`. 404 unless `FAUCET` is `"1"`; 503 while paused |
 | `/api/lend/pools` | GET | Keeper `GET /lend/pools`. No query. See "Lending" below |
-| `/api/lend/account` | GET | Keeper `GET /lend/account?wallet&nonce&timestamp&signature` |
+| `/api/lend/account` | GET | Keeper `GET /lend/account?wallet&nonce&timestamp&sessionKey&sessionExpiry&sessionAuth&signature` |
 | `/api/lend/ticket` | POST | Keeper `POST /lend/ticket`. 503 while paused |
 | `/api/lend/build` | POST | Keeper `POST /lend/build` (30 s). 503 while paused |
 | everything else | | Static files. HTML gets the CSP, `nosniff` and `no-referrer`; `/assets/*-<hash>.*` is cached for a year |
@@ -77,15 +77,20 @@ only a reply of exactly the shape below; anything else is a 502. A keeper 4xx wi
 `{"error": "<text>"}` is passed through (text cut to 200 characters). Bodies and replies are
 capped at 16 KiB. Timeout 30 s for `build`, 10 s for the rest.
 
-Signed fields, on `ticket`, `build` and `account` (the keeper checks the signature and freshness):
-`wallet` (base58), `nonce` (32 lowercase hex), `timestamp`, `signature` (128 lowercase hex).
+Signed fields, on `ticket`, `build` and `account` (the keeper checks the signatures and freshness;
+the Worker checks shape only): `wallet` (base58), `nonce` (32 lowercase hex), `timestamp`,
+`sessionKey` (base58, the browser's session key), `sessionExpiry` (unix seconds), `sessionAuth`
+(128 lowercase hex: the wallet's signature over the authorisation text), `signature` (128 lowercase
+hex: the session key's signature over the request). In the `account` query, `timestamp` and
+`sessionExpiry` are read as numbers. The byte layouts, the authorisation text and the freshness and
+replay rules are in `docs/lend-api.md`.
 
 | Route | Request | Reply |
 | --- | --- | --- |
 | `pools` | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
 | `account` | query: signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}`, each at most 8; `message` is base64 up to 512 characters; `status` is `waiting`, `filled` or `refundable` |
 | `ticket` | signed fields, `purpose` (`supply`, `deposit`, `repay`), `amount`, optional `pool`, `vault`, `position` | `{id (32 hex), expiry, signature (128 hex)}` |
-| `build` | signed fields, `op` (`redeem`, `draw`), optional `pool`, `vault`, `position`, `amount`, `borrow`, `withdraw` | `{transaction (base64, at most 5,464 characters = 4,096 bytes), outputs: [64 hex] (1 to 8), now, bound?}` |
+| `build` | signed fields, `op` (`redeem`, `draw`), optional `pool`, `vault`, `position`, `amount`, `borrow`, `withdraw` | `{transaction (base64, at most 5,464 characters = 4,096 bytes), outputs: [64 hex] (1 to 8), now, bound?, index?}`; `index` is the pool's price index (1e12-scaled) the transaction used |
 
 Which optional fields an operation needs is the keeper's check, not the Worker's.
 
