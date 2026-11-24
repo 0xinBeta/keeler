@@ -20,6 +20,7 @@ pub use keeler_lend::{
     client::{note_data_hash, output_blinding, output_hash, NoteKind},
     instructions::{
         cancel_intent::CancelIntentArgs, init_reserve::InitReserveArgs, intent::IntentArgs,
+        redeem::RedeemArgs, supply::SupplyArgs,
     },
     tag, ADMIN, ID, KEEPER, POOL_SEED, USER_SEED,
 };

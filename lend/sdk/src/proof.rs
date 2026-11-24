@@ -14,10 +14,12 @@ pub enum CircuitId {
     InitReserve,
     Intent,
     CancelIntent,
+    Supply,
+    Redeem,
 }
 
 impl CircuitId {
-    pub const ALL: [Self; 3] = [Self::InitReserve, Self::Intent, Self::CancelIntent];
+    pub const ALL: [Self; 5] = [Self::InitReserve, Self::Intent, Self::CancelIntent, Self::Supply, Self::Redeem];
 
     /// The directory `zolana zk compile` writes under [`keys_dir`].
     pub fn name(self) -> &'static str {
@@ -25,6 +27,8 @@ impl CircuitId {
             Self::InitReserve => "init_reserve",
             Self::Intent => "intent",
             Self::CancelIntent => "cancel_intent",
+            Self::Supply => "supply",
+            Self::Redeem => "redeem",
         }
     }
 }
