@@ -27,7 +27,7 @@ import {
   decimal,
   decode as decodeTx,
   ixData,
-  markerData,
+
   prove,
   proveSpp,
   sppInputs,
@@ -110,10 +110,10 @@ export function createLendSeams(ctx: () => Promise<LendContext>) {
 
   const makerIdentity = (c: LendContext) => decimal(solanaOwnerIdentity(addressBytes(c.payer)));
 
-  const intentInstruction = async (c: LendContext, tag: number, args: Uint8Array, raw: RawProgramTransaction, circuit: "intent" | "cancel_intent" | "close", owners: { address: Address; role: AccountRole }[], marker?: Uint8Array) => {
+  /** A transaction the user builds and pays: [tag] ‖ proof ‖ args ‖ transact, as lend/sdk/src/lib.rs `instruction`. */
+  const userInstruction = async (c: LendContext, tag: number, args: Uint8Array, raw: RawProgramTransaction, circuit: "intent" | "cancel_intent" | "close", owners: { address: Address; role: AccountRole }[]) => {
     const tx = await decodeTx(c, raw);
-    const keeper = await keeperAddress(c);
-    const spp = await sppInputs(c, tx, marker ? [{ viewTag: keeper.address.signingPublicKey.confidentialViewTag(), data: marker }] : []);
+    const spp = await sppInputs(c, tx, []);
     // An intent spends the user's own note; a cancel or close spends a PDA note, completed under the zero nullifier key.
     const authority = circuit === "intent" ? c.keys : new NullifierKeyProofAuthority(ProgramOwner.nullifierKey(), c.client.proofService);
     const transact = await proveSpp(c, tx, spp, authority);
@@ -150,8 +150,8 @@ export function createLendSeams(ctx: () => Promise<LendContext>) {
       const output = raw.finalizedTx.outputUtxos[SLOT.intent.intent];
       if (!hash || !output) throw new Error("the intent transaction has no intent output");
       const args = Uint8Array.of(...addressBytes(mint), ...user.viewing.toBytes(), user.bump);
-      // The marker on the keeper's view tag tells it which wallet's PDA to scan, as the swap's make does for the dealer.
-      const { built } = await intentInstruction(c, TAG.intent, args, raw, "intent", [rs(c.payer), r(user.pda)], markerData(hash, c.payer));
+      // No marker message: the keeper finds the intent from its ticket, scanning this wallet's PDA (as the Rust SDK sends it).
+      const { built } = await userInstruction(c, TAG.intent, args, raw, "intent", [rs(c.payer), r(user.pda)]);
       return { ...built, hash: new Uint8Array(hash), output };
     },
 
@@ -167,23 +167,25 @@ export function createLendSeams(ctx: () => Promise<LendContext>) {
       onProving();
       const raw = await callWorker<RawProgramTransaction>({ op: "lendCancel", inputs, sender: c.keys.address().toBytes(), payer: c.payer });
       const args = Uint8Array.of(...user.viewing.toBytes(), user.bump, ...u64Bytes(state.expiry));
-      return (await intentInstruction(c, TAG.cancelIntent, args, raw, "cancel_intent", [r(user.pda)])).built;
+      return (await userInstruction(c, TAG.cancelIntent, args, raw, "cancel_intent", [r(user.pda)])).built;
     },
 
+    /** A port of lend/sdk/src/vault.rs `close`: the owner alone takes all the collateral of a debt-free position. */
     async close(position, onProving) {
       const c = await ctx();
-      const user = await pdaOf(c);
-      const positionUtxo = pdaUtxo(c, user.owner, position, position.leafIndex);
-      const { data: state } = await callWorker<{ data: unknown }>({ op: "lendState", kind: "position", utxo: positionUtxo });
-      // shortcut: the close circuit's inputs are assumed to mirror cancel_intent's; change them when Vault builds close.
+      const { owner, pda, bump } = await userPda(c.payer, c.programId);
+      const viewing = c.keys.address().viewingPublicKey;
+      const positionUtxo = pdaUtxo(c, owner, position, position.leafIndex);
+      const { data: state } = await callWorker<{ data: { owner: unknown; vault: bigint; positionId: bigint; debtShares: bigint } }>({ op: "lendState", kind: "position", utxo: positionUtxo });
+      const halves = mintHalves(address(position.mint));
       const inputs = {
         private: { txContext: { outputTreeId: TREE_ID }, positionUtxo, positionState: state },
-        public: { userOwner: user.shielded, makerIdentity: makerIdentity(c) },
+        public: { userOwner: owner.address(viewing).toBytes(), ownerIdentity: makerIdentity(c), collHi: halves.mintHi, collLo: halves.mintLo, vault: BigInt(state.vault) },
       };
       onProving();
       const raw = await callWorker<RawProgramTransaction>({ op: "lendClose", inputs, sender: c.keys.address().toBytes(), payer: c.payer });
-      const args = Uint8Array.of(...addressBytes(address(position.mint)), ...user.viewing.toBytes(), user.bump);
-      return (await intentInstruction(c, TAG.close, args, raw, "close", [r(user.pda)])).built;
+      const args = Uint8Array.of(...u64Bytes(BigInt(state.vault)), ...viewing.toBytes(), bump);
+      return (await userInstruction(c, TAG.close, args, raw, "close", [r(pda)])).built;
     },
   };
 
@@ -294,9 +296,12 @@ export function createLendSeams(ctx: () => Promise<LendContext>) {
     },
   };
 
+  /** Receipts and positions are the user PDA's notes under the user's own viewing key (lend/sdk/src/vault.rs, earn.rs). */
   const owners = async () => {
     const c = await ctx();
-    return { user: c.keys.address().toBytes(), pda: (await pdaOf(c)).shielded };
+    const me = c.keys.address();
+    const { owner } = await userPda(c.payer, c.programId);
+    return { user: me.toBytes(), pda: owner.address(me.viewingPublicKey).toBytes(), viewing: me.viewingPublicKey.toBytes() };
   };
 
   return { build, chain, wasm, owners };

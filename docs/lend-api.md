@@ -132,11 +132,23 @@ with exactly the ticket's purpose, target, amount and expiry.
 ## Intents
 
 An intent moves one private note's `amount` into a note the user PDA (`["user", wallet]`) owns
-under the keeper's registered viewing key, slot 1 (slot 0 is the change). Its SPP transact carries
-one message on the keeper's confidential view tag: `intent output hash (32) ‖ wallet (32)`, which
-tells the keeper whose PDA to look at. The page sends it itself (the user pays) and then waits for
-the keeper to fill it. After `expiry` the user can cancel it (`cancel_intent`) and take the funds
-back.
+under the keeper's registered viewing key, slot 1 (slot 0 is the change). It carries no message:
+the keeper knows the wallet from the ticket and scans that wallet's PDA, as for intents the Rust SDK
+builds. The page sends it itself (the user pays) and then waits for the keeper to fill it. After
+`expiry` the user can cancel it (`cancel_intent`) and take the funds back.
+
+Receipts and positions are the user PDA's notes under the user's own viewing key (`owner_viewing` in
+the keeper-built args), so the user can always decrypt them.
+
+`close` is the user's alone: the page builds, proves and pays it (no keeper, no price), for a
+position with no debt; the whole collateral comes back at slot 0.
+
+## Pause
+
+The Worker's `PAUSED` switch is the swap's and does not apply to `/api/lend/*`: repayments,
+withdrawals and refunds must keep working while liquidations run. Lending is paused at the keeper,
+which then refuses new supply, new positions and borrowing with a 403 (`paused` on the page, the
+keeper's sentence shown) and keeps serving everything else.
 
 ## Errors
 
@@ -146,7 +158,7 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | Status | Page code | Meaning |
 | --- | --- | --- |
 | 401 | `network` | Session or signature refused (the page retries once with a new session) |
-| 403 | `paused` | Lending paused at the keeper |
+| 403 | `paused` | Lending paused at the keeper (new supply, new positions, borrowing) |
 | 404 | `storage` | No such position or receipt |
 | 409 | `busy` | The reserve is in use; try again shortly |
 | 410 | `no-liquidity` | Not enough in the pool |
@@ -155,43 +167,46 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | 423 | `unhealthy` | The position would be unhealthy |
 | 429 | `rate-limited` | Too many requests |
 | 502, 504 | `keeper-offline` | The keeper did not answer (Worker) |
-| 503 | `paused` if the text says paused, else `keeper-offline` | Paused or not configured (Worker) |
+| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured (Worker) |
 | other | `network` | |
 
-## Layouts the page assumes
+## Layouts the page checks
 
-The page checks every keeper-built transaction before the wallet sees it (`lend-check.ts`). Rows
-marked *assumed* are guesses until the Earn and Vault pieces build those instructions; they live
-in one table, `web/src/keeler/lend-layout.ts`, so integrating them is a constants change.
+The page checks every keeper-built transaction before the wallet sees it (`lend-check.ts`). The
+layouts below are read from the program (`lend/program/src/instructions/`, `circuits/`,
+`lend/sdk/src/builders/earn.rs`, `lend/sdk/src/vault.rs`) and live in one table,
+`web/src/keeler/lend-layout.ts`.
 
-Instruction data is `[tag] ‖ args ‖ wincode(TransactIxData)`; each args struct starts with the
-128-byte compressed proof.
+Instruction data is `[tag] ‖ wincode(args) ‖ wincode(TransactIxData)`; each args struct starts
+with the 128-byte compressed proof.
 
-| Item | Value | State |
-| --- | --- | --- |
-| Tags | init_reserve 1, intent 2, cancel_intent 3, supply 4, redeem 5, deposit 6, draw 7, repay 8, liquidate 9, close 10 | built |
-| intent args | proof, mint [32], viewing [33], user_bump | built |
-| cancel_intent args | proof, viewing [33], user_bump, expiry u64 | built |
-| redeem args | proof, mint [32], pool_bump, user_bump, now u64 | assumed |
-| draw args | proof, vault u64, pool_bump, user_bump, now u64, bound u64 | assumed |
-| liquidate args | as draw (the page reads only `bound`, to report a liquidation) | assumed |
-| close args | proof, mint [32], viewing [33], user_bump | assumed |
-| Keeper-built account head | keeper (writable signer, fee payer) at 0, owner (read-only signer) at 1 | assumed |
-| intent slots | change 0, intent 1 | built |
-| cancel_intent slots | refund 0 | built |
-| redeem slots | reserve 0, payout 1, receipt 2 | assumed |
-| draw slots | reserve 0, position 1, debt payout 2, collateral payout 3 | assumed |
-| close slots | collateral 0 | assumed |
-| Owner output blindings | `outputBlinding(first nullifier, poseidon([domain, previous note's blinding]), slot)`; domain `"LRDM"` (redeem, from the receipt) or `"LDRW"` (draw, from the position) as a big-endian u32 in a field element | assumed |
-| Note state record | the Borsh state as one `utxoData` data record | assumed |
-| close circuit inputs | `{private: {txContext, positionUtxo, positionState}, public: {userOwner, makerIdentity}}`, WASM `closeTransaction` | assumed; the package has no `closeTransaction` yet, so close fails with a clear message |
+| Item | Value |
+| --- | --- |
+| Tags | init_reserve 1, intent 2, cancel_intent 3, supply 4, redeem 5, deposit_open 6, draw 7, repay 8, liquidate 9, close 10, deposit_add 11, set_test_price 12 |
+| intent args | proof, mint [32], viewing [33], user_bump |
+| cancel_intent args | proof, viewing [33], user_bump, expiry u64 |
+| redeem args | proof, mint [32], pool_viewing [33], pool_bump, owner_viewing [33], user_bump, now u64 |
+| draw args | proof, vault u64, pool_viewing [33], pool_bump, owner_viewing [33], user_bump, now u64, bound u64 |
+| liquidate args | proof, vault u64, pool_viewing [33], pool_bump, owner [32], owner_viewing [33], user_bump, now u64, bound u64 (the page reads only `bound`, to report a liquidation) |
+| close args | proof, vault u64, viewing [33], user_bump |
+| Keeper-built account head | keeper (writable signer, fee payer) at 0, owner (read-only signer) at 1; draw always has the price account at 2 |
+| Owner-built account head | intent, cancel_intent and close: the owner (writable signer, fee payer) at 0 |
+| intent slots | change 0, intent 1 |
+| cancel_intent slots | refund 0 |
+| redeem slots | receipt 0, reserve 1, payout 2 |
+| draw slots | position 0, reserve 1, debt payout 2, collateral payout 3 |
+| close slots | payout 0 |
+| Owner output blindings | `outputBlinding(first nullifier, poseidon([domain, spent note's blinding]), slot)`; domain `"LRDM"` (redeem, from the receipt) or `"LPOS"` (draw, repay and liquidate, from the position) as a big-endian u32 in a field element; close uses no seed |
+| Note state record | the Borsh state as one `utxoData` data record (`DataUtxo::try_from` in `circuits/notes.rs`) |
+| close circuit inputs | `{private: {txContext, positionUtxo, positionState}, public: {userOwner, ownerIdentity, collHi, collLo, vault}}`, WASM `closeTransaction` |
 
 The signing check refuses a keeper transaction unless: it decodes; it uses no lookup table and no
 durable nonce; the keeper pays its fees and the owner does not; it has exactly one lend instruction
 of the requested op, and nothing else but compute-budget instructions without accounts; the owner
-is exactly one read-only signer, at head index 1, and the keeper is at index 0; `now` in the args
-equals the reply's `now` and is within 60 s behind and 10 s ahead of chain time; the transact
-expiry is after chain time and at most 300 s ahead; it moves nothing out of the pool (no interface
-transfers); for draw, `bound` equals the reply's and is within 2 % of the page's reference price;
-the reply's `outputs` are the transaction's; it spends the owner's note; and every note the owner
-should get (payouts, the new receipt or position) hashes to the output at its slot.
+is exactly one read-only signer, at head index 1, and the keeper is at index 0; `owner_viewing` in
+the args is the owner's viewing key; `now` in the args equals the reply's `now` and is within 60 s
+behind and 10 s ahead of chain time; the transact expiry is after chain time and at most 300 s
+ahead; it moves nothing out of the pool (no interface transfers); for draw, `bound` equals the
+reply's and is within 2 % of the page's reference price; the reply's `outputs` are the
+transaction's; its first nullifier is the owner's note; and every note the owner should get
+(payouts, the new receipt or position) hashes to the output at its slot.

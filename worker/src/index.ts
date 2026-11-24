@@ -746,15 +746,15 @@ const ACCOUNT_REPLY: Spec = {
 };
 
 type LendRoute = {
-  method: "GET" | "POST"; keeper: string; limits: [LimitName, LimitName]; timeoutMs: number; pausable: boolean;
+  method: "GET" | "POST"; keeper: string; limits: [LimitName, LimitName]; timeoutMs: number;
   /** The query for a GET, the body for a POST. */
   request: Spec; reply: Spec;
 };
 const LEND_ROUTES: Record<string, LendRoute> = {
-  "/api/lend/pools": { method: "GET", keeper: "/lend/pools", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, pausable: false, request: {}, reply: POOLS_REPLY },
-  "/api/lend/account": { method: "GET", keeper: "/lend/account", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, pausable: false, request: SIGNED, reply: ACCOUNT_REPLY },
-  "/api/lend/ticket": { method: "POST", keeper: "/lend/ticket", limits: ["LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, pausable: true, request: TICKET_REQUEST, reply: TICKET_REPLY },
-  "/api/lend/build": { method: "POST", keeper: "/lend/build", limits: ["LEND_BUILD_LIMIT", "LEND_BUILD_GLOBAL_LIMIT"], timeoutMs: LEND_BUILD_TIMEOUT_MS, pausable: true, request: BUILD_REQUEST, reply: BUILD_REPLY },
+  "/api/lend/pools": { method: "GET", keeper: "/lend/pools", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: {}, reply: POOLS_REPLY },
+  "/api/lend/account": { method: "GET", keeper: "/lend/account", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: SIGNED, reply: ACCOUNT_REPLY },
+  "/api/lend/ticket": { method: "POST", keeper: "/lend/ticket", limits: ["LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: TICKET_REQUEST, reply: TICKET_REPLY },
+  "/api/lend/build": { method: "POST", keeper: "/lend/build", limits: ["LEND_BUILD_LIMIT", "LEND_BUILD_GLOBAL_LIMIT"], timeoutMs: LEND_BUILD_TIMEOUT_MS, request: BUILD_REQUEST, reply: BUILD_REPLY },
 };
 
 // shortcut: one keeper, the first DEALERS entry; return a list here when there is more than one.
@@ -767,7 +767,8 @@ function keeper(env: Env): { url: string } {
 async function lend(request: Request, env: Env, url: URL, path: string): Promise<Response> {
   const route = Object.hasOwn(LEND_ROUTES, path) ? LEND_ROUTES[path]! : undefined;
   if (lendConfig(env) === undefined || route === undefined) throw new Fail(404, "Not found.");
-  if (route.pausable && env.PAUSED === "1") throw new Fail(503, "Swaps are paused.");
+  // PAUSED is the swap's switch: lending ignores it, so repayments and withdrawals keep working while liquidations run.
+  // The keeper has its own pause, which stops only new supply, new positions and borrowing (a 403 the page shows).
   const wrong = only(request, route.method);
   if (wrong) return wrong;
   await limit(env, route.limits[0], request);
