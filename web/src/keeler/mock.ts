@@ -1,8 +1,10 @@
 // In-memory Keeler for building the interface without a chain. `?mock=<scenario>` makes one error reachable:
 // dealer-offline, no-quotes, wallet-rejected, storage, rate-limited, paused.
 import type { Wallet } from "@wallet-standard/base";
+// Lend scenarios are listed in mock-lend.ts.
 import { KeelerError } from "./index";
 import type { Asset, Balance, Config, Keeler, Order, Quote, SwapStep } from "./index";
+import { createMockLend } from "./mock-lend";
 
 type Scenario = "dealer-offline" | "no-quotes" | "wallet-rejected" | "storage" | "rate-limited" | "paused" | null;
 
@@ -98,8 +100,16 @@ export function createMockKeeler(): Keeler {
     if (config.paused) throw new KeelerError("paused", "Swaps are paused right now. Your balances, withdrawals and refunds still work.");
   };
   const strip = ({ settlesAt: _, ...o }: (typeof orders)[number]): Order => ({ ...o });
+  const lend = createMockLend(tUSD, tSOL, {
+    scenario,
+    need: () => need("unlock"),
+    spend,
+    addNote,
+    hasNote: (asset, amount) => notes.get(asset.mint)!.some((n) => n >= amount),
+  });
 
   return {
+    lend,
     async config() {
       await sleep(250);
       return config;

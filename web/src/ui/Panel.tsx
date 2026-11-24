@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import type { Wallet } from "@wallet-standard/base";
 import { KeelerError } from "../keeler/index";
-import type { Asset, Balance, Config, Keeler, Order, Quote, SwapStep } from "../keeler/index";
+import type { Asset, Balance, Config, Keeler, LendAccount, Order, Quote, SwapStep } from "../keeler/index";
 import { bps, countdown, formatUnits, parseUnits, short } from "./format";
+import { BorrowTab, EarnTab } from "./Lend";
+import type { Market } from "./Lend";
 import type { DealerLight } from "./ring";
 import { Amount, ErrorNote, errorText, useChainNow } from "./shared";
 
@@ -19,7 +21,15 @@ type Props = {
   reloadConfig: () => void;
   setLights: Dispatch<SetStateAction<DealerLight[] | null>>;
   setProving: (p: boolean) => void;
+  tab: Tab;
+  setTab: (t: Tab) => void;
+  market: Market | null;
+  account: LendAccount | null;
+  refreshLend: () => Promise<unknown>;
 };
+
+export type Tab = "swap" | "earn" | "borrow" | "balances";
+const TITLE: Record<Tab, string> = { swap: "Swap privately", earn: "Earn privately", borrow: "Borrow privately", balances: "Balances" };
 
 type Phase = "wallet" | "unlock" | "register" | "ready";
 type View =
@@ -52,7 +62,7 @@ export function Panel(p: Props) {
   const { keeler, config } = p;
   const [phase, setPhase] = useState<Phase>("wallet");
   const [address, setAddress] = useState<string | null>(null);
-  const [tab, setTab] = useState<"swap" | "balances">("swap");
+  const { tab, setTab } = p;
   const act = useAction();
   const heading = useRef<HTMLHeadingElement>(null);
   const first = useRef(true);
@@ -165,29 +175,50 @@ export function Panel(p: Props) {
     );
   }
 
+  const lend = keeler.lend;
+  const tabs: Tab[] = lend ? ["swap", "earn", "borrow", "balances"] : ["swap", "balances"];
+  const shown: Tab = tabs.includes(tab) ? tab : "swap";
+  const lendProps = {
+    balances: p.balances,
+    market: p.market,
+    account: p.account,
+    chainOffset: p.chainOffset,
+    refreshLend: p.refreshLend,
+    refreshBalances: p.refreshBalances,
+  };
+
   return (
     <div className="panel-body">
       <div className="panel-head">
         <h2 className="panel-title" ref={heading} tabIndex={-1}>
-          {tab === "swap" ? "Swap privately" : "Balances"}
+          {TITLE[shown]}
         </h2>
         <span className="addr mono" title={address ?? ""}>
           {short(address ?? "")}
         </span>
       </div>
-      <div className="seg" role="group" aria-label="Panel">
-        <button aria-pressed={tab === "swap"} onClick={() => setTab("swap")}>
-          Swap
-        </button>
-        <button aria-pressed={tab === "balances"} onClick={() => setTab("balances")}>
-          Balances
-        </button>
+      <div className={`seg${lend ? " seg-4" : ""}`} role="group" aria-label="Panel">
+        {tabs.map((t) => (
+          <button key={t} aria-pressed={shown === t} onClick={() => setTab(t)}>
+            {t === "swap" ? "Swap" : t === "earn" ? "Earn" : t === "borrow" ? "Borrow" : "Balances"}
+          </button>
+        ))}
       </div>
-      {/* Both stay mounted so a swap in progress survives a look at balances. */}
-      <div hidden={tab !== "swap"}>
+      {/* All stay mounted so an operation in progress survives a look at another tab. */}
+      <div hidden={shown !== "swap"}>
         <SwapTab {...p} toBalances={() => setTab("balances")} />
       </div>
-      <div hidden={tab !== "balances"}>
+      {lend && (
+        <>
+          <div hidden={shown !== "earn"}>
+            <EarnTab {...lendProps} lend={lend} />
+          </div>
+          <div hidden={shown !== "borrow"}>
+            <BorrowTab {...lendProps} lend={lend} />
+          </div>
+        </>
+      )}
+      <div hidden={shown !== "balances"}>
         <BalancesTab {...p} />
       </div>
     </div>

@@ -6,15 +6,16 @@ import { RingCanvas } from "./RingCanvas";
 
 const reduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-export function Facts() {
-  const facts = [
-    ["~1.5 s", "to prove your order, right in your browser"],
-    ["0", "slippage. The quote you accept is the amount you get"],
-    ["On-chain", "custody. Your funds sit in Solana programs, never in a Keeler account"],
-    ["1 click", "to take your funds back if a dealer doesn't deliver"],
-  ];
+const SWAP_FACTS = [
+  ["~1.5 s", "to prove your order, right in your browser"],
+  ["0", "slippage. The quote you accept is the amount you get"],
+  ["On-chain", "custody. Your funds sit in Solana programs, never in a Keeler account"],
+  ["1 click", "to take your funds back if a dealer doesn't deliver"],
+];
+
+export function Facts({ facts = SWAP_FACTS, label = "Keeler in numbers" }: { facts?: string[][]; label?: string }) {
   return (
-    <section className="facts" aria-label="Keeler in numbers">
+    <section className="facts" aria-label={label}>
       <ul>
         {facts.map(([fig, line]) => (
           <li key={fig}>
@@ -127,7 +128,27 @@ const ROWS = [
   { label: "Price", value: "142.37 tUSD per tSOL", secret: true },
 ];
 
+type CompareProps = {
+  id: string;
+  title: ReactNode;
+  rows: { label: string; value: string; secret: boolean }[];
+  labels: [string, string];
+  caption: string;
+};
+
 export function ChainSees() {
+  return (
+    <Compare
+      id="privacy"
+      title="What the chain sees"
+      rows={ROWS}
+      labels={["A normal swap", "On Keeler"]}
+      caption="Who traded and which assets are public. How much and at what price are not."
+    />
+  );
+}
+
+function Compare({ id, title, rows, labels, caption }: CompareProps) {
   const [keeler, setKeeler] = useState(false);
   const [touched, setTouched] = useState(false);
   const box = useRef<HTMLDivElement>(null);
@@ -153,26 +174,26 @@ export function ChainSees() {
   };
 
   return (
-    <section className="section" id="privacy" aria-labelledby="privacy-title">
+    <section className="section" id={id} aria-labelledby={`${id}-title`}>
       <div className="split-head">
-        <h2 id="privacy-title" className="big">
-          What the chain sees
+        <h2 id={`${id}-title`} className="big">
+          {title}
         </h2>
         <div className="switch" role="group" aria-label="Compare">
           <button aria-pressed={!keeler} onClick={() => pick(false)}>
-            A normal swap
+            {labels[0]}
           </button>
           <button aria-pressed={keeler} onClick={() => pick(true)}>
-            On Keeler
+            {labels[1]}
           </button>
           <span className={`switch-thumb${keeler ? " on" : ""}`} aria-hidden="true" />
         </div>
       </div>
       <div className={`sees${keeler ? " is-keeler" : ""}`} ref={box}>
         <table>
-          <caption className="sr-only">{keeler ? "What the chain sees on Keeler" : "What the chain sees in a normal swap"}</caption>
+          <caption className="sr-only">{`What the chain sees: ${keeler ? labels[1] : labels[0]}`}</caption>
           <tbody>
-            {ROWS.map((r, i) => {
+            {rows.map((r, i) => {
               const hidden = keeler && r.secret;
               return (
                 <tr key={r.label} className={r.secret ? "secret" : undefined} style={{ ["--i" as string]: i }}>
@@ -201,7 +222,7 @@ export function ChainSees() {
             })}
           </tbody>
         </table>
-        <p className="sees-cap">Who traded and which assets are public. How much and at what price are not.</p>
+        <p className="sees-cap">{caption}</p>
       </div>
     </section>
   );
@@ -307,6 +328,209 @@ export function Dealers() {
   );
 }
 
+/* ---------------- Keeler Lend. Every claim here must hold for docs/plan-lend.md's design. ---------------- */
+
+const LEND_VIZ: Record<string, ReactNode> = {
+  earn: (
+    <svg viewBox="0 0 160 80" aria-hidden="true">
+      <ellipse cx="80" cy="44" rx="62" ry="22" className="v-ring v-faint" />
+      <path d="M22 62 C52 60 74 50 92 36 S124 16 140 14" className="v-line v-gold" />
+      <circle cx="140" cy="14" r="4.5" className="v-dot v-pulse" />
+      <circle cx="36" cy="60" r="3" className="v-dot-dim" />
+      <circle cx="64" cy="54" r="3" className="v-dot-dim" />
+      <circle cx="92" cy="36" r="3" className="v-dot-dim" />
+    </svg>
+  ),
+  exit: (
+    <svg viewBox="0 0 160 80" aria-hidden="true">
+      <rect x="30" y="20" width="100" height="40" rx="20" className="v-band" />
+      <rect x="30" y="20" width="72" height="40" rx="20" className="v-chip" />
+      <path d="M112 40 h34 M138 32 l8 8 -8 8" className="v-line v-gold v-flow" />
+      <circle cx="116" cy="40" r="4" className="v-moon" />
+    </svg>
+  ),
+  borrow: (
+    <svg viewBox="0 0 160 80" aria-hidden="true">
+      <rect x="20" y="34" width="120" height="12" rx="6" className="v-chip" />
+      <rect x="20" y="34" width="96" height="12" rx="6" className="v-band" />
+      <line x1="116" y1="24" x2="116" y2="56" className="v-line v-gold" />
+      <line x1="122" y1="26" x2="122" y2="54" className="v-ref" />
+      <circle cx="116" cy="24" r="3.5" className="v-dot v-pulse" />
+    </svg>
+  ),
+  trim: (
+    <svg viewBox="0 0 160 80" aria-hidden="true">
+      <path d="M24 56 L60 50 L92 30 L108 46 L140 44" className="v-line v-faint" />
+      <line x1="20" y1="40" x2="144" y2="40" className="v-ref" />
+      <circle cx="92" cy="30" r="4.5" className="v-off" />
+      <path d="M92 36 L106 44" className="v-line v-gold v-flow" />
+      <circle cx="108" cy="46" r="4.5" className="v-dot" />
+    </svg>
+  ),
+  hidden: (
+    <svg viewBox="0 0 160 80" aria-hidden="true">
+      <ellipse cx="80" cy="40" rx="66" ry="24" className="v-ring v-spin-slow" />
+      <g className="v-mask">
+        <rect x="46" y="33" width="68" height="14" rx="7" className="v-chip" />
+        <circle cx="60" cy="40" r="2.2" />
+        <circle cx="72" cy="40" r="2.2" />
+        <circle cx="84" cy="40" r="2.2" />
+        <circle cx="96" cy="40" r="2.2" />
+      </g>
+    </svg>
+  ),
+  close: (
+    <svg viewBox="0 0 160 80" aria-hidden="true">
+      <rect x="44" y="16" width="72" height="48" rx="10" className="v-frame" />
+      <path d="M66 40 l10 10 20 -20" className="v-tick" />
+      <circle cx="132" cy="22" r="3.5" className="v-moon v-orbit" />
+    </svg>
+  ),
+};
+
+export function LendFeatures({ market, onOpen }: { market: { pools: { supplyAprBps: number; borrowAprBps: number; asset: { symbol: string } }[] } | null; onOpen: (t: "earn" | "borrow") => void }) {
+  const pool = market?.pools[0];
+  const items: [string, string, string][] = [
+    ["earn", "Earn a floating rate", "Supply to one shared pool. Borrowers pay interest into it, and the value of your share grows as that interest accrues."],
+    ["exit", "Out when you want", "Withdraw any time the pool has idle funds. No lock-up period, no term, no waiting for a maturity date."],
+    ["borrow", "Borrow up to 80%", "Lock tSOL and borrow tUSD against up to 80% of its value. Repay whenever you like; a loan has no end date."],
+    ["trim", "A liquidation that leaves you standing", "Past 85%, only enough collateral is sold to bring you back to the line. The 1% penalty goes to the pool's safety buffer, not to a liquidator."],
+    ["hidden", "Nobody sees your position", "Your deposit, collateral, debt, health and liquidation price stay off the public chain. Only you and the pool's keeper can read them."],
+    ["close", "Yours to close", "Once a position has no debt, your browser proves the close and you take your collateral back, without anyone's help."],
+  ];
+  return (
+    <section className="section" id="lend" aria-labelledby="lend-title">
+      <div className="lend-hero">
+        <div>
+          <p className="kicker">Keeler Lend</p>
+          <h2 id="lend-title" className="big">
+            Jupiter-style lending. <span className="gold">Nobody sees your position.</span>
+          </h2>
+          <p className="dealers-text">
+            A shared pool with a floating rate, and vaults that let you borrow against your collateral with no term. It works like
+            the lending markets you know, except the public chain never sees how much you deposit, borrow or hold.
+          </p>
+          <div className="pills">
+            <button className="pill pill-gold" onClick={() => onOpen("earn")}>
+              Start earning
+            </button>
+            <button className="pill pill-outline" onClick={() => onOpen("borrow")}>
+              Borrow against tSOL
+            </button>
+          </div>
+        </div>
+        <div className="lend-rate" aria-live="off">
+          <svg viewBox="0 0 200 200" aria-hidden="true" className="lend-rate-ring">
+            <circle cx="100" cy="100" r="86" className="v-ring v-faint" />
+            <circle cx="100" cy="100" r="86" className="v-ring lend-rate-arc" pathLength={100} strokeDasharray="72 100" />
+          </svg>
+          <div className="lend-rate-body">
+            <span className="fact-fig">{pool ? `${(pool.supplyAprBps / 100).toFixed(2)}%` : "—"}</span>
+            <span className="muted">{pool ? `${pool.asset.symbol} supply APR now` : "Reading the pool…"}</span>
+            {pool && <span className="muted small">Borrow at {(pool.borrowAprBps / 100).toFixed(2)}%</span>}
+          </div>
+        </div>
+      </div>
+      <ul className="features">
+        {items.map(([k, title, text]) => (
+          <li key={k} className="feature">
+            <div className="viz">{LEND_VIZ[k]}</div>
+            <h3>{title}</h3>
+            <p>{text}</p>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+const LEND_ROWS = [
+  { label: "Wallet address", value: "9xQe…4kLm", secret: false },
+  { label: "Vault", value: "tSOL → tUSD", secret: false },
+  { label: "Collateral", value: "1,200 tSOL", secret: true },
+  { label: "Debt", value: "118,400 tUSD", secret: true },
+  { label: "Health", value: "69.3% loan-to-value", secret: true },
+  { label: "Liquidation price", value: "116.08 tUSD per tSOL", secret: true },
+];
+
+export function LendPrivacy() {
+  return (
+    <Compare
+      id="lend-privacy"
+      title={
+        <>
+          Your liquidation price <span className="gold">is nobody's business.</span>
+        </>
+      }
+      rows={LEND_ROWS}
+      labels={["A public market", "On Keeler"]}
+      caption="On a public lending market anyone can list every position and its liquidation price. Here they can't."
+    />
+  );
+}
+
+export function LendLiquidation() {
+  const steps = [
+    ["Watched", "The keeper checks every position against the oracle price, privately. Nobody else can see how close yours is."],
+    ["Trimmed", "Past 85%, it repays part of your debt and sells only enough collateral to bring you back to 85%."],
+    ["Buffered", "The 1% penalty is paid into the pool's safety buffer, not to the liquidator. The rest of your collateral stays yours."],
+  ];
+  return (
+    <section className="section" id="liquidation" aria-labelledby="liq-title">
+      <h2 id="liq-title" className="big">
+        How liquidation works: <span className="gold">a trim, not a wipe-out.</span>
+      </h2>
+      <div className="liq-demo" aria-hidden="true">
+        <p className="liq-labels">A position's loan-to-value as the tSOL price falls, crosses 85%, and is trimmed back.</p>
+        <div className="health-bar liq-bar">
+          <span className="health-fill" />
+          <span className="health-mark" style={{ left: "80%" }} />
+          <span className="health-mark health-mark-lt" style={{ left: "85%" }} />
+        </div>
+        <div className="health-scale muted">
+          <span>80% borrow limit</span>
+          <span className="lt">85% liquidation</span>
+        </div>
+      </div>
+      <ol className="steps-3">
+        {steps.map(([title, text], i) => (
+          <li key={title} className="card">
+            <span className="step-n">{i + 1}</span>
+            <h3>{title}</h3>
+            <p>{text}</p>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+export function LendNumbers() {
+  return (
+    <div className="section section-facts">
+      <Facts
+        label="Keeler Lend in numbers"
+        facts={[
+          ["80%", "of your collateral's value you can borrow, with no term"],
+          ["85%", "loan-to-value where liquidation starts, and it only trims back to the line"],
+          ["1%", "penalty, paid into the pool's safety buffer, never to a liquidator"],
+          ["0", "amounts on the public chain: deposit, collateral, debt, health and liquidation price stay hidden"],
+        ]}
+      />
+    </div>
+  );
+}
+
+const LEND_FAQ: [string, string, string?][] = [
+  ["What does “Jupiter-style” mean?", "Keeler Lend follows the same shape as Jupiter Lend: one shared pool per token with a floating rate set by how much of it is borrowed, and vaults where you borrow against collateral with a borrow limit, a liquidation threshold and a penalty. Keeler is not affiliated with Jupiter and uses none of its code."],
+  ["What is visible when I lend or borrow?", "Your wallet address, which pool or vault you used, when, and which kind of operation it was; a borrow and a collateral withdrawal look the same. If a position is liquidated, that is public too, with the price used. Your amounts, health and liquidation price are not. People using the same pool can estimate how much of it is borrowed over time, and may notice a very large operation."],
+  ["Who runs the pool?", "A keeper service run by Keeler. It holds the pool's private records, so it can see the amounts in every deposit and position. It puts operations in order and performs liquidations. It cannot take your principal: your funds only move with your signed request or your wallet's signature, or by a liquidation under the vault's rules."],
+  ["What if the keeper is offline?", "Deposits, borrowing, repayments and withdrawals wait until it is back, and your funds stay where they are. A deposit or repayment it hasn't taken in can be taken back once the request expires. A position that could not be topped up while it was offline may be liquidated when it returns. A position with no debt can be closed without the keeper at any time."],
+  ["How does liquidation work?", "Each vault has a liquidation threshold: 85% loan-to-value for tSOL → tUSD. Past it, the keeper repays part of your debt and sells only enough collateral, at a price set from the oracle, to bring you back to 85%, plus a 1% penalty that goes to the pool's safety buffer. If a position gets past 90% before that happens, the whole loan is repaid the same way and the rest of the collateral stays yours."],
+  ["When can I withdraw from Earn?", "Any time the pool has idle funds. When most of the pool is borrowed, the rate climbs to bring repayments and new deposits in, and no borrow may take the pool above 95% used."],
+  ["How are lending rates set?", "By utilisation, the share of the pool that is borrowed. The borrow rate rises gently up to 88% and steeply after it. Suppliers share the borrowers' interest, less a 10% fee. Collateral is not lent out, so it does not earn."],
+];
+
 const FAQ: [string, string, string?][] = [
   ["What stays private?", "The amounts and the price. The two wallet addresses, the assets, the time, and the fact that a swap happened are public. The dealers you ask see your request so they can quote it."],
   ["Do I need a special wallet?", "No. Your Solana wallet signs a message to create your private keys in the browser. It asks twice, to check your wallet signs consistently. Signing moves no funds."],
@@ -320,7 +544,13 @@ const FAQ: [string, string, string?][] = [
   ["Is Keeler on mainnet?", "Not yet. Keeler is in beta on Solana devnet with test tokens, so you can try every step for free. It has not been audited yet and uses test proving keys; mainnet follows the security review."],
 ];
 
-export function Faq() {
+const MAINNET_LEND: [string, string] = [
+  "Is Keeler on mainnet?",
+  "Not yet. Swaps and lending are in beta on Solana devnet with test tokens, so you can try every step for free. Keeler has not been audited yet and uses test proving keys; mainnet follows the security review.",
+];
+
+export function Faq({ lend = false }: { lend?: boolean }) {
+  const list = lend ? [...FAQ.slice(0, -1), ...LEND_FAQ, MAINNET_LEND] : FAQ;
   return (
     <section className="section" id="faq" aria-labelledby="faq-title">
       <div className="faq-grid">
@@ -328,7 +558,7 @@ export function Faq() {
           Questions, answered
         </h2>
         <div className="faq">
-          {FAQ.map(([q, a, id]) => (
+          {list.map(([q, a, id]) => (
             <details key={q} id={id}>
               <summary>
                 <span>{q}</span>

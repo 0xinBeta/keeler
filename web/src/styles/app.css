@@ -1596,3 +1596,391 @@ details[open] .faq-icon::after {
     clip: rect(0 0 0 0);
   }
 }
+
+/* ---------------- Keeler Lend ---------------- */
+.seg-4 button {
+  min-width: 0;
+  padding: 0 4px;
+}
+.combo-sym {
+  display: grid;
+  place-items: center;
+  min-width: 88px;
+  padding: 0 14px;
+  border-left: 1px solid var(--line);
+  border-radius: 0 15px 15px 0;
+  background: var(--raised);
+  color: var(--ice);
+  font: 500 16px var(--ui);
+}
+.lend-card {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--void);
+}
+.lend-card.pool {
+  background:
+    radial-gradient(90% 80% at 100% 0%, rgb(233 184 114 / 0.1), transparent 60%),
+    var(--void);
+}
+.lend-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+.pool-name {
+  font-weight: 500;
+}
+.apr {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+.apr-big,
+.mine-big {
+  font: 300 34px/1 var(--display);
+  letter-spacing: -0.02em;
+}
+.apr-big {
+  background: linear-gradient(180deg, #ffe4b8 0%, var(--gold) 55%, #f08a55 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.mine {
+  gap: 6px;
+}
+.mine-big {
+  font-size: 24px;
+}
+.mine-big .sym {
+  font: 400 15px var(--ui);
+}
+.kv {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 12px;
+  margin: 0;
+}
+.kv-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.kv-preview {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 12px 14px;
+  border: 1px dashed var(--edge);
+  border-radius: 14px;
+}
+.kv dt {
+  color: var(--dust);
+  font-size: 13px;
+}
+.kv dd {
+  margin: 2px 0 0;
+  font-size: 15px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.util {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.util span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--gold), var(--ember));
+}
+
+/* Health bar: fill to loan-to-value, ticks at the borrow limit and the liquidation threshold. */
+.health {
+  display: grid;
+  gap: 8px;
+}
+.health-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.health-bar {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--line);
+}
+.health-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--gold);
+  box-shadow: 0 0 12px rgb(233 184 114 / 0.45);
+}
+.health-close .health-fill {
+  background: linear-gradient(90deg, var(--gold), #ff9a5e);
+}
+.health-liquidatable .health-fill {
+  background: var(--ember);
+  box-shadow: 0 0 14px rgb(255 106 61 / 0.6);
+}
+.health-after {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ice);
+  box-shadow: 0 0 8px rgb(244 235 214 / 0.8);
+}
+.health-mark {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 1px;
+  background: var(--dust);
+}
+.health-mark-lt {
+  width: 2px;
+  background: var(--ember);
+}
+/* A legend, not labels pinned to the ticks: the two ticks sit too close to label in place on a phone. */
+.health-scale {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 12px;
+}
+.health-scale span {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  white-space: nowrap;
+}
+.health-scale span::before {
+  content: "";
+  width: 2px;
+  height: 10px;
+  background: var(--dust);
+}
+.health-scale .lt::before {
+  background: var(--ember);
+}
+.kv-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (prefers-reduced-motion: no-preference) {
+  .health-fill,
+  .util span {
+    transition: width 0.6s cubic-bezier(0.3, 0.7, 0.2, 1);
+  }
+}
+.badge {
+  font-size: 13px;
+}
+.badge-healthy {
+  border-color: var(--gold);
+  color: var(--gold);
+}
+.badge-close {
+  border-color: #ff9a5e;
+  color: #ff9a5e;
+}
+.badge-liquidatable {
+  border-color: var(--ember);
+  color: var(--ember);
+}
+.position-liquidatable {
+  border-color: rgb(255 106 61 / 0.55);
+}
+.liquidated {
+  font-size: 14px;
+}
+.close-note {
+  margin-top: 8px;
+}
+.mock {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px dashed #3a3f49;
+  border-radius: 14px;
+}
+.mock .btn-small {
+  min-height: 36px;
+  padding: 0 14px;
+  font-size: 14px;
+}
+
+/* Activity */
+.section-tight {
+  padding-top: 0;
+}
+.chain-steps {
+  display: inline-flex;
+  gap: 4px;
+}
+.chain-steps > span[aria-hidden] {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--dust);
+  font-size: 12px;
+}
+.chain-steps .cs-done {
+  color: var(--gold);
+}
+.chain-steps .cs-now {
+  background: rgb(255 106 61 / 0.16);
+  color: var(--ice);
+}
+
+/* Landing: lend */
+.kicker {
+  margin-bottom: 14px;
+  color: var(--ember);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.lend-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  gap: 48px;
+  align-items: center;
+  margin-bottom: 56px;
+}
+.section .lend-hero h2.big {
+  margin-bottom: 20px;
+}
+.lend-hero .pills {
+  margin-top: 0;
+}
+.lend-rate {
+  position: relative;
+  display: grid;
+  place-items: center;
+  justify-self: center;
+  width: min(100%, 340px);
+  aspect-ratio: 1;
+}
+.lend-rate-ring {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+.lend-rate-arc {
+  stroke-width: 3;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 8px rgb(233 184 114 / 0.7));
+}
+.lend-rate-body {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  text-align: center;
+}
+.lend-rate-body .fact-fig {
+  font-size: clamp(44px, 5vw, 64px);
+}
+.liq-demo {
+  margin: 0 0 40px;
+  padding: 28px 28px 18px;
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background:
+    radial-gradient(60% 120% at 85% 50%, rgb(255 106 61 / 0.1), transparent 60%),
+    var(--surface);
+}
+.liq-labels {
+  margin-bottom: 14px;
+  color: var(--dust);
+  font-size: 14px;
+}
+.liq-bar {
+  height: 14px;
+}
+.liq-bar .health-fill {
+  width: 85%;
+}
+.liq-demo .health-scale {
+  margin-top: 10px;
+  font-size: 13px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .liq-bar .health-fill {
+    animation: liq 7s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+  }
+  .lend-rate-arc {
+    animation: arc 9s ease-in-out infinite alternate;
+  }
+}
+@keyframes liq {
+  0%,
+  10% {
+    width: 58%;
+    background: var(--gold);
+  }
+  45% {
+    width: 81%;
+    background: var(--gold);
+  }
+  62%,
+  70% {
+    width: 88.5%;
+    background: var(--ember);
+  }
+  82%,
+  100% {
+    width: 85%;
+    background: var(--gold);
+  }
+}
+@keyframes arc {
+  to {
+    stroke-dasharray: 80 100;
+  }
+}
+.section-facts {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.section-facts .facts {
+  margin: 0;
+  padding: 0;
+}
+
+@media (max-width: 799px) {
+  .lend-hero {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 32px;
+  }
+  .lend-rate {
+    width: min(100%, 260px);
+  }
+  .liq-demo {
+    padding: 20px 16px 12px;
+  }
+  .section-facts {
+    padding: 0 16px;
+  }
+}
+@media (max-width: 440px) {
+  .kv,
+  .kv-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .seg-4 button {
+    font-size: 14px;
+  }
+}
