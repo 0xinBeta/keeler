@@ -280,7 +280,8 @@ impl LendChain {
             signatures,
             message,
         };
-        Ok(bincode::serialize(&tx)?)
+        // The wire format: a v1 transaction is its message, then its signatures (bincode is not).
+        Ok(wincode::serialize(&tx)?)
     }
 
     /// JSON-RPC that `spr-client` does not wrap.
@@ -594,6 +595,10 @@ impl Ledger for LendChain {
         }
     }
 
+    fn set_price(&self, vault: u64, price: u64, confidence: u64) -> Result<String> {
+        set_test_price(self, vault, price, confidence)
+    }
+
     #[allow(clippy::type_complexity)]
     fn build(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built> {
         let salt = u128::from_le_bytes({
@@ -857,7 +862,7 @@ impl Ledger for LendChain {
     }
 
     fn send(&self, tx: &[u8]) -> Result<String> {
-        let tx: VersionedTransaction = bincode::deserialize(tx)?;
+        let tx: VersionedTransaction = wincode::deserialize(tx)?;
         Ok(self.rpc().process_transaction(tx)?.to_string())
     }
 

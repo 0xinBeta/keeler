@@ -273,6 +273,17 @@ export function createLendSeams(ctx: () => Promise<LendContext>) {
       } while (paginationToken);
       return found;
     },
+    /** The test price account (`["price", vault u64 LE]`, owned by the program, 24 bytes), as the program reads it. */
+    async testPrice(vault) {
+      const c = await ctx();
+      const [at] = await getProgramDerivedAddress({ programAddress: c.programId, seeds: ["price", u64Bytes(BigInt(vault))] });
+      const info = (await c.client.solanaRpc.getAccountInfo(at, { encoding: "base64", commitment: "confirmed" }).send()).value;
+      if (!info || info.owner !== c.programId) return null;
+      const data = new Uint8Array(getBase64Encoder().encode(info.data[0]));
+      if (data.length !== 24) return null;
+      const view = new DataView(data.buffer, data.byteOffset);
+      return { price: view.getBigUint64(0, true), confidence: view.getBigUint64(8, true), publishTime: Number(view.getBigInt64(16, true)) };
+    },
   };
 
   const wasm: LendWasm = {

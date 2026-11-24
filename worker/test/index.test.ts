@@ -521,6 +521,7 @@ describe("/api/lend/*", () => {
     receipts: [{ pool: MINT_B, shares: "5000000", message: "AAAA" }],
     positions: [{ vault: 0, position: "7", collateral: "10000000", debtShares: "0", message: "AAAA" }],
     intents: [{ id: "ab".repeat(16), purpose: "deposit", amount: "10000000", expiry: 1_800_000_600, status: "waiting" }],
+    index: { supply: "1000000000000", borrow: "1000000000000", at: 1_800_000_000 },
   };
   const routes = () => [
     req("/api/lend/pools"),
@@ -586,7 +587,7 @@ describe("/api/lend/*", () => {
     expect(JSON.parse(calls[3]!.init.body as string)).toEqual(BUILD);
     expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([10000, 10000, 10000, 30000]);
     // A redeem of everything names its shares, and a partial one its amount.
-    for (const body of [REDEEM, { ...SIGNED, op: "redeem", pool: MINT_B, amount: "1000000" }]) {
+    for (const body of [REDEEM, { ...SIGNED, op: "redeem", pool: MINT_B, amount: "1000000" }, { ...REDEEM, receipt: OUT }]) {
       expect((await call(post("/api/lend/build", body), lendEnv())).res.status).toBe(200);
       expect(JSON.parse(calls.at(-1)!.init.body as string)).toEqual(body);
     }
@@ -622,6 +623,8 @@ describe("/api/lend/*", () => {
       post("/api/lend/build", { ...SIGNED, op: "redeem", pool: MINT_B }),
       post("/api/lend/build", { ...REDEEM, shares: "5" + "0".repeat(20) }),
       post("/api/lend/build", { ...BUILD, shares: "5000000" }),
+      post("/api/lend/build", { ...BUILD, receipt: OUT }), // a receipt names what a redeem spends
+      post("/api/lend/build", { ...REDEEM, receipt: "cd" }),
       post("/api/lend/build", { ...BUILD, pad: "x".repeat(5 * 1024) }), // over the old 4 KiB cap: refused for shape, not size
     ];
     for (const r of bad) expect((await call(r, e)).res.status, r.url).toBe(400);

@@ -9,7 +9,7 @@ const P = 142_370_000_000n; // 142.37 tUSD per tSOL, 1e12-scaled base units
 const vault: Vault = {
   id: 1, pool: "u", collateral: tSOL, debt: tUSD,
   collateralFactorBps: 8000, liquidationThresholdBps: 8500, liquidationMaxLimitBps: 9000, penaltyBps: 100,
-  minCollateral: 0n, minDebt: 0n, price: P, priceTime: 0,
+  minCollateral: 0n, minDebt: 0n, price: P, confidence: 0n, priceTime: 0,
 };
 const V = { cfBps: 8000n, ltBps: 8500n, lmlBps: 9000n, penaltyBps: 100n };
 const SOL = 1_000_000_000n;

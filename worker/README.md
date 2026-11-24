@@ -88,9 +88,9 @@ replay rules are in `docs/lend-api.md`.
 | Route | Request | Reply |
 | --- | --- | --- |
 | `pools` | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
-| `account` | query: signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}`, each at most 8; `message` is base64 up to 512 characters; `status` is `waiting`, `filled` or `refundable` |
+| `account` | query: signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}`, each at most 8; `message` is base64 up to 512 characters; `status` is `waiting`, `filled` or `refundable`; optional `index: {supply, borrow, at}` (decimal strings, chain time) |
 | `ticket` | signed fields, `purpose` (`supply`, `deposit`, `repay`), `amount`, optional `pool`, `vault`, `position` | `{id (32 hex), expiry, signature (128 hex)}` |
-| `build` | signed fields, `op` (`redeem`, `draw`), optional `pool`, `vault`, `position`, `amount`, `shares`, `borrow`, `withdraw`; a redeem has exactly one of `amount` and `shares`, and only a redeem takes `shares` | `{transaction (base64, at most 5,464 characters = 4,096 bytes), outputs: [64 hex] (1 to 8), now, bound?, index?}`; `index` is the pool's price index (1e12-scaled) the transaction used |
+| `build` | signed fields, `op` (`redeem`, `draw`), optional `pool`, `vault`, `position`, `amount`, `shares`, `borrow`, `withdraw`, `receipt` (64 hex); a redeem has exactly one of `amount` and `shares`, and only a redeem takes `shares` or `receipt` | `{transaction (base64, at most 5,464 characters = 4,096 bytes), outputs: [64 hex] (1 to 8), now, bound?, index?}`; `index` is the pool's price index (1e12-scaled) the transaction used |
 
 Which optional fields an operation needs is the keeper's check, not the Worker's.
 

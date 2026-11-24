@@ -17,6 +17,15 @@ export const liquidatable = (health: number, vault: Vault) => health > vault.liq
 /** The highest price at which the position is liquidatable; null without debt or collateral. */
 export const liquidationPrice = (collateral: bigint, debt: bigint, thresholdBps: number) => L.liquidationPrice(debt, collateral, BigInt(thresholdBps));
 
+/** The keeper's default `bound_margin_bps`: it draws at (price - confidence) less this much. */
+const KEEPER_MARGIN_BPS = 50n;
+
+/** The price a draw is checked at: the low end of the oracle's band, less the keeper's margin. Never below 0. */
+export function drawPrice(vault: Vault): bigint {
+  const low = vault.price > vault.confidence ? vault.price - vault.confidence : 0n;
+  return (low * (L.BPS - KEEPER_MARGIN_BPS)) / L.BPS;
+}
+
 /** How much more can be borrowed now: the largest debt `canDraw` allows, less the debt. */
 export function maxBorrow(collateral: bigint, debt: bigint, price: bigint, factorBps: number): bigint {
   const limit = (BigInt(factorBps) * L.collateralValue(collateral, price)) / L.BPS;

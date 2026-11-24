@@ -28,7 +28,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { KeelerError, type LendStep } from "../src/keeler/index";
 import { hex, ticketMessage, verifyRequest } from "../src/keeler/lend-auth";
 import { COMPUTE_BUDGET_PROGRAM } from "../src/keeler/lend-check";
-import { ARGS, SEED_DOMAIN, SLOT, TAG, u64At, u64Bytes } from "../src/keeler/lend-layout";
+import { ARGS, SEED_DOMAIN, SLOT, TAG, u64At, u64Bytes, withLastU64 } from "../src/keeler/lend-layout";
 import { createLend, keeperError, parseOpening, vaultPrice, type FoundIntent, type LendDeps, type LendServerConfig, type NoteState } from "../src/keeler/lend";
 import { lendStore } from "../src/keeler/lend-store";
 
@@ -191,6 +191,7 @@ async function world() {
       blockHeight: async () => 100n,
       transaction: async (s) => txs.get(s) ?? null,
       scanIntents: async () => found,
+      testPrice: async () => null,
     },
     build: {
       intent: async (p, onProving) => {
@@ -295,9 +296,22 @@ describe("pools", () => {
     expect(() => vaultPrice({}, sol, usd)).toThrow(/no reference price/);
   });
 
-  it("says the keeper is offline when it is", async () => {
+  it("still gives the pool's parameters and the price when the keeper is offline, with empty figures", async () => {
+    const http = W.deps.http;
+    W.deps.http = async (url, init) => (String(url).includes("/api/lend/pools") ? new Response("{}", { status: 502 }) : http(url, init));
+    const { pools, vaults } = await createLend(W.deps).pools();
+    expect(pools[0]).toMatchObject({ id: TUSD, supplyAprBps: 0, utilisationBps: 0, size: 0n, minSupply: 1_000000n, feeBps: 1000 });
+    expect(vaults[0]).toMatchObject({ id: 1, price: 142_370_000_000n, confidence: 0n });
+  });
+
+  it("takes the vault's price from its test price account when there is one, as the program does", async () => {
+    W.deps.chain.testPrice = async () => ({ price: 10_000_000_000n, confidence: 10_000_000n, publishTime: T0 - 3 });
+    expect((await createLend(W.deps).pools()).vaults[0]).toMatchObject({ price: 10_000_000_000n, confidence: 10_000_000n, priceTime: T0 - 3 });
+  });
+
+  it("shows price 0 when neither the price account nor the reference prices answer", async () => {
     W.deps.http = async () => new Response("{}", { status: 502 });
-    expect((await refusal(createLend(W.deps).pools())).code).toBe("keeper-offline");
+    expect((await createLend(W.deps).pools()).vaults[0]).toMatchObject({ price: 0n, confidence: 0n });
   });
 });
 
@@ -452,7 +466,9 @@ describe("keeper-built operations: redeem and draw", () => {
     expect(op).toMatchObject({ status: "landed", amounts: [{ amount: 249_999999n }] });
     expect(W.log.requests.at(-1)?.body).toMatchObject({ op: "redeem", pool: TUSD, shares: "227272727" });
     expect(W.log.requests.at(-1)?.body).not.toHaveProperty("amount");
-    expect(W.store.all("receipt")[0]?.shares).toBe(0n);
+    expect(W.log.requests.at(-1)?.body).toMatchObject({ receipt: hex(r.hash) });
+    // A receipt of no shares is not kept.
+    expect(W.store.all("receipt")).toEqual([]);
   });
 
   it("refuses a redeem of everything that pays less than the shares' worth or leaves shares behind", async () => {
@@ -478,6 +494,19 @@ describe("keeper-built operations: redeem and draw", () => {
     W.keeper.build = () => keeperBuild(W, "redeem", r, redeemNotes(r, 100_000000n, 227_272727n - 90_909091n), [{ programAddress: address("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), accounts: [rs(W.USER)], data: Uint8Array.of(3) }]);
     expect((await refusal(W.lend.redeem(TUSD, 100_000000n, () => {}))).message).toMatch(/another program/);
     expect(W.log.signed).toHaveLength(1); // only the supply that opened the session
+    // The keeper's index of a refused transaction is not kept.
+    expect(W.store.get("index", TUSD)).toBeUndefined();
+  });
+
+  it("names the receipt it spends: the smallest one worth the amount", async () => {
+    const big = await withReceipt();
+    const small = await giveReceipt(W, 100_000000n);
+    await W.lend.lendAccount();
+    W.keeper.build = () => keeperBuild(W, "redeem", small, redeemNotes(small, 100_000000n, 100_000000n - 90_909091n));
+    await W.lend.redeem(TUSD, 100_000000n, () => {});
+    expect(W.log.requests.at(-1)?.body).toMatchObject({ op: "redeem", receipt: hex(small.hash), amount: "100000000" });
+    expect(W.store.all("receipt").map((r) => r.shares).sort()).toEqual([100_000000n - 90_909091n, 227_272727n].sort());
+    expect(W.store.get("receipt", hex(big.hash))).toBeTruthy();
   });
 
   it("draws against a position with the bound checked against the reference price", async () => {
@@ -497,6 +526,102 @@ describe("keeper-built operations: redeem and draw", () => {
     expect(op).toMatchObject({ kind: "draw", status: "landed", positionId: "42" });
     const a = await W.lend.lendAccount();
     expect(a.positions[0]).toMatchObject({ id: "42", collateral: 4_000000000n, debt: 100_000001n }); // debt rounds up
+  });
+});
+
+describe("several receipts, empty notes, indices", () => {
+  it("keeps every receipt in a pool: a second supply's receipt adds to the first", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    await giveReceipt(W, 227_272727n);
+    await giveReceipt(W, 50_000000n);
+    expect((await W.lend.lendAccount()).receipts.map((r) => r.shares)).toEqual(expect.arrayContaining([227_272727n, 50_000000n]));
+    expect((await W.lend.lendAccount()).receipts).toHaveLength(2);
+  });
+
+  it("takes a new receipt after a withdrawal of everything", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const r = await giveReceipt(W, 227_272727n);
+    await W.lend.lendAccount();
+    W.keeper.build = () =>
+      keeperBuild(W, "redeem", r, [
+        { slot: SLOT.redeem.payout, owner: USER_ADDR, mint: mintBytes(TUSD), amount: 249_999999n, kind: 0, state: new Uint8Array() },
+        { slot: SLOT.redeem.receipt, owner: PDA_ADDR, mint: mintBytes(TUSD), amount: 0n, kind: 2, state: Uint8Array.of(...r.state.slice(0, -8), ...u64Bytes(0n)) },
+      ]);
+    await W.lend.redeem(TUSD, "all", () => {});
+    expect(W.store.all("receipt")).toEqual([]);
+    W.notes.set(hex(r.hash), { leafIndex: 7n, spentBy: "redeemed" });
+    W.keeper.account.receipts = [];
+    await giveReceipt(W, 80_000000n);
+    expect((await W.lend.lendAccount()).receipts.map((x) => x.shares)).toEqual([80_000000n]);
+  });
+
+  it("drops a zero-share receipt or a position with no collateral and no debt the keeper offers", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    await giveReceipt(W, 0n);
+    await givePosition(W, 5n, 0n, 0n);
+    const a = await W.lend.lendAccount();
+    expect(a.receipts).toEqual([]);
+    expect(a.positions).toEqual([]);
+  });
+
+  it("takes the keeper's indices only between the last seen and that grown at the curve's top rate", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const view = W.keeper.account as typeof W.keeper.account & { index?: { supply: string; borrow: string; at: number } };
+    view.index = { supply: "1100000000000", borrow: "1200000000000", at: T0 };
+    await W.lend.lendAccount();
+    expect(W.store.get("index", TUSD)?.supply?.index).toBe(1_100_000_000_000n);
+    // A year at 15% at most: 1.1 grows to 1.265 at most, never shrinks.
+    W.clock.now = T0 + 31_536_000;
+    for (const supply of ["1300000000000", "1000000000000"]) {
+      view.index = { supply, borrow: "1200000000000", at: W.clock.now };
+      await W.lend.lendAccount();
+      expect(W.store.get("index", TUSD)?.supply?.index).toBe(1_100_000_000_000n);
+    }
+    view.index = { supply: "1260000000000", borrow: "1200000000000", at: W.clock.now };
+    await W.lend.lendAccount();
+    expect(W.store.get("index", TUSD)?.supply?.index).toBe(1_260_000_000_000n);
+  });
+});
+
+describe("a keeper fill with the keeper gone", () => {
+  /** The successor note a keeper deposit-add or repay makes of `p`, put on chain. */
+  async function successorOnChain(p: { hash: Uint8Array; blinding: Uint8Array; state: Uint8Array }, collateral: bigint, debtShares: bigint) {
+    const blinding = await wasm.blinding(wasm.nullifier(p.hash, p.blinding), wasm.seed(SEED_DOMAIN.draw, p.blinding), SLOT.draw.position);
+    const hash = await wasm.hash({ slot: SLOT.draw.position, owner: PDA_ADDR, mint: mintBytes(TSOL), amount: collateral, kind: 3, state: withLastU64(p.state, debtShares), blinding });
+    W.notes.set(hex(hash), { leafIndex: 11n });
+  }
+
+  it("derives the position after a deposit-add and keeps it once the chain has it", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const p = await givePosition(W, 42n, 4_000000000n, 1_000000n);
+    await W.lend.lendAccount();
+    await W.lend.deposit(1, "42", 1_000000000n, () => {});
+    W.notes.set(hex(p.hash), { leafIndex: 9n, spentBy: "fill" });
+    await successorOnChain(p, 5_000000000n, 1_000000n);
+    W.keeper.status = 502;
+    const a = await W.lend.lendAccount();
+    expect(a.positions).toMatchObject([{ id: "42", collateral: 5_000000000n }]);
+  });
+
+  it("derives the debt-free position after a full repay, so it can close", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const p = await givePosition(W, 42n, 4_000000000n, 1_000000n);
+    await W.lend.lendAccount();
+    await W.lend.repay("42", 2_000000n, () => {});
+    W.notes.set(hex(p.hash), { leafIndex: 9n, spentBy: "fill" });
+    await successorOnChain(p, 4_000000000n, 0n);
+    W.keeper.status = 502;
+    const a = await W.lend.lendAccount();
+    expect(a.positions).toMatchObject([{ id: "42", collateral: 4_000000000n, debt: 0n }]);
+  });
+
+  it("keeps nothing it cannot find on chain", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const p = await givePosition(W, 42n, 4_000000000n, 1_000000n);
+    await W.lend.lendAccount();
+    W.notes.set(hex(p.hash), { leafIndex: 9n, spentBy: "fill" });
+    W.keeper.status = 502;
+    expect((await W.lend.lendAccount()).positions).toEqual([]);
   });
 });
 

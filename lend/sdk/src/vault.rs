@@ -44,7 +44,7 @@ use keeler_lend::{
 };
 
 use crate::{
-    builders::{Args, Prepared},
+    builders::{Args, Prepared, OWNER_TX_SECS},
     decode, err, identity, mint_halves, pool_pda,
     proof::CircuitId,
     tag, user_pda, IntentState, PositionState, ReserveState,
@@ -284,7 +284,7 @@ pub fn draw(
     let position_state: PositionState = decode(&position)?;
     let reserve_state: ReserveState = decode(&reserve)?;
     let debt_mint = reserve.utxo.asset;
-    let transaction = DrawClient {
+    let mut transaction = DrawClient {
         private: DrawPrivateInputsClient {
             tx_context: options(POSITION_BLINDING_DOMAIN, &position, tree_id)?,
             position_utxo: position.clone(),
@@ -316,6 +316,9 @@ pub fn draw(
         keeper_key(keeper)?,
     )
     .map_err(err)?;
+    transaction.finalized = transaction
+        .finalized
+        .with_expiry_unix_ts(now + OWNER_TX_SECS);
     let (pool_bump, user_bump) = (pool.bump, user.bump);
     let owner_viewing = *owner.viewing_pubkey.as_bytes();
     let args: Args = Box::new(move |proof| {

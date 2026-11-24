@@ -119,6 +119,8 @@ export type Vault = {
   minDebt: bigint;
   /** Oracle price, 1e12-scaled debt base units per collateral base unit. */
   price: bigint;
+  /** The oracle's confidence, same scale; 0 where the source gives none. Borrowing is bounded by price − confidence. */
+  confidence: bigint;
   priceTime: number;
 };
 

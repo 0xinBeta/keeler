@@ -4,7 +4,7 @@ import { useState } from "react";
 import type { Asset, Balance, KeelerLend, LendAccount, LendKind, LendOperation, LendStep, Pool, Position, Vault } from "../keeler/index";
 import type { MockLendControls } from "../keeler/mock-lend";
 import { countdown, formatUnits, parseUnits } from "./format";
-import { grow, healthBps, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceText } from "./lend-view";
+import { drawPrice, grow, healthBps, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceText } from "./lend-view";
 import { Amount, ErrorNote, errorText, useChainNow } from "./shared";
 
 export type Market = { pools: Pool[]; vaults: Vault[] };
@@ -248,7 +248,7 @@ function check(text: string, asset: Asset, shown: boolean, max: bigint | null, t
 
 export function EarnTab(p: LendProps) {
   const pool = p.market?.pools[0];
-  const [mode, setMode] = useState<"in" | "out">("in");
+  const [chosen, setMode] = useState<"in" | "out">("in");
   const [text, setText] = useState("");
   const [shown, setShown] = useState(false);
   const op = useOperation(p);
@@ -269,10 +269,15 @@ export function EarnTab(p: LendProps) {
     );
 
   const a = pool.asset;
-  const receipt = p.account?.receipts.find((r) => r.pool === pool.id);
+  // Every receipt in this pool counts towards the deposit; one withdrawal spends one receipt, so the largest caps it.
+  const mine = p.account?.receipts.filter((r) => r.pool === pool.id && r.shares > 0n) ?? [];
+  const receipt = mine.length ? { value: mine.reduce((t, r) => t + r.value, 0n) } : undefined;
+  const largestReceipt = mine.reduce((m, r) => (r.value > m ? r.value : m), 0n);
+  // With nothing left to withdraw the form goes back to depositing.
+  const mode = receipt ? chosen : "in";
   const value = receipt ? grown(receipt.value, pool.supplyAprBps, p.account!.asOf, now) : 0n;
   const note = largest(p.balances, a);
-  const max = mode === "in" ? note : receipt ? receipt.value : 0n;
+  const max = mode === "in" ? note : largestReceipt;
   const f = check(
     text,
     a,
@@ -280,7 +285,9 @@ export function EarnTab(p: LendProps) {
     max,
     mode === "in"
       ? `One deposit spends one private note, and your largest is ${formatUnits(note ?? 0n, a.decimals)} ${a.symbol}.`
-      : `Your deposit is worth ${formatUnits(max ?? 0n, a.decimals)} ${a.symbol}. Enter that or less.`,
+      : mine.length > 1
+        ? `One withdrawal spends one deposit, and your largest is worth ${formatUnits(max ?? 0n, a.decimals)} ${a.symbol}. Enter that or less.`
+        : `Your deposit is worth ${formatUnits(max ?? 0n, a.decimals)} ${a.symbol}. Enter that or less.`,
     mode === "in" ? { value: pool.minSupply, text: `The pool takes at least ${formatUnits(pool.minSupply, a.decimals)} ${a.symbol}.` } : undefined,
   );
 
@@ -498,8 +505,8 @@ export function BorrowTab(p: LendProps) {
       min: position ? undefined : { value: vault.minCollateral, text: `A new position needs at least ${sym(vault.collateral, vault.minCollateral)}.` },
     },
     borrow: {
-      max: maxBorrow(c, d, vault.price, cf),
-      tooMuch: `That would take you past ${pct(cf, 0)}. You can borrow up to ${sym(vault.debt, maxBorrow(c, d, vault.price, cf))} now.`,
+      max: maxBorrow(c, d, drawPrice(vault), cf),
+      tooMuch: `That would take you past ${pct(cf, 0)}. You can borrow up to ${sym(vault.debt, maxBorrow(c, d, drawPrice(vault), cf))} now.`,
       min: d === 0n ? { value: vault.minDebt, text: `A loan starts at ${sym(vault.debt, vault.minDebt)}.` } : undefined,
     },
     repay: {
@@ -507,8 +514,8 @@ export function BorrowTab(p: LendProps) {
       tooMuch: `One repayment spends one private note, and your largest is ${sym(vault.debt, largest(p.balances, vault.debt) ?? 0n)}.`,
     },
     withdraw: {
-      max: maxWithdraw(c, d, vault.price, cf),
-      tooMuch: `That would take you past ${pct(cf, 0)}. You can withdraw up to ${sym(vault.collateral, maxWithdraw(c, d, vault.price, cf))} now.`,
+      max: maxWithdraw(c, d, drawPrice(vault), cf),
+      tooMuch: `That would take you past ${pct(cf, 0)}. You can withdraw up to ${sym(vault.collateral, maxWithdraw(c, d, drawPrice(vault), cf))} now.`,
     },
   };
   const lim = limits[act];
@@ -523,7 +530,8 @@ export function BorrowTab(p: LendProps) {
   const lp2 = liquidationPrice(c2, d2, vault.liquidationThresholdBps);
   const st = healthState(h, vault);
   // Repaying "all": the debt plus two minutes of interest; anything above the debt comes back as change.
-  const repayAll = grow(d, pool.borrowAprBps, 120) + 1n;
+  // Interest keeps accruing until the keeper's transaction lands; the overpayment comes back as change.
+  const repayAll = grow(d, pool.borrowAprBps, 120) + d / 100n + 1n;
 
   const submit = () => {
     setShown(true);
@@ -602,7 +610,7 @@ export function BorrowTab(p: LendProps) {
             <div>
               <dt>You can still borrow</dt>
               <dd>
-                <Amount value={maxBorrow(c, d, vault.price, cf)} asset={vault.debt} />
+                <Amount value={maxBorrow(c, d, drawPrice(vault), cf)} asset={vault.debt} />
               </dd>
             </div>
           </dl>

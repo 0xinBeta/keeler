@@ -1,6 +1,6 @@
-// The lend page's real proving path in a browser: `npx playwright test --config tests/playwright.lend.config.ts`
-// after `scripts/lend-web-stack.sh start` (local network at offset 2400, the keeper stand-in, the Worker on 5301).
-// The spec skips itself while that stack is down. This config starts only the harness dev server, on 5300.
+// The lend page against the real keeper: `npx playwright test --config tests/playwright.lend.config.ts` after
+// `scripts/lend-web-stack.sh start` (local network at offset 2400, the keeper on 47810, the Worker on 5301).
+// The spec skips itself while that stack is down. This config starts only the app's dev server, on 5300.
 import { existsSync, readFileSync } from "node:fs";
 import { defineConfig } from "@playwright/test";
 
@@ -16,11 +16,12 @@ export default defineConfig({
   timeout: 900_000,
   workers: 1,
   reporter: "list",
-  use: { browserName: "chromium", baseURL: "http://127.0.0.1:5300" },
+  // A click or fill that cannot happen fails in a minute instead of at the test's timeout.
+  use: { browserName: "chromium", baseURL: "http://127.0.0.1:5300", viewport: { width: 1440, height: 900 }, actionTimeout: 60_000 },
   webServer: {
     command: `VITE_NETWORK=local ${lendEnv} KEELER_WORKER_URL=http://127.0.0.1:5301 npx vite --host 127.0.0.1 --port 5300 --strictPort`,
     cwd: new URL("..", import.meta.url).pathname,
-    url: "http://127.0.0.1:5300/tests/harness/index.html",
+    url: "http://127.0.0.1:5300/",
     timeout: 120_000,
     reuseExistingServer: false,
   },

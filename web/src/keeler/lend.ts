@@ -32,6 +32,8 @@ export type LendChain = {
   transaction(signature: string): Promise<Uint8Array | null>;
   /** Intents this wallet wrote, from its user PDA's transactions, decrypted with its keys. */
   scanIntents(): Promise<FoundIntent[]>;
+  /** The vault's test price account (`["price", vault u64 LE]`, what `draw` and `liquidate` read on test networks); null where there is none. */
+  testPrice(vault: number): Promise<{ price: bigint; confidence: bigint; publishTime: number } | null>;
 };
 
 export type Built = { transaction: Transaction; lastValidBlockHeight: bigint };
@@ -83,6 +85,8 @@ const mintBytes = (mint: string) => new Uint8Array(getAddressEncoder().encode(ad
 const toBytes = (b64: string) => new Uint8Array(getBase64Encoder().encode(b64));
 const equal = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+/** A receipt of no shares, or a position of no collateral and no debt: nothing to show or spend. */
+const empty = (r: ReceiptRecord | PositionRecord) => ("shares" in r ? r.shares === 0n : r.collateral === 0n && r.debtShares === 0n);
 
 /** The keeper's statuses → page error codes (docs/lend-api.md, "Errors"). */
 export function keeperError(status: number, said: string): KeelerError {
@@ -124,6 +128,7 @@ type KeeperPools = { pools: { mint: string; at: number; size: string; utilisatio
 type KeeperAccount = {
   receipts: { pool: string; shares: string; message: string }[];
   positions: { vault: number; position: string; collateral: string; debtShares: string; message: string }[];
+  index?: { supply: string; borrow: string; at: number };
 };
 type WireBuild = { transaction: string; outputs: string[]; now: number; bound?: string; index?: string };
 
@@ -213,6 +218,20 @@ export function createLend(d: LendDeps): KeelerLend {
     }
   };
 
+  /**
+   * The vault's price as the program reads it: the test price account where there is one (test networks), else the
+   * reference price (`/api/prices`, the Pyth feed the program's account carries). Price 0 when neither answers.
+   */
+  const vaultQuote = async (v: LendServerConfig["vaults"][number]): Promise<{ price: bigint; confidence: bigint; priceTime: number }> => {
+    const onChain = await d.chain.testPrice(v.id).catch(() => null);
+    if (onChain) return { price: onChain.price, confidence: onChain.confidence, priceTime: onChain.publishTime };
+    try {
+      return { ...vaultPrice(await prices(), asset(v.collateralMint), asset(v.debtMint)), confidence: 0n };
+    } catch {
+      return { price: 0n, confidence: 0n, priceTime: 0 };
+    }
+  };
+
   const toOp = (r: OpRecord): LendOperation => {
     const { tx: _t, onChain: _o, intent: _i, spends: _s, creates: _c, ...op } = r;
     return { ...op, amounts: op.amounts.map((a) => ({ ...a })) };
@@ -232,8 +251,8 @@ export function createLend(d: LendDeps): KeelerLend {
       s.remove("receipt", hex(r.spends));
       s.remove("position", hex(r.spends));
     }
-    if (r.creates?.receipt) s.put("receipt", hex(r.creates.receipt.note.hash), r.creates.receipt);
-    if (r.creates?.position) s.put("position", hex(r.creates.position.note.hash), r.creates.position);
+    if (r.creates?.receipt && !empty(r.creates.receipt)) s.put("receipt", hex(r.creates.receipt.note.hash), r.creates.receipt);
+    if (r.creates?.position && !empty(r.creates.position)) s.put("position", hex(r.creates.position.note.hash), r.creates.position);
   };
 
   /** One record's next state from the chain; a failed read throws and changes nothing. */
@@ -311,6 +330,8 @@ export function createLend(d: LendDeps): KeelerLend {
       const noteKind = kind === "receipt" ? NOTE_KIND.receipt : NOTE_KIND.position;
       const blinding = o.blinding;
       const hash = await d.wasm.hash({ slot: 0, owner: pda, mint: mintBytes(mint), amount: o.amount, kind: noteKind, state: o.state, blinding });
+      // Already held: nothing to check again.
+      if (d.store().get(kind, hex(hash))) return undefined;
       const where = await d.chain.note(hash, blinding);
       if (where.leafIndex === undefined || where.spentBy) return undefined;
       const note: NoteOpening = { hash, mint, amount: o.amount, blinding, state: o.state, kind: noteKind };
@@ -336,28 +357,37 @@ export function createLend(d: LendDeps): KeelerLend {
    */
   const holdings = async (useKeeper: boolean, now: number) => {
     const s = d.store();
+    const gone: PositionRecord[] = [];
     for (const kind of ["receipt", "position"] as const) {
       for (const r of s.all(kind)) {
+        if (empty(r)) {
+          s.remove(kind, hex(r.note.hash));
+          continue;
+        }
         const where = await d.chain.note(r.note.hash, r.note.blinding).catch(() => undefined);
         if (!where?.spentBy) continue;
         s.remove(kind, hex(r.note.hash));
         useKeeper = true;
-        if (kind === "position") await noteLiquidation(r as PositionRecord, where.spentBy).catch(() => undefined);
+        if (kind === "position") {
+          gone.push(r as PositionRecord);
+          await noteLiquidation(r as PositionRecord, where.spentBy).catch(() => undefined);
+        }
       }
     }
     if (useKeeper) {
       const view = await keeper<KeeperAccount>("GET", "/lend/account", {}).catch(() => undefined);
+      if (view?.index) learnIndex(view.index, now);
       for (const r of view?.receipts ?? []) {
-        if (s.all("receipt").some((x) => x.pool === r.pool)) continue;
         const got = await adopt("receipt", r.pool, r.message);
-        if (got) s.put("receipt", hex(got.note.hash), { pool: r.pool, shares: got.decoded.shares, note: got.note });
+        if (got && got.decoded.shares > 0n) s.put("receipt", hex(got.note.hash), { pool: r.pool, shares: got.decoded.shares, note: got.note });
       }
       for (const p of view?.positions ?? []) {
-        if (s.all("position").some((x) => x.id === p.position)) continue;
         const v = cfg.vaults.find((x) => x.id === p.vault);
-        if (!v) continue;
+        // A position this browser holds unspent is current; the keeper's view may lag behind it.
+        if (!v || s.all("position").some((x) => x.id === p.position)) continue;
         const got = await adopt("position", v.collateralMint, p.message);
         if (!got || got.decoded.positionId?.toString() !== p.position) continue;
+        if (got.note.amount === 0n && got.decoded.shares === 0n) continue;
         const before = liquidated.get(p.position);
         liquidated.delete(p.position);
         const at = index(v.debtMint, "borrow", now);
@@ -367,7 +397,39 @@ export function createLend(d: LendDeps): KeelerLend {
         s.put("position", hex(got.note.hash), { vault: v.id, id: p.position, collateral: got.note.amount, debtShares: got.decoded.shares, note: got.note, lastLiquidation });
       }
     }
+    // A position a keeper fill spent, with no successor from the keeper (it went away): derive the successor where it
+    // is computable and keep it only if the chain has exactly that note.
+    for (const old of gone) {
+      if (s.all("position").some((x) => x.id === old.id) || liquidated.has(old.id)) continue;
+      const next = await successor(old).catch(() => undefined);
+      if (next && !empty(next)) s.put("position", hex(next.note.hash), next);
+    }
     return { receipts: s.all("receipt"), positions: s.all("position") };
+  };
+
+  /** A keeper deposit-add (collateral grows by an intent of this position's) or a full repay (no debt shares left). */
+  const successor = async (old: PositionRecord): Promise<PositionRecord | undefined> => {
+    const { pda } = await d.owners();
+    const v = vaultOf(old.vault);
+    const adds = d
+      .store()
+      .all("op")
+      .filter((o) => o.kind === "deposit" && o.positionId === old.id && o.intent)
+      .map((o) => o.amounts[0]!.amount);
+    const candidates: { collateral: bigint; debtShares: bigint }[] = [
+      ...adds.map((a) => ({ collateral: old.collateral + a, debtShares: old.debtShares })),
+      ...(old.debtShares > 0n ? [{ collateral: old.collateral, debtShares: 0n }] : []),
+    ];
+    const first = d.wasm.nullifier(old.note.hash, old.note.blinding);
+    const blinding = await d.wasm.blinding(first, d.wasm.seed(SEED_DOMAIN.draw, old.note.blinding), SLOT.draw.position);
+    for (const c of candidates) {
+      const state = withLastU64(old.note.state, c.debtShares);
+      const hash = await d.wasm.hash({ slot: SLOT.draw.position, owner: pda, mint: mintBytes(v.collateralMint), amount: c.collateral, kind: NOTE_KIND.position, state, blinding });
+      const where = await d.chain.note(hash, blinding);
+      if (where.leafIndex === undefined || where.spentBy) continue;
+      return { ...old, collateral: c.collateral, debtShares: c.debtShares, lastLiquidation: null, note: { hash, mint: v.collateralMint, amount: c.collateral, blinding, state, kind: NOTE_KIND.position } };
+    }
+    return undefined;
   };
 
   const index = (pool: string, kind: "supply" | "borrow", now: number): bigint => {
@@ -382,6 +444,26 @@ export function createLend(d: LendDeps): KeelerLend {
   const remember = (pool: string, kind: "supply" | "borrow", value: bigint, at: number) => {
     const s = d.store();
     s.put("index", pool, { ...(s.get("index", pool) ?? { pool }), [kind]: { index: value, at } });
+  };
+  /**
+   * The keeper's stated indices, taken only within what the chain allows: never below the last seen (indices only
+   * grow), never above the last seen grown at the curve's top rate for the time between (or 1e12 the first time).
+   */
+  const learnIndex = (view: { supply: string; borrow: string; at: number }, now: number) => {
+    const pool = cfg.pools[0];
+    if (!pool || !/^\d+$/.test(view.supply) || !/^\d+$/.test(view.borrow) || !Number.isSafeInteger(view.at) || view.at > now + 60) return;
+    const top = BigInt(Math.max(...pool.curve.map((c) => c.rateBps)));
+    for (const kind of ["supply", "borrow"] as const) {
+      const value = BigInt(view[kind]);
+      const seen = d.store().get("index", pool.mint)?.[kind];
+      const floor = seen?.index ?? PRICE_SCALE;
+      if (value < floor || (seen && view.at < seen.at)) continue;
+      if (seen) {
+        const dt = BigInt(Math.max(0, view.at - seen.at));
+        if (value > seen.index + (seen.index * top * dt) / (10_000n * 31_536_000n) + 1n) continue;
+      }
+      remember(pool.mint, kind, value, view.at);
+    }
   };
 
   const verifyTicketReply = async (t: { id?: unknown; expiry?: unknown; signature?: unknown }, purpose: number, target: bigint, amount: bigint, now: number) => {
@@ -472,7 +554,7 @@ export function createLend(d: LendDeps): KeelerLend {
     kind: "redeem" | "draw",
     request: Fields,
     spent: NoteOpening,
-    expect: (reply: BuildReply & { index?: bigint }, owners: Owners) => { notes: ExpectedNote[]; reference?: bigint; creates: (blindings: Map<number, Uint8Array>, outputs: Uint8Array[]) => OpRecord["creates"] },
+    expect: (reply: BuildReply & { index?: bigint }, owners: Owners) => { notes: ExpectedNote[]; reference?: bigint; creates: (blindings: Map<number, Uint8Array>, outputs: Uint8Array[]) => OpRecord["creates"]; checked: () => void },
     place: Pick<LendOperation, "pool" | "vault" | "positionId" | "amounts">,
     on: (s: LendStep) => void,
   ) => {
@@ -486,6 +568,8 @@ export function createLend(d: LendDeps): KeelerLend {
       { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
       d.wasm,
     );
+    // The keeper's index is kept only once its transaction passed the check.
+    want.checked();
     const blindings = new Map<number, Uint8Array>();
     for (const n of want.notes) blindings.set(n.slot, await d.wasm.blinding(checked.firstNullifier, seed, n.slot));
     const creates = want.creates(blindings, checked.outputs);
@@ -507,7 +591,8 @@ export function createLend(d: LendDeps): KeelerLend {
 
   const lend: KeelerLend = {
     async pools() {
-      const figures = (await call<KeeperPools>("/api/lend/pools")).pools ?? [];
+      // Without the keeper the figures are empty and the pool parameters still come from the config.
+      const figures = (await call<KeeperPools>("/api/lend/pools").catch(() => undefined))?.pools ?? lastFigures;
       lastFigures = figures;
       const now = await d.chainNow().catch(() => Math.floor(Date.now() / 1000));
       const pools: Pool[] = cfg.pools.map((p) => {
@@ -526,8 +611,8 @@ export function createLend(d: LendDeps): KeelerLend {
           curve: p.curve.map((c) => ({ ...c })),
         };
       });
-      const p = await prices();
-      const vaults: Vault[] = cfg.vaults.map((v) => {
+      const quotes = await Promise.all(cfg.vaults.map(vaultQuote));
+      const vaults: Vault[] = cfg.vaults.map((v, i) => {
         const collateral = asset(v.collateralMint);
         const debt = asset(v.debtMint);
         return {
@@ -541,7 +626,7 @@ export function createLend(d: LendDeps): KeelerLend {
           penaltyBps: v.penaltyBps,
           minCollateral: BigInt(v.minCollateral),
           minDebt: BigInt(v.minDebt),
-          ...vaultPrice(p, collateral, debt),
+          ...quotes[i]!,
         };
       });
       return { pools, vaults };
@@ -594,15 +679,20 @@ export function createLend(d: LendDeps): KeelerLend {
 
     redeem: (pool, amount, on) =>
       exclusive("lend", async () => {
-        const receipt = mustHave(d.store().all("receipt").find((r) => r.pool === pool), "a deposit in this pool");
-        const mint = mintBytes(pool);
         const all = amount === "all";
+        const held = d.store().all("receipt").filter((r) => r.pool === pool && r.shares > 0n);
+        const now = await d.chainNow();
+        const at = index(pool, "supply", now);
+        // All: the largest receipt, every share. An amount: the smallest receipt worth that much, as the keeper picks.
+        const bySize = held.sort((a, b) => (a.shares < b.shares ? -1 : a.shares > b.shares ? 1 : 0));
+        const receipt = mustHave(all ? bySize[bySize.length - 1] : (bySize.find((r) => assetsOf(r.shares, at) >= amount) ?? bySize[bySize.length - 1]), "a deposit in this pool");
+        const mint = mintBytes(pool);
         // Withdrawing everything names the shares, so none are left behind; the payout is known once the keeper states its index.
         const place = { pool, vault: null, positionId: null, amounts: [{ asset: asset(pool), amount: all ? 0n : amount }] };
         let left = 0n;
         return keeperBuilt(
           "redeem",
-          all ? { pool, shares: receipt.shares.toString() } : { pool, amount: amount.toString() },
+          { pool, receipt: hex(receipt.note.hash), ...(all ? { shares: receipt.shares.toString() } : { amount: amount.toString() }) },
           receipt.note,
           (reply, owners) => {
             if (reply.index === undefined || reply.index < PRICE_SCALE) throw err("network", "The keeper did not state a usable share price. Nothing was sent.");
@@ -612,9 +702,9 @@ export function createLend(d: LendDeps): KeelerLend {
             if (paid === 0n) throw err("below-minimum", "Your deposit is worth nothing to withdraw yet. Nothing was sent.");
             place.amounts[0]!.amount = paid;
             left = receipt.shares - burned;
-            remember(pool, "supply", reply.index, reply.now);
             const state = withLastU64(receipt.note.state, left);
             return {
+              checked: () => remember(pool, "supply", reply.index!, reply.now),
               notes: [
                 { slot: SLOT.redeem.payout, owner: owners.user, mint, amount: paid, kind: NOTE_KIND.token, state: new Uint8Array() },
                 { slot: SLOT.redeem.receipt, owner: owners.pda, mint, amount: 0n, kind: NOTE_KIND.receipt, state },
@@ -633,7 +723,8 @@ export function createLend(d: LendDeps): KeelerLend {
         const p = positionRecord(positionId);
         const v = vaultOf(p.vault);
         if (withdraw > p.collateral) throw err("unhealthy", "That is more collateral than the position holds.");
-        const reference = vaultPrice(await prices(), asset(v.collateralMint), asset(v.debtMint)).price;
+        // The bound is checked against the price the program reads (the test price account where there is one).
+        const reference = (await vaultQuote(v)).price;
         const [collateralMint, debtMint] = [mintBytes(v.collateralMint), mintBytes(v.debtMint)];
         return keeperBuilt(
           "draw",
@@ -642,10 +733,10 @@ export function createLend(d: LendDeps): KeelerLend {
           (reply, owners) => {
             if (reply.index === undefined || reply.index < PRICE_SCALE) throw err("network", "The keeper did not state a usable debt price. Nothing was sent.");
             const debtShares = p.debtShares + (borrow > 0n ? borrowShares(borrow, reply.index) : 0n);
-            remember(v.debtMint, "borrow", reply.index, reply.now);
             const state = withLastU64(p.note.state, debtShares);
             const collateral = p.collateral - withdraw;
             return {
+              checked: () => remember(v.debtMint, "borrow", reply.index!, reply.now),
               reference,
               notes: [
                 { slot: SLOT.draw.position, owner: owners.pda, mint: collateralMint, amount: collateral, kind: NOTE_KIND.position, state },

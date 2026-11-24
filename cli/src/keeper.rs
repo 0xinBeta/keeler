@@ -134,6 +134,10 @@ pub struct Lend {
     /// Seconds between passes of the queue; default 2.
     #[serde(default)]
     pub poll_secs: Option<u64>,
+    /// With the test price: re-post it at least this often (the program
+    /// refuses one older than 90 s); default 45.
+    #[serde(default)]
+    pub price_refresh_secs: Option<u64>,
 }
 
 impl Lend {
@@ -170,7 +174,15 @@ impl Lend {
             self.price == LendPrice::Pyth || self.network != "mainnet",
             "the test price is for local networks and devnet"
         );
+        ensure!(
+            (5..=80).contains(&self.price_refresh()),
+            "lend.price_refresh_secs must be within 5..=80"
+        );
         Ok(())
+    }
+
+    fn price_refresh(&self) -> u64 {
+        self.price_refresh_secs.unwrap_or(45)
     }
 
     pub fn state_path(&self, keeper: &Address) -> Result<PathBuf> {
@@ -405,6 +417,29 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// What `keeler lend-set-price` last set; a running keeper keeps posting it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestPrice {
+    pub vault: u64,
+    pub price: u64,
+    pub confidence: u64,
+}
+
+/// The test price's control file, next to the state file.
+pub fn price_file(state: &Path) -> PathBuf {
+    state.with_extension("price.json")
+}
+
+pub fn read_price_file(path: &Path) -> Result<Option<TestPrice>> {
+    match std::fs::read(path) {
+        Ok(t) => Ok(Some(serde_json::from_slice(&t).map_err(|_| {
+            anyhow!("test price file {} is not valid", path.display())
+        })?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The state file, with tickets this keeper did not sign dropped.
 pub fn load_book(path: &Path, keeper: &Address, program: &Address) -> Result<Book> {
     let text = match std::fs::read(path) {
@@ -506,6 +541,9 @@ pub trait Ledger: Sync {
     /// unspent.
     fn intents(&self, wallet: &Address) -> Result<Vec<Intent>>;
     fn quote(&self, vault: u64) -> Result<Quote>;
+    /// Writes the vault's test price (`set_test_price`), published at chain
+    /// time; the signature.
+    fn set_price(&self, vault: u64, price: u64, confidence: u64) -> Result<String>;
     /// Builds and proves `job` against `reserve` at chain time `now`.
     fn build(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built>;
     /// Sends a keeper-built transaction; the signature.
@@ -1039,10 +1077,46 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         Ok(())
     }
 
+    /// With the test price only: posts the price `keeler lend-set-price`
+    /// last named (its control file), else the one on chain again, whenever
+    /// the chain's is older than `price_refresh_secs` or is not that price.
+    /// True when it posted.
+    pub fn refresh_price(&self) -> Result<bool> {
+        if self.cfg.price != LendPrice::Test || self.cfg.network == "mainnet" {
+            return Ok(false);
+        }
+        let want = read_price_file(&price_file(&self.state))?;
+        let vault = want.as_ref().map_or(vault1().id, |w| w.vault);
+        let now = self.ledger.now()?;
+        let have = self.ledger.quote(vault).ok();
+        let (price, confidence) = match (&want, have) {
+            (Some(w), _) => (w.price, w.confidence),
+            (None, Some(q)) => {
+                let conf = (q.high - q.low) / 2;
+                (q.low + conf, conf)
+            }
+            (None, None) => return Ok(false),
+        };
+        let current = have.is_some_and(|q| {
+            q.low == price.saturating_sub(confidence)
+                && q.high == price.saturating_add(confidence)
+                && (now as i64).saturating_sub(q.published) < self.cfg.price_refresh() as i64
+        });
+        if current {
+            return Ok(false);
+        }
+        let sig = self.ledger.set_price(vault, price, confidence)?;
+        log!("lend: test price of vault {vault} posted at {price} +- {confidence}: {sig}");
+        Ok(true)
+    }
+
     /// Runs the queue until `stop`.
     pub fn run(&self, stop: &AtomicBool) {
         let every = Duration::from_secs(self.cfg.poll_secs.unwrap_or(2));
         while !stop.load(Ordering::Relaxed) {
+            if let Err(e) = self.refresh_price() {
+                log!("lend: test price refresh: {e:#}");
+            }
             match self.step() {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -1205,7 +1279,23 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 })
             })
             .collect();
-        Ok(json!({ "receipts": receipts, "positions": positions, "intents": intents }))
+        // The pool's price indices now, so the page values receipts and debt.
+        let index = match &book.reserve {
+            Some(r) => {
+                let r = accrued(r, now).map_err(internal)?;
+                json!({
+                    "supply": r.supply_price.to_string(),
+                    "borrow": r.borrow_price.to_string(),
+                    "at": now,
+                })
+            }
+            None => Value::Null,
+        };
+        let mut out = json!({ "receipts": receipts, "positions": positions, "intents": intents });
+        if !index.is_null() {
+            out["index"] = index;
+        }
+        Ok(out)
     }
 
     fn ticket(&self, fields: BTreeMap<String, String>) -> Result<Value, Refusal> {
@@ -1340,11 +1430,20 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             "/lend/build",
             &[
                 "op", "pool", "vault", "position", "amount", "shares", "borrow", "withdraw",
+                "receipt",
             ],
         )?;
         let op = fields.get("op").map(String::as_str);
         let num = |k: &str| decimal(fields.get(k)).ok_or((400, format!("bad {k}")));
         let mut shares = None;
+        // redeem: the receipt the page expects spent, by note hash (optional).
+        let named = match fields.get("receipt") {
+            Some(h) if op == Some("redeem") => {
+                Some(hex32(h).map_err(|_| (400, "bad receipt".to_owned()))?)
+            }
+            Some(_) => return refuse(400, "receipt is for a redeem"),
+            None => None,
+        };
         let (borrow, withdraw, mut amount) = match op {
             Some("redeem") => {
                 if fields.get("pool") != Some(&vault1().debt_mint.to_string()) {
@@ -1411,6 +1510,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 .receipts
                 .iter()
                 .filter(|n| n.owned_by(&wallet))
+                .filter(|n| named.is_none_or(|h| n.hash().is_ok_and(|m| m == h)))
                 .filter_map(|n| {
                     let s: ReceiptState = n.state().ok()?;
                     Some((core::assets_of(s.supply_shares, r.supply_price).ok()?, n))
@@ -1719,8 +1819,8 @@ impl<L: Ledger> LendRoutes for Keeper<'_, L> {
 
 /// Fails unless the wallet is on a network where the test price exists.
 pub fn require_test_network(lend: &Lend) -> Result<()> {
-    if lend.network == "mainnet" {
-        bail!("set_test_price is for local networks and devnet only");
+    if lend.network == "mainnet" || lend.price != LendPrice::Test {
+        bail!("set_test_price is for local networks and devnet, with lend.price \"test\"");
     }
     Ok(())
 }

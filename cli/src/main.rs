@@ -69,12 +69,15 @@ fn run(args: &[String]) -> Result<()> {
             let cfg = keeper::KeeperConfig::load(cfg)?;
             keeper::require_test_network(&cfg.lend)?;
             let p = keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
-            let sig = lend_chain::set_test_price(
-                &p.chain,
-                vault.parse()?,
-                price.parse()?,
-                confidence.parse()?,
-            )?;
+            let want = keeper::TestPrice {
+                vault: vault.parse()?,
+                price: price.parse()?,
+                confidence: confidence.parse()?,
+            };
+            // A running keeper re-posts what this file names, so the price stays set.
+            keeper::write_private(&keeper::price_file(&p.state), &serde_json::to_vec(&want)?)?;
+            let sig =
+                lend_chain::set_test_price(&p.chain, want.vault, want.price, want.confidence)?;
             println!("test price set: {sig}");
         }
         [cmd, cfg] if cmd == "refund" => {

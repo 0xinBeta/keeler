@@ -66,6 +66,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
     minCollateral: 50_000000n, // 0.05 tSOL
     minDebt: 5_000000n,
     price: START_PRICE,
+    confidence: 0n,
     priceTime: now(),
   };
 
@@ -211,6 +212,8 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
         asOf: now(),
       });
       vault.priceTime = now(); // the mock oracle is always fresh
+      // No keeper, no published figures: the page still gets the pool's parameters, as the real client does.
+      if (s.scenario === "keeper-offline") return { pools: [{ ...pool, size: 0n, utilisationBps: 0, borrowAprBps: 0, supplyAprBps: 0 }], vaults: [{ ...vault }] };
       return { pools: [{ ...pool }], vaults: [{ ...vault }] };
     },
 

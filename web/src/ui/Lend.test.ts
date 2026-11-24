@@ -9,7 +9,7 @@ const tSOL = { mint: "s", symbol: "tSOL", decimals: 9 };
 const vault: Vault = {
   id: 1, pool: "u", collateral: tSOL, debt: tUSD,
   collateralFactorBps: 8000, liquidationThresholdBps: 8500, liquidationMaxLimitBps: 9000, penaltyBps: 100,
-  minCollateral: 0n, minDebt: 0n, price: 142_370_000_000n, priceTime: 0,
+  minCollateral: 0n, minDebt: 0n, price: 142_370_000_000n, confidence: 0n, priceTime: 0,
 };
 
 test("health states follow the borrow limit and the threshold", () => {
