@@ -134,7 +134,8 @@ every other build on those inputs is dropped. Unspent after `now + 125 s` (the p
 
 On start the keeper settles the pending builds, then rebuilds from the chain: every transaction the
 keeper key signed (`getSignaturesForAddress`), its lend instruction (which wallet), and each output
-opened with the keeper's writer key, checked against the hash on chain. It keeps the unspent
+opened with the keeper's writer key, checked against the hash on chain (it waits up to 60 s for the indexer to have each one, and
+refuses to start rather than rebuild without one). It keeps the unspent
 reserve, receipts and positions, merged with the file. It refuses to start with two unspent
 reserves. Tickets are not on chain: after a restart with an empty file the keeper fills no intent
 made before it (their makers refund after expiry) and the account view shows no old intents.

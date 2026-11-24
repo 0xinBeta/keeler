@@ -1099,6 +1099,12 @@ fn restarts_recover_from_the_file_and_the_chain() {
         .pending[0]
         .clone();
     s.fake.land(&p);
+    // An unspent receipt redeemed to zero on chain is not brought back.
+    let lender_addr = parse_address(p.wallet.as_str()).unwrap();
+    s.fake
+        .w()
+        .history
+        .push(receipt_note(&lender_addr, 0, 9_999));
     let k = s.keeper();
     let book = k.snapshot().unwrap();
     assert!(book.pending.is_empty());

@@ -664,7 +664,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         let live: Vec<Note> = all
             .into_iter()
             .zip(spent)
-            .filter(|(_, s)| !s)
+            .filter(|(n, s)| !s && holds_something(n))
             .map(|(n, _)| n)
             .collect();
         let reserves: Vec<&Note> = live.iter().filter(|n| n.kind == KIND_RESERVE).collect();
@@ -1549,6 +1549,18 @@ impl<'a, L: Ledger> Keeper<'a, L> {
 }
 
 /// Applies a landed build: its inputs leave the book, its notes join it.
+/// A receipt redeemed in full holds nothing; a position left with nothing in
+/// it is closed by its owner, if at all. Neither is kept in the book.
+fn holds_something(n: &Note) -> bool {
+    match n.kind {
+        KIND_RECEIPT => n.state::<ReceiptState>().is_ok_and(|s| s.supply_shares > 0),
+        KIND_POSITION => {
+            n.amount > 0 || n.state::<PositionState>().is_ok_and(|s| s.debt_shares > 0)
+        }
+        _ => true,
+    }
+}
+
 fn apply(book: &mut Book, p: &Pending, outs: &[([u8; 32], u64)]) {
     let spent = |n: &Note| p.inputs.contains(&n.nullifier);
     if book.reserve.as_ref().is_some_and(spent) {
@@ -1564,16 +1576,8 @@ fn apply(book: &mut Book, p: &Pending, outs: &[([u8; 32], u64)]) {
             .and_then(|h| outs.iter().find(|(o, _)| *o == h).map(|(_, l)| *l));
         match n.kind {
             KIND_RESERVE => book.reserve = Some(n),
-            // A receipt redeemed in full holds nothing.
-            KIND_RECEIPT if n.state::<ReceiptState>().is_ok_and(|s| s.supply_shares > 0) => {
-                book.receipts.push(n)
-            }
-            // A position left with nothing in it is closed by its owner, if at all.
-            KIND_POSITION
-                if n.amount > 0 || n.state::<PositionState>().is_ok_and(|s| s.debt_shares > 0) =>
-            {
-                book.positions.push(n)
-            }
+            KIND_RECEIPT if holds_something(&n) => book.receipts.push(n),
+            KIND_POSITION if holds_something(&n) => book.positions.push(n),
             _ => {}
         }
     }

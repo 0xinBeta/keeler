@@ -892,15 +892,26 @@ impl Ledger for LendChain {
                 continue;
             };
             let signature = Signature::from_str(&sig).map_err(err)?;
-            let indexed = self
-                .chain
-                .client
-                .indexer()
-                .get_shielded_transactions_by_signature(signature, None)?;
-            let Some(tx) = indexed.transactions.first().map(|t| &t.transaction) else {
-                log!("lend: the indexer does not have {sig} yet");
-                continue;
+            // A lagging indexer must not make recovery skip a note: wait for
+            // it, then refuse to start rather than rebuild without it.
+            let mut tries = 0;
+            let indexed = loop {
+                let indexed = self
+                    .chain
+                    .client
+                    .indexer()
+                    .get_shielded_transactions_by_signature(signature, None)?;
+                if !indexed.transactions.is_empty() {
+                    break indexed;
+                }
+                tries += 1;
+                ensure!(tries < 60, "the indexer does not have {sig} after 60 s");
+                if tries == 1 {
+                    log!("lend: waiting for the indexer to have {sig}");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
             };
+            let tx = &indexed.transactions[0].transaction;
             let (Some(first), Some(salt)) = (tx.nullifiers.first(), tx.salt) else {
                 continue;
             };
