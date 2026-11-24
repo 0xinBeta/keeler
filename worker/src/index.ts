@@ -30,6 +30,15 @@ export interface Env {
   PROVE_GLOBAL_LIMIT?: RateLimit;
   QUOTE_LIMIT?: RateLimit;
   FAUCET_LIMIT?: RateLimit;
+  LEND_PROGRAM_ID?: string;
+  LEND_POOLS?: unknown;
+  LEND_VAULTS?: unknown;
+  LEND_READ_LIMIT?: RateLimit;
+  LEND_READ_GLOBAL_LIMIT?: RateLimit;
+  LEND_TICKET_LIMIT?: RateLimit;
+  LEND_TICKET_GLOBAL_LIMIT?: RateLimit;
+  LEND_BUILD_LIMIT?: RateLimit;
+  LEND_BUILD_GLOBAL_LIMIT?: RateLimit;
 }
 
 const RPC_BODY_CAP = 64 * 1024;
@@ -46,6 +55,10 @@ const PRICE_TIMEOUT_MS = 5000;
 const SMALL_BODY_CAP = 4 * 1024;
 const DEALER_TIMEOUT_MS = 3000;
 const FAUCET_TIMEOUT_MS = 15000;
+const LEND_BODY_CAP = 16 * 1024;
+const LEND_TIMEOUT_MS = 10000;
+// A build makes two proofs.
+const LEND_BUILD_TIMEOUT_MS = 30000;
 const U64_MAX = (1n << 64n) - 1n;
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
@@ -127,6 +140,7 @@ async function api(request: Request, env: Env, url: URL, path: string): Promise<
         if (env.PAUSED === "1") throw new Fail(503, "Swaps are paused.");
         return only(request, "POST") ?? (await limit(env, "FAUCET_LIMIT", request), await faucet(request, env));
       }
+      if (path.startsWith("/api/lend/")) return await lend(request, env, url, path);
       if (path.startsWith("/v1/spr/")) return await spr(request, env, url);
       throw new Fail(404, "Not found.");
     } catch (error) {
@@ -150,7 +164,8 @@ export function clientKey(ip: string | null): string {
   return full.slice(0, 4).map((h) => h.replace(/^0+(?=.)/, "")).join(":") + "::/64";
 }
 
-type LimitName = "RPC_LIMIT" | "RPC_GLOBAL_LIMIT" | "SPR_LIMIT" | "SPR_GLOBAL_LIMIT" | "PROVE_LIMIT" | "PROVE_GLOBAL_LIMIT" | "QUOTE_LIMIT" | "FAUCET_LIMIT";
+type LimitName = "RPC_LIMIT" | "RPC_GLOBAL_LIMIT" | "SPR_LIMIT" | "SPR_GLOBAL_LIMIT" | "PROVE_LIMIT" | "PROVE_GLOBAL_LIMIT" | "QUOTE_LIMIT" | "FAUCET_LIMIT"
+  | "LEND_READ_LIMIT" | "LEND_READ_GLOBAL_LIMIT" | "LEND_TICKET_LIMIT" | "LEND_TICKET_GLOBAL_LIMIT" | "LEND_BUILD_LIMIT" | "LEND_BUILD_GLOBAL_LIMIT";
 
 /**
  * Charges `times` units to a limiter, keyed per client unless `global`. A missing binding is no
@@ -217,7 +232,89 @@ function config(env: Env) {
     maxTtlSecs: Number(env.MAX_TTL_SECS ?? 0),
     faucet: env.FAUCET === "1",
     paused: env.PAUSED === "1",
+    ...(lendConfig(env) === undefined ? {} : { lend: lendConfig(env) }),
   };
+}
+
+// ---- shapes ----
+
+type Check = (v: unknown) => boolean;
+/** Field name → [check, required]. */
+type Spec = Record<string, readonly [Check, boolean]>;
+
+const uint: Check = (v) => Number.isSafeInteger(v) && (v as number) >= 0;
+const bps: Check = (v) => uint(v) && (v as number) <= 10_000;
+const hex = (n: number): Check => (v) => typeof v === "string" && new RegExp(`^[0-9a-f]{${n}}$`).test(v);
+const base64 = (max: number): Check => (v) => typeof v === "string" && v.length > 0 && v.length <= max && v.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(v);
+const oneOf = (...values: string[]): Check => (v) => typeof v === "string" && values.includes(v);
+const list = (item: Check, min: number, max: number): Check => (v) => Array.isArray(v) && v.length >= min && v.length <= max && v.every(item);
+const object = (spec: Spec): Check => (v) => shaped(v, spec) !== null;
+const address: Check = (v) => isAddress(v);
+const amount: Check = (v) => isAmount(v);
+
+/** The object with exactly the spec's fields, or null if a field is missing, wrong, or unknown. */
+function shaped(v: unknown, spec: Spec): Record<string, unknown> | null {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  if (Object.keys(o).some((k) => !Object.hasOwn(spec, k))) return null;
+  const out: Record<string, unknown> = {};
+  for (const [k, [check, required]] of Object.entries(spec)) {
+    if (o[k] === undefined) {
+      if (required) return null;
+    } else if (!check(o[k])) return null;
+    else out[k] = o[k];
+  }
+  return out;
+}
+
+// ---- lend config ----
+
+const CURVE_POINT: Spec = { utilisationBps: [bps, true], rateBps: [uint, true] };
+// Piecewise linear from 0 % to 100 % utilisation, utilisation strictly rising.
+const curve: Check = (v) => {
+  if (!list(object(CURVE_POINT), 2, 8)(v)) return false;
+  const u = (v as { utilisationBps: number }[]).map((p) => p.utilisationBps);
+  return u[0] === 0 && u.at(-1) === 10_000 && u.every((x, i) => i === 0 || x > u[i - 1]!);
+};
+const POOL: Spec = {
+  mint: [address, true],
+  curve: [curve, true],
+  feeBps: [bps, true],
+  maxUtilisationBps: [bps, true],
+  minSupply: [amount, true],
+};
+const VAULT: Spec = {
+  id: [(v) => uint(v) && (v as number) <= 0xffff, true],
+  collateralMint: [address, true],
+  debtMint: [address, true],
+  cfBps: [bps, true],
+  ltBps: [bps, true],
+  lmlBps: [bps, true],
+  penaltyBps: [bps, true],
+  minCollateral: [amount, true],
+  minDebt: [amount, true],
+};
+
+type LendConfig = { programId: string; pools: Record<string, unknown>[]; vaults: Record<string, unknown>[] };
+
+/** Lend is off (undefined) when none of its variables is set; set but malformed is a config error. */
+function lendConfig(env: Env): LendConfig | undefined {
+  if (env.LEND_PROGRAM_ID === undefined && env.LEND_POOLS === undefined && env.LEND_VAULTS === undefined) return undefined;
+  if (!isAddress(env.LEND_PROGRAM_ID)) throw new Fail(500, "The server setting LEND_PROGRAM_ID is malformed.");
+  const all = (name: "LEND_POOLS" | "LEND_VAULTS", spec: Spec) => {
+    const raw = parsed(env[name], name);
+    const items = Array.isArray(raw) && raw.length > 0 ? raw.map((x) => shaped(x, spec)) : [null];
+    if (items.some((x) => x === null)) throw new Fail(500, `The server setting ${name} is malformed.`);
+    return items as Record<string, unknown>[];
+  };
+  const pools = all("LEND_POOLS", POOL);
+  const vaults = all("LEND_VAULTS", VAULT);
+  const mints = new Set(pools.map((p) => p.mint));
+  const ok = vaults.every((v, i) =>
+    mints.has(v.debtMint) && (v.cfBps as number) <= (v.ltBps as number) && (v.ltBps as number) <= (v.lmlBps as number) &&
+    vaults.findIndex((w) => w.id === v.id) === i);
+  if (!ok || mints.size !== pools.length) throw new Fail(500, "The server settings LEND_POOLS and LEND_VAULTS do not fit together.");
+  return { programId: env.LEND_PROGRAM_ID, pools, vaults };
 }
 
 type Asset = { mint: string; symbol: string; decimals: number; maxSell?: string };
@@ -466,7 +563,6 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
   // A proof POST costs Helius credits; status polls and the rest use the indexer limit.
   const proving = request.method === "POST" && sub.startsWith("/prove/");
   await limit(env, proving ? "PROVE_LIMIT" : "SPR_LIMIT", request);
-  await limit(env, proving ? "PROVE_GLOBAL_LIMIT" : "SPR_GLOBAL_LIMIT", request, 1, true);
 
   const headers = new Headers();
   for (const name of SPR_REQUEST_HEADERS) {
@@ -479,6 +575,9 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
     if (read === null) throw new Fail(413, "The request is larger than 1 MiB.");
     body = read;
   }
+  if (proving) checkProofRequest(headers, body!);
+  // Global spend is charged only for a request that passed every check, so junk cannot use it up.
+  await limit(env, proving ? "PROVE_GLOBAL_LIMIT" : "SPR_GLOBAL_LIMIT", request, 1, true);
   const local = env.NETWORK === "local";
   const base = isIndexer
     ? env.UPSTREAM_INDEXER ?? env.UPSTREAM_SPR ?? (local ? LOCAL.indexer : helius(env, "/v1/spr"))
@@ -503,6 +602,24 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
   return new Response(bytes, { status, headers: out });
 }
 
+// dist/client/prover: a plain proof POST is a JSON object; through the TEE it is
+// application/octet-stream with Spr-Tee and Spr-Tee-Enc and at least a 16-byte GCM tag.
+function checkProofRequest(headers: Headers, body: Uint8Array) {
+  const type = (headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+  if (type === "application/octet-stream") {
+    if (headers.get("spr-tee") === null || headers.get("spr-tee-enc") === null || body.byteLength < 16) {
+      throw new Fail(400, "An encrypted proof request needs Spr-Tee, Spr-Tee-Enc and a body.");
+    }
+    return;
+  }
+  if (type !== "application/json") throw new Fail(415, "A proof request must be application/json or application/octet-stream.");
+  let v: unknown;
+  try {
+    v = JSON.parse(new TextDecoder().decode(body));
+  } catch {}
+  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new Fail(400, "The proof request must be a JSON object.");
+}
+
 // ---- /api/tee-policy ----
 
 async function teePolicy(env: Env): Promise<Response> {
@@ -516,8 +633,8 @@ async function teePolicy(env: Env): Promise<Response> {
 
 // ---- dealers ----
 
-async function smallJson(request: Request): Promise<Record<string, unknown>> {
-  const bytes = await readCapped(request.body, SMALL_BODY_CAP);
+async function smallJson(request: Request, cap = SMALL_BODY_CAP): Promise<Record<string, unknown>> {
+  const bytes = await readCapped(request.body, cap);
   if (bytes === null) throw new Fail(413, "The request is too large.");
   try {
     const v: unknown = JSON.parse(new TextDecoder().decode(bytes));
@@ -534,10 +651,11 @@ function dealerKey(env: Env): string {
   return env.DEALER_KEY;
 }
 
-async function askDealer(dealerUrl: string, route: string, key: string, body: string, timeoutMs: number): Promise<Response | null> {
+/** POSTs `body`, or GETs when there is none. */
+async function askDealer(dealerUrl: string, route: string, key: string, body: string | undefined, timeoutMs: number): Promise<Response | null> {
   try {
     return await fetch(`${dealerUrl.replace(/\/+$/, "")}${route}`, {
-      method: "POST",
+      method: body === undefined ? "GET" : "POST",
       headers: { "content-type": "application/json", "x-keeler-key": key },
       body,
       redirect: "manual",
@@ -590,4 +708,100 @@ async function faucet(request: Request, env: Env): Promise<Response> {
   if (response.ok && reply?.ok === true) return json({ ok: true });
   const reason = typeof reply?.error === "string" ? reply.error.slice(0, 200) : "The faucet refused the request.";
   return json({ error: reason }, response.status >= 400 && response.status < 500 ? response.status : 502);
+}
+
+// ---- /api/lend/* ----
+
+const vaultId: Check = (v) => uint(v) && (v as number) <= 0xffff;
+// A wallet signature over the request, with a nonce and a timestamp; the keeper verifies all three.
+const SIGNED: Spec = { wallet: [address, true], nonce: [hex(32), true], timestamp: [uint, true], signature: [hex(128), true] };
+const PURPOSE = oneOf("supply", "deposit", "repay");
+// The owner message, encrypted to the owner's viewing key.
+const message = base64(512);
+
+const POOLS_REPLY: Spec = {
+  pools: [list(object({
+    mint: [address, true], at: [uint, true], size: [amount, true], utilisationBps: [bps, true], supplyRateBps: [uint, true], borrowRateBps: [uint, true],
+  }), 0, 8), true],
+};
+const TICKET_REQUEST: Spec = {
+  ...SIGNED, purpose: [PURPOSE, true], amount: [amount, true], pool: [address, false], vault: [vaultId, false], position: [amount, false],
+};
+const TICKET_REPLY: Spec = { id: [hex(32), true], expiry: [uint, true], signature: [hex(128), true] };
+const BUILD_REQUEST: Spec = {
+  ...SIGNED, op: [oneOf("redeem", "draw"), true], pool: [address, false], vault: [vaultId, false], position: [amount, false],
+  amount: [amount, false], borrow: [amount, false], withdraw: [amount, false],
+};
+// A v1 transaction is at most 4,096 bytes: 5,464 base64 characters.
+const BUILD_REPLY: Spec = { transaction: [base64(5464), true], outputs: [list(hex(64), 1, 8), true], now: [uint, true], bound: [amount, false] };
+const ACCOUNT_REPLY: Spec = {
+  receipts: [list(object({ pool: [address, true], shares: [amount, true], message: [message, true] }), 0, 8), true],
+  positions: [list(object({
+    vault: [vaultId, true], position: [amount, true], collateral: [amount, true], debtShares: [amount, true], message: [message, true],
+  }), 0, 8), true],
+  intents: [list(object({
+    id: [hex(32), true], purpose: [PURPOSE, true], amount: [amount, true], expiry: [uint, true], status: [oneOf("waiting", "filled", "refundable"), true],
+  }), 0, 8), true],
+};
+
+type LendRoute = {
+  method: "GET" | "POST"; keeper: string; limits: [LimitName, LimitName]; timeoutMs: number; pausable: boolean;
+  /** The query for a GET, the body for a POST. */
+  request: Spec; reply: Spec;
+};
+const LEND_ROUTES: Record<string, LendRoute> = {
+  "/api/lend/pools": { method: "GET", keeper: "/lend/pools", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, pausable: false, request: {}, reply: POOLS_REPLY },
+  "/api/lend/account": { method: "GET", keeper: "/lend/account", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, pausable: false, request: SIGNED, reply: ACCOUNT_REPLY },
+  "/api/lend/ticket": { method: "POST", keeper: "/lend/ticket", limits: ["LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, pausable: true, request: TICKET_REQUEST, reply: TICKET_REPLY },
+  "/api/lend/build": { method: "POST", keeper: "/lend/build", limits: ["LEND_BUILD_LIMIT", "LEND_BUILD_GLOBAL_LIMIT"], timeoutMs: LEND_BUILD_TIMEOUT_MS, pausable: true, request: BUILD_REQUEST, reply: BUILD_REPLY },
+};
+
+// shortcut: one keeper, the first DEALERS entry; return a list here when there is more than one.
+function keeper(env: Env): { url: string } {
+  const first = dealers(env)[0];
+  if (first === undefined) throw new Fail(503, "No lending keeper is configured.");
+  return first;
+}
+
+async function lend(request: Request, env: Env, url: URL, path: string): Promise<Response> {
+  const route = Object.hasOwn(LEND_ROUTES, path) ? LEND_ROUTES[path]! : undefined;
+  if (lendConfig(env) === undefined || route === undefined) throw new Fail(404, "Not found.");
+  if (route.pausable && env.PAUSED === "1") throw new Fail(503, "Swaps are paused.");
+  const wrong = only(request, route.method);
+  if (wrong) return wrong;
+  await limit(env, route.limits[0], request);
+
+  let body: string | undefined;
+  let query = "";
+  if (route.method === "POST") {
+    const clean = shaped(await smallJson(request, LEND_BODY_CAP), route.request);
+    if (clean === null) throw new Fail(400, `The request body does not have the fields ${route.keeper} takes.`);
+    body = JSON.stringify(clean);
+  } else {
+    const params = [...url.searchParams];
+    const given = Object.fromEntries(params.map(([k, v]) => [k, k === "timestamp" && /^(0|[1-9][0-9]{0,15})$/.test(v) ? Number(v) : v]));
+    const clean = params.length === Object.keys(given).length ? shaped(given, route.request) : null;
+    if (clean === null) throw new Fail(400, `The query does not have the fields ${route.keeper} takes.`);
+    if (params.length > 0) query = "?" + new URLSearchParams(Object.entries(clean).map(([k, v]) => [k, String(v)]));
+  }
+  const key = dealerKey(env);
+  const target = keeper(env);
+  // Charged only once the request passed every check.
+  await limit(env, route.limits[1], request, 1, true);
+
+  const response = await askDealer(target.url, route.keeper + query, key, body, route.timeoutMs);
+  if (response === null) throw new Fail(502, "The lending keeper did not answer.");
+  let reply: unknown = null;
+  try {
+    const bytes = await readCapped(response.body, LEND_BODY_CAP);
+    reply = bytes && JSON.parse(new TextDecoder().decode(bytes));
+  } catch {}
+  if (response.ok) {
+    const clean = shaped(reply, route.reply);
+    if (clean === null) throw new Fail(502, "The lending keeper sent a malformed reply.");
+    return json(clean);
+  }
+  const error = (reply as { error?: unknown } | null)?.error;
+  if (response.status >= 400 && response.status < 500 && typeof error === "string") return json({ error: error.slice(0, 200) }, response.status);
+  throw new Fail(502, "The lending keeper could not do this right now.");
 }

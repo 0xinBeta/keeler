@@ -456,6 +456,247 @@ describe("round 2", () => {
   });
 });
 
+describe("proof requests and the global prover limit", () => {
+  it("charges the global limit only for a well-formed proof request", async () => {
+    mockFetch(() => Response.json({}));
+    const seen: string[] = [];
+    const count = (name: string) => ({ limit: async () => (seen.push(name), { success: true }) }) as RateLimit;
+    const e = env({ PROVE_LIMIT: count("client"), PROVE_GLOBAL_LIMIT: count("global") });
+    const raw = (body: BodyInit, headers: Record<string, string>) => req("/v1/spr/prove/merge_8_1", { method: "POST", body, headers });
+    for (const [r, status] of [
+      [post("/v1/spr/prove/merge_8_1", "{nope"), 400],
+      [post("/v1/spr/prove/merge_8_1", "[]"), 400],
+      [post("/v1/spr/prove/merge_8_1", ""), 400],
+      [raw("{}", { "content-type": "text/plain" }), 415],
+      [raw("{}", {}), 415],
+      [raw(new Uint8Array(32), { "content-type": "application/octet-stream", "spr-tee": "v1" }), 400],
+      [raw(new Uint8Array(8), { "content-type": "application/octet-stream", "spr-tee": "v1", "spr-tee-enc": "ee" }), 400],
+      [post("/v1/spr/prove/merge_8_1", "x".repeat(1024 * 1024 + 65)), 413],
+    ] as const) {
+      expect((await call(r, e)).res.status).toBe(status);
+    }
+    expect(seen).toEqual(Array(8).fill("client"));
+    expect(calls).toHaveLength(0);
+    seen.length = 0;
+    expect((await call(post("/v1/spr/prove/merge_8_1", { a: 1 }, { "content-type": "application/json; charset=utf-8" }), e)).res.status).toBe(200);
+    expect((await call(raw(new Uint8Array(32), { "content-type": "application/octet-stream", "spr-tee": "v1", "spr-tee-enc": "ee" }), e)).res.status).toBe(200);
+    expect(seen).toEqual(["client", "global", "client", "global"]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("refuses over the client limit before reading the request", async () => {
+    mockFetch(() => Response.json({}));
+    const seen: string[] = [];
+    const named = (name: string, ok: boolean) => ({ limit: async () => (seen.push(name), { success: ok }) }) as RateLimit;
+    const e = env({ PROVE_LIMIT: named("client", false), PROVE_GLOBAL_LIMIT: named("global", true) });
+    expect((await call(post("/v1/spr/prove/merge_8_1", "{nope"), e)).res.status).toBe(429);
+    expect(seen).toEqual(["client"]);
+  });
+});
+
+describe("/api/lend/*", () => {
+  const PROGRAM = "Lend1111111111111111111111111111111111111111";
+  const POOLS = [{
+    mint: MINT_B,
+    curve: [{ utilisationBps: 0, rateBps: 0 }, { utilisationBps: 8800, rateBps: 500 }, { utilisationBps: 9300, rateBps: 700 }, { utilisationBps: 10000, rateBps: 1500 }],
+    feeBps: 1000, maxUtilisationBps: 9500, minSupply: "1000000",
+  }];
+  const VAULTS = [{
+    id: 0, collateralMint: MINT_A, debtMint: MINT_B, cfBps: 8000, ltBps: 8500, lmlBps: 9000, penaltyBps: 100, minCollateral: "10000000", minDebt: "1000000",
+  }];
+  const LIMITS = ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT", "LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT", "LEND_BUILD_LIMIT", "LEND_BUILD_GLOBAL_LIMIT"] as const;
+  const lendEnv = (over: Partial<Env> = {}) => env({
+    LEND_PROGRAM_ID: PROGRAM, LEND_POOLS: JSON.stringify(POOLS), LEND_VAULTS: JSON.stringify(VAULTS),
+    ...Object.fromEntries(LIMITS.map((n) => [n, allow])), ...over,
+  });
+  const SIGNED = { wallet: TRADER, nonce: "0f".repeat(16), timestamp: 1_800_000_000, signature: SIG };
+  const query = (o: Record<string, unknown>) => "?" + new URLSearchParams(Object.entries(o).map(([k, v]) => [k, String(v)]));
+  const TICKET = { ...SIGNED, purpose: "supply", pool: MINT_B, amount: "5000000" };
+  const BUILD = { ...SIGNED, op: "draw", vault: 0, position: "7", borrow: "1000000", withdraw: "0" };
+  const TX = "A".repeat(5464); // 4,096 bytes
+  const OUT = "cd".repeat(32);
+  const POOLS_REPLY = { pools: [{ mint: MINT_B, at: 1_800_000_000, size: "1000000000", utilisationBps: 5000, supplyRateBps: 120, borrowRateBps: 280 }] };
+  const ACCOUNT_REPLY = {
+    receipts: [{ pool: MINT_B, shares: "5000000", message: "AAAA" }],
+    positions: [{ vault: 0, position: "7", collateral: "10000000", debtShares: "0", message: "AAAA" }],
+    intents: [{ id: "ab".repeat(16), purpose: "deposit", amount: "10000000", expiry: 1_800_000_600, status: "waiting" }],
+  };
+  const routes = () => [
+    req("/api/lend/pools"),
+    req("/api/lend/account" + query(SIGNED)),
+    post("/api/lend/ticket", TICKET),
+    post("/api/lend/build", BUILD),
+  ];
+
+  it("is absent from config and every route is 404 without the lend settings", async () => {
+    mockFetch(() => Response.json({}));
+    expect((await call(req("/api/config"))).body.lend).toBeUndefined();
+    for (const r of routes()) expect((await call(r)).res.status).toBe(404);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("puts lend in config, and refuses malformed settings", async () => {
+    expect((await call(req("/api/config"), lendEnv())).body.lend).toEqual({ programId: PROGRAM, pools: POOLS, vaults: VAULTS });
+    const p = POOLS[0]!;
+    const v = VAULTS[0]!;
+    for (const bad of [
+      { LEND_PROGRAM_ID: "nope" },
+      { LEND_POOLS: undefined },
+      { LEND_VAULTS: "[]" },
+      { LEND_POOLS: "[{" },
+      { LEND_POOLS: JSON.stringify([{ ...p, extra: 1 }]) },
+      { LEND_POOLS: JSON.stringify([{ ...p, minSupply: 1 }]) },
+      { LEND_POOLS: JSON.stringify([{ ...p, curve: p.curve.slice(0, 3) }]) }, // does not reach 100 %
+      { LEND_POOLS: JSON.stringify([{ ...p, curve: [p.curve[0], p.curve[2], p.curve[1], p.curve[3]] }]) }, // not rising
+      { LEND_POOLS: JSON.stringify([{ ...p, feeBps: 10001 }]) },
+      { LEND_POOLS: JSON.stringify([p, p]) },
+      { LEND_VAULTS: JSON.stringify([{ ...v, debtMint: TRADER }]) }, // no such pool
+      { LEND_VAULTS: JSON.stringify([{ ...v, cfBps: 8600 }]) }, // above the threshold
+      { LEND_VAULTS: JSON.stringify([v, v]) },
+      { LEND_VAULTS: JSON.stringify([{ ...v, minDebt: undefined }]) },
+    ] as Partial<Env>[]) {
+      expect((await call(req("/api/config"), lendEnv(bad))).res.status, JSON.stringify(bad)).toBe(500);
+    }
+  });
+
+  it("forwards each route to the first dealer's keeper path with the key, and returns the checked reply", async () => {
+    const replies: Record<string, unknown> = {
+      "/lend/pools": POOLS_REPLY,
+      "/lend/account": ACCOUNT_REPLY,
+      "/lend/ticket": { id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG },
+      "/lend/build": { transaction: TX, outputs: [OUT, OUT], now: 1_800_000_000, bound: "150000000000000" },
+    };
+    mockFetch((url) => Response.json(replies[new URL(url).pathname]));
+    const timeouts = vi.spyOn(AbortSignal, "timeout");
+    const results = [];
+    for (const r of routes()) results.push(await call(r, lendEnv()));
+    expect(results.map((r) => r.res.status)).toEqual([200, 200, 200, 200]);
+    expect(results.map((r) => r.body)).toEqual(Object.values(replies));
+    expect(results[0]!.res.headers.get("content-security-policy")).toBe("default-src 'none'");
+    expect(calls.map((c) => [c.init.method, c.url])).toEqual([
+      ["GET", "https://d1.example/lend/pools"],
+      ["GET", "https://d1.example/lend/account" + query(SIGNED)],
+      ["POST", "https://d1.example/lend/ticket"],
+      ["POST", "https://d1.example/lend/build"],
+    ]);
+    for (const c of calls) expect((c.init.headers as Record<string, string>)["x-keeler-key"]).toBe(DKEY);
+    expect(calls[0]!.init.body).toBeUndefined();
+    expect(JSON.parse(calls[2]!.init.body as string)).toEqual(TICKET);
+    expect(JSON.parse(calls[3]!.init.body as string)).toEqual(BUILD);
+    expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([10000, 10000, 10000, 30000]);
+  });
+
+  it("refuses requests of the wrong shape without asking the keeper", async () => {
+    mockFetch(() => Response.json({}));
+    const e = lendEnv();
+    const bad: Request[] = [
+      req("/api/lend/pools?x=1"),
+      req("/api/lend/account"),
+      req("/api/lend/account" + query({ ...SIGNED, extra: 1 })),
+      req("/api/lend/account" + query({ ...SIGNED, timestamp: "soon" })),
+      req("/api/lend/account" + query({ ...SIGNED, wallet: "nope" })),
+      req("/api/lend/account" + query(SIGNED) + "&wallet=" + TRADER),
+      post("/api/lend/ticket", { ...TICKET, extra: 1 }),
+      post("/api/lend/ticket", { ...TICKET, amount: 5000000 }),
+      post("/api/lend/ticket", { ...TICKET, amount: "18446744073709551616" }),
+      post("/api/lend/ticket", { ...TICKET, purpose: "borrow" }),
+      post("/api/lend/ticket", { ...TICKET, signature: SIG.toUpperCase() }),
+      post("/api/lend/ticket", { ...TICKET, nonce: "0f" }),
+      post("/api/lend/ticket", { ...TICKET, timestamp: -1 }),
+      post("/api/lend/ticket", { ...TICKET, wallet: undefined }),
+      post("/api/lend/ticket", "[]"),
+      post("/api/lend/build", { ...BUILD, op: "liquidate" }),
+      post("/api/lend/build", { ...BUILD, vault: 70000 }),
+      post("/api/lend/build", { ...BUILD, pad: "x".repeat(5 * 1024) }), // over the old 4 KiB cap: refused for shape, not size
+    ];
+    for (const r of bad) expect((await call(r, e)).res.status, r.url).toBe(400);
+    expect((await call(post("/api/lend/build", { ...BUILD, pad: "x".repeat(16 * 1024) }), e)).res.status).toBe(413);
+    expect((await call(req("/api/lend/ticket"), e)).res.status).toBe(405);
+    expect((await call(post("/api/lend/pools", {}), e)).res.status).toBe(405);
+    expect((await call(req("/api/lend/other"), e)).res.status).toBe(404);
+    expect((await call(req("/api/lend/constructor"), e)).res.status).toBe(404);
+    expect(calls).toHaveLength(0);
+    // The existing dealer routes keep their 4 KiB cap.
+    expect((await call(post("/api/quotes", { pad: "x".repeat(5 * 1024) }), e)).res.status).toBe(413);
+  });
+
+  it("refuses malformed and oversized keeper replies, and passes its refusals", async () => {
+    const cases: [Response | (() => never), number][] = [
+      [Response.json({ transaction: "A".repeat(5468), outputs: [OUT], now: 1 }), 502], // over 4,096 bytes
+      [Response.json({ transaction: TX, outputs: [], now: 1 }), 502],
+      [Response.json({ transaction: TX, outputs: [OUT], now: 1, extra: 1 }), 502],
+      [Response.json({ transaction: "not base64!", outputs: [OUT], now: 1 }), 502],
+      [new Response("not json"), 502],
+      [new Response(JSON.stringify({ transaction: TX, outputs: [OUT], now: 1, bound: "1".padEnd(17 * 1024, " ") })), 502], // over 16 KiB
+      [Response.json({ error: "x" }, { status: 500 }), 502],
+      [() => { throw new Error(`refused ${DKEY}`); }, 502],
+      [Response.json({ error: "The reserve is busy for 12 s." }, { status: 409 }), 409],
+    ];
+    for (const [reply, status] of cases) {
+      mockFetch(() => (typeof reply === "function" ? reply() : reply));
+      const { res, body } = await call(post("/api/lend/build", BUILD), lendEnv());
+      expect(res.status).toBe(status);
+      expect(body.error).toBeTypeOf("string");
+    }
+    mockFetch(() => Response.json({ ...ACCOUNT_REPLY, receipts: [{ ...ACCOUNT_REPLY.receipts[0], shares: 5 }] }));
+    expect((await call(req("/api/lend/account" + query(SIGNED)), lendEnv())).res.status).toBe(502);
+  });
+
+  it("charges the client limit first and the global limit only after validation", async () => {
+    mockFetch(() => Response.json({ id: "ab".repeat(16), expiry: 1, signature: SIG }));
+    const seen: string[] = [];
+    const named = (name: string, ok = true) => ({ limit: async ({ key }: { key: string }) => (seen.push(`${name}:${key}`), { success: ok }) }) as RateLimit;
+    const e = lendEnv(Object.fromEntries(LIMITS.map((n) => [n, named(n)])));
+    const ip = { "cf-connecting-ip": "2001:db8:a:b:1:2:3:4" };
+    await call(post("/api/lend/ticket", { ...TICKET, extra: 1 }, ip), e);
+    await call(post("/api/lend/ticket", TICKET, ip), e);
+    await call(post("/api/lend/build", BUILD, ip), e);
+    await call(req("/api/lend/pools", { headers: ip }), e);
+    await call(req("/api/lend/account", { headers: ip }), e);
+    expect(seen).toEqual([
+      "LEND_TICKET_LIMIT:2001:db8:a:b::/64",
+      "LEND_TICKET_LIMIT:2001:db8:a:b::/64", "LEND_TICKET_GLOBAL_LIMIT:global",
+      "LEND_BUILD_LIMIT:2001:db8:a:b::/64", "LEND_BUILD_GLOBAL_LIMIT:global",
+      "LEND_READ_LIMIT:2001:db8:a:b::/64", "LEND_READ_GLOBAL_LIMIT:global",
+      "LEND_READ_LIMIT:2001:db8:a:b::/64",
+    ]);
+    for (const n of LIMITS) {
+      mockFetch(() => Response.json({}));
+      const i = LIMITS.indexOf(n) >> 1;
+      const { res } = await call(routes()[[0, 2, 3][i]!]!, lendEnv({ [n]: named(n, false) }));
+      expect(res.status, n).toBe(429);
+      const missing = await call(routes()[[0, 2, 3][i]!]!, lendEnv({ [n]: undefined }));
+      expect(missing.res.status, n).toBe(503);
+      expect(missing.body.error).toContain("Rate limiting");
+      expect(calls).toHaveLength(0);
+    }
+    mockFetch(() => Response.json(POOLS_REPLY));
+    const local = lendEnv({ NETWORK: "local", ...Object.fromEntries(LIMITS.map((n) => [n, undefined])) });
+    expect((await call(req("/api/lend/pools"), local)).res.status).toBe(200);
+  });
+
+  it("PAUSED refuses tickets and builds; pools and account still answer", async () => {
+    mockFetch((url) => Response.json(new URL(url).pathname === "/lend/pools" ? POOLS_REPLY : ACCOUNT_REPLY));
+    const e = lendEnv({ PAUSED: "1" });
+    const [pools, account, ticket, build] = routes();
+    for (const r of [ticket!, build!]) {
+      const { res, body } = await call(r, e);
+      expect(res.status).toBe(503);
+      expect(body).toEqual({ error: "Swaps are paused." });
+    }
+    expect(calls).toHaveLength(0);
+    expect((await call(pools!, e)).res.status).toBe(200);
+    expect((await call(account!, e)).res.status).toBe(200);
+  });
+
+  it("leaves the page CSP unchanged", async () => {
+    const html = await worker.fetch(req("/"), lendEnv());
+    expect(html.headers.get("content-security-policy")).toBe(
+      "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'",
+    );
+  });
+});
+
 describe("/api/prices", () => {
   const FEED_A = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
   const FEED_B = "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a";

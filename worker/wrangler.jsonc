@@ -16,7 +16,14 @@
     // Global (constant key) caps on spend, whatever the number of client addresses. Tune to the Helius plan.
     { "name": "RPC_GLOBAL_LIMIT", "namespace_id": "4106", "simple": { "limit": 1200, "period": 60 } },
     { "name": "SPR_GLOBAL_LIMIT", "namespace_id": "4107", "simple": { "limit": 1200, "period": 60 } },
-    { "name": "PROVE_GLOBAL_LIMIT", "namespace_id": "4108", "simple": { "limit": 30, "period": 60 } }
+    { "name": "PROVE_GLOBAL_LIMIT", "namespace_id": "4108", "simple": { "limit": 30, "period": 60 } },
+    // The lending keeper: one lane per pool, a build is two proofs, a ticket a signature.
+    { "name": "LEND_READ_LIMIT", "namespace_id": "4109", "simple": { "limit": 60, "period": 60 } },
+    { "name": "LEND_READ_GLOBAL_LIMIT", "namespace_id": "4110", "simple": { "limit": 600, "period": 60 } },
+    { "name": "LEND_TICKET_LIMIT", "namespace_id": "4111", "simple": { "limit": 10, "period": 60 } },
+    { "name": "LEND_TICKET_GLOBAL_LIMIT", "namespace_id": "4112", "simple": { "limit": 60, "period": 60 } },
+    { "name": "LEND_BUILD_LIMIT", "namespace_id": "4113", "simple": { "limit": 6, "period": 60 } },
+    { "name": "LEND_BUILD_GLOBAL_LIMIT", "namespace_id": "4114", "simple": { "limit": 12, "period": 60 } }
   ],
   "vars": { "NETWORK": "local" }
 }
