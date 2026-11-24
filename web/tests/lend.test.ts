@@ -48,6 +48,7 @@ const config: LendServerConfig = {
 };
 const USER_ADDR = new Uint8Array(64).fill(1);
 const PDA_ADDR = new Uint8Array(64).fill(2);
+const USER_TAG = new Uint8Array(32).fill(1);
 const RESERVE_NF = new Uint8Array(32).fill(0xaa);
 const INDEX = 1_100_000_000_000n; // 1.1 tUSD per share
 const TSOL_PRICE = { price: "14237000000", expo: -8, publishTime: T0 }; // $142.37
@@ -63,6 +64,8 @@ const wasm: LendDeps["wasm"] = {
   hash: async (n) => sha(n.owner, n.mint, u64Bytes(n.amount), Uint8Array.of(n.kind), n.state, n.blinding),
   seed: (domain, prev) => sha(domain, prev),
   nullifier: (hash, blinding) => sha("nf", hash, blinding),
+  // A fake payout ciphertext: mint ‖ amount ‖ blinding (see keeperBuild).
+  openPayout: async ({ data }) => (data.length === 72 ? { mint: data.slice(0, 32), amount: u64At(data, 32), blinding: data.slice(40), plain: true } : undefined),
   // Test states: 16 opaque bytes, then the pool or position id, then the shares.
   decode: async (n) => ({ ownerIsMe: n.state[0] !== 0xee, shares: u64At(n.state, n.state.length - 8), positionId: u64At(n.state, n.state.length - 16), pool: u64At(n.state, n.state.length - 16) }),
 };
@@ -184,7 +187,7 @@ async function world() {
     send,
     sync: async () => {},
     notes: (mint) => (mint === TUSD ? [{ amount: 500_000000n, utxo: "tusd-note" }] : [{ amount: 5_000000000n, utxo: "tsol-note" }]),
-    owners: async () => ({ user: USER_ADDR, pda: PDA_ADDR, viewing: new Uint8Array(33).fill(6) }),
+    owners: async () => ({ user: USER_ADDR, pda: PDA_ADDR, viewing: new Uint8Array(33).fill(6), tags: [USER_TAG] }),
     chain: {
       note: async (hash) => notes.get(hex(hash)) ?? {},
       signatureStatus: async (s) => sigs.get(s) ?? null,
@@ -225,12 +228,17 @@ async function keeperBuild(W: World, op: "redeem" | "draw", spent: { hash: Uint8
     const n = notes.find((x) => x.slot === slot);
     return n ? wasm.hash({ ...n, blinding: await wasm.blinding(first, seed, slot) }) : sha("pad", Uint8Array.of(slot));
   }));
+  // Each note's ciphertext opens to it, under the owner's tag.
+  const data = await Promise.all([0, 1, 2, 3].map(async (slot) => {
+    const n = notes.find((x) => x.slot === slot);
+    return n ? Uint8Array.of(...n.mint, ...u64Bytes(n.amount), ...(await wasm.blinding(first, seed, slot))) : new Uint8Array(72);
+  }));
   const transact = encodeTransactInstructionData({
     expiryUnixTs: BigInt(W.clock.now + 60),
     txViewingPk: new Uint8Array(33).fill(2),
     salt: new Uint8Array(16),
     interfaceTransfers: [],
-    outputs: outputs.map((utxoHash) => ({ utxoHash, ownerTag: { kind: "inline" as const, value: new Uint8Array(32) } })),
+    outputs: outputs.map((utxoHash, i) => ({ utxoHash, ownerTag: { kind: "inline" as const, value: USER_TAG }, data: data[i] })),
     messages: [],
     privateTxHash: new Uint8Array(32),
     circuit: { kind: "confidentialSigner", inputs: 2, outputs: 4, publicAssetSlots: 0 },

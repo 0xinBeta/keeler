@@ -53,7 +53,8 @@ export type LendWasm = Hashing & {
   decode(note: NoteOpening, leafIndex: bigint): Promise<{ ownerIsMe: boolean; pool?: bigint; vault?: bigint; positionId?: bigint; shares: bigint }>;
 };
 
-export type Owners = { user: Uint8Array; pda: Uint8Array; viewing: Uint8Array };
+/** `tags`: the view tags the user's wallet finds a payment under (its viewing key's x, its identity's tag). */
+export type Owners = { user: Uint8Array; pda: Uint8Array; viewing: Uint8Array; tags: Uint8Array[] };
 
 export type LendDeps = {
   network: string;
@@ -565,7 +566,7 @@ export function createLend(d: LendDeps): KeelerLend {
     const seed = d.wasm.seed(SEED_DOMAIN[kind], spent.blinding);
     const checked = await checkKeeperTransaction(
       reply,
-      { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
+      { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, payoutTags: owners.tags, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
       d.wasm,
     );
     // The keeper's index is kept only once its transaction passed the check.
@@ -706,7 +707,7 @@ export function createLend(d: LendDeps): KeelerLend {
             return {
               checked: () => remember(pool, "supply", reply.index!, reply.now),
               notes: [
-                { slot: SLOT.redeem.payout, owner: owners.user, mint, amount: paid, kind: NOTE_KIND.token, state: new Uint8Array() },
+                { slot: SLOT.redeem.payout, owner: owners.user, mint, amount: paid, kind: NOTE_KIND.token, state: new Uint8Array(), payout: true },
                 { slot: SLOT.redeem.receipt, owner: owners.pda, mint, amount: 0n, kind: NOTE_KIND.receipt, state },
               ],
               creates: (b, outputs) => ({ receipt: { pool, shares: left, note: { hash: outputs[SLOT.redeem.receipt]!, mint: pool, amount: 0n, blinding: b.get(SLOT.redeem.receipt)!, state, kind: NOTE_KIND.receipt } } }),
@@ -740,8 +741,8 @@ export function createLend(d: LendDeps): KeelerLend {
               reference,
               notes: [
                 { slot: SLOT.draw.position, owner: owners.pda, mint: collateralMint, amount: collateral, kind: NOTE_KIND.position, state },
-                { slot: SLOT.draw.debtPayout, owner: owners.user, mint: debtMint, amount: borrow, kind: NOTE_KIND.token, state: new Uint8Array() },
-                { slot: SLOT.draw.collateralPayout, owner: owners.user, mint: collateralMint, amount: withdraw, kind: NOTE_KIND.token, state: new Uint8Array() },
+                { slot: SLOT.draw.debtPayout, owner: owners.user, mint: debtMint, amount: borrow, kind: NOTE_KIND.token, state: new Uint8Array(), payout: true },
+                { slot: SLOT.draw.collateralPayout, owner: owners.user, mint: collateralMint, amount: withdraw, kind: NOTE_KIND.token, state: new Uint8Array(), payout: true },
               ],
               creates: (b, outputs) => ({
                 position: { ...p, collateral, debtShares, note: { hash: outputs[SLOT.draw.position]!, mint: v.collateralMint, amount: collateral, blinding: b.get(SLOT.draw.position)!, state, kind: NOTE_KIND.position } },

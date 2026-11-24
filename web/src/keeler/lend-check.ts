@@ -18,8 +18,13 @@ export const COMPUTE_BUDGET_PROGRAM = address("ComputeBudget11111111111111111111
 /** The parts of `wincode(TransactIxData)` the page reads (@heliuslabs/spr `encodeTransactInstructionData`, read back). */
 export type Transact = {
   expiryUnixTs: bigint;
+  /** The transaction viewing key and salt every output ciphertext is sealed under. */
+  txViewingPk: Uint8Array;
+  salt: Uint8Array;
   interfaceTransfers: number;
   outputs: Uint8Array[];
+  /** Each output's inline owner tag (null for an account-index tag) and published data. */
+  slots: { tag: Uint8Array | null; data?: Uint8Array }[];
   nullifiers: Uint8Array[];
 };
 
@@ -30,8 +35,8 @@ export type Transact = {
 export function decodeTransact(bytes: Uint8Array): Transact {
   const r = new Reader(bytes);
   const expiryUnixTs = r.u64("expiryUnixTs");
-  r.bytes(33, "txViewingPk");
-  r.bytes(16, "salt");
+  const txViewingPk = r.bytes(33, "txViewingPk");
+  const salt = r.bytes(16, "salt");
   const transfers = r.u8("interfaceTransfers.length");
   for (let i = 0; i < transfers; i++) {
     const kind = r.u8("interfaceTransfer.kind");
@@ -42,14 +47,17 @@ export function decodeTransact(bytes: Uint8Array): Transact {
   r.option("dataHash", (x) => x.bytes(32, "dataHash"));
   r.option("ringDataHash", (x) => x.bytes(32, "ringDataHash"));
   const outputs: Uint8Array[] = [];
+  const slots: Transact["slots"] = [];
   const outputCount = r.u8("outputs.length");
   for (let i = 0; i < outputCount; i++) {
     outputs.push(r.bytes(32, "output.utxoHash"));
-    const tag = r.u8("ownerTag.kind");
-    if (tag === 0) r.bytes(32, "ownerTag.value");
-    else if (tag === 1) r.u8("ownerTag.index");
+    const kind = r.u8("ownerTag.kind");
+    let tag: Uint8Array | null = null;
+    if (kind === 0) tag = r.bytes(32, "ownerTag.value");
+    else if (kind === 1) r.u8("ownerTag.index");
     else throw new Error("unknown owner tag");
-    r.option("output.data", (x) => x.bytes(x.u16("output.data.length"), "output.data"));
+    const data = r.option("output.data", (x) => x.bytes(x.u16("output.data.length"), "output.data"));
+    slots.push({ tag, ...(data === undefined ? {} : { data }) });
   }
   const messages = r.u8("messages.length");
   for (let i = 0; i < messages; i++) {
@@ -74,7 +82,7 @@ export function decodeTransact(bytes: Uint8Array): Transact {
   const trees = r.u8("treeContexts.length");
   for (let i = 0; i < trees; i++) r.bytes(4, "treeContext");
   r.done();
-  return { expiryUnixTs, interfaceTransfers: transfers, outputs, nullifiers };
+  return { expiryUnixTs, txViewingPk, salt, interfaceTransfers: transfers, outputs, slots, nullifiers };
 }
 
 /** An output the owner must find at `slot`: its blinding comes from the transaction's first nullifier and `seed`. */
@@ -89,6 +97,8 @@ export type ExpectedNote = {
   kind: number;
   /** Borsh state; empty for a token note. */
   state: Uint8Array;
+  /** A token note paid to the owner's own address: its ciphertext must open, under the owner's key, to this note. */
+  payout?: boolean;
 };
 
 export type Expected = {
@@ -102,6 +112,8 @@ export type Expected = {
   spends: Uint8Array;
   /** The owner's 33-byte viewing key: the new receipt or position is encrypted to it (`owner_viewing`). */
   ownerViewing: Uint8Array;
+  /** The view tags the owner's wallet looks for a payment under (its viewing key's x, its identity's tag). */
+  payoutTags: Uint8Array[];
   /** Blinding seed of the outputs below (`SEED_DOMAIN`). */
   seed: Uint8Array;
   notes: ExpectedNote[];
@@ -112,6 +124,11 @@ export type Expected = {
 export type Hashing = {
   blinding(firstNullifier: Uint8Array, seed: Uint8Array, slot: number): Promise<Uint8Array>;
   hash(note: ExpectedNote & { blinding: Uint8Array }): Promise<Uint8Array>;
+  /**
+   * Opens an output's published data as the owner's wallet sync would (the transfer cipher under the owner's
+   * viewing key); undefined if it does not open. `plain`: no data records and no ring, as a token note has.
+   */
+  openPayout(p: { data: Uint8Array; txViewingPk: Uint8Array; salt: Uint8Array; slotIndex: number }): Promise<{ mint: Uint8Array; amount: bigint; blinding: Uint8Array; plain: boolean } | undefined>;
 };
 
 /** The keeper's `/lend/build` reply, decoded. */
@@ -215,8 +232,20 @@ export async function checkKeeperTransaction(reply: BuildReply, e: Expected, h: 
   if (!first || !equal(first, e.spends)) return refuse("it does not spend your note first");
   for (const note of e.notes) {
     const got = transact.outputs[note.slot];
-    const want = await h.hash({ ...note, blinding: await h.blinding(first, e.seed, note.slot) });
+    const blinding = await h.blinding(first, e.seed, note.slot);
+    const want = await h.hash({ ...note, blinding });
     if (!got || !equal(got, want)) refuse(`output ${note.slot} is not the note you asked for`);
+    // The hash alone does not make a payout findable: the wallet finds it by its tag and opens its ciphertext.
+    if (note.payout && note.amount > 0n) {
+      const slot = transact.slots[note.slot]!;
+      if (!slot.tag || !e.payoutTags.some((t) => equal(t, slot.tag!)) || !slot.data) refuse(`output ${note.slot} is not addressed to your wallet`);
+      // Ciphertext slot indexes count data-bearing slots only, as the wallet's sync does.
+      const slotIndex = transact.slots.slice(0, note.slot).filter((x) => x.data).length;
+      const opened = await h.openPayout({ data: slot.data!, txViewingPk: transact.txViewingPk, salt: transact.salt, slotIndex }).catch(() => undefined);
+      if (!opened || !opened.plain || opened.amount !== note.amount || !equal(opened.mint, note.mint) || !equal(opened.blinding, blinding)) {
+        refuse(`output ${note.slot} would not show up in your private balance`);
+      }
+    }
   }
   return { transaction, now, outputs: transact.outputs, firstNullifier: first, ...(bound === undefined ? {} : { bound }) };
 }

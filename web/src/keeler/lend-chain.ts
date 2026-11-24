@@ -291,6 +291,17 @@ export function createLendSeams(ctx: () => Promise<LendContext>) {
     hash: (n) => callWorker<Uint8Array>({ op: "lendNoteHash", owner: n.owner, mint: n.mint, amount: n.amount, kind: n.kind, state: n.state, blinding: n.blinding, treeId: TREE_ID }),
     seed: (domain, previous) => new Uint8Array(poseidon([domainField(domain), previous])),
     nullifier: (hash, blinding) => new Uint8Array(ProgramOwner.nullifierKey().nullifier(bytes32(hash), bytes32(blinding))),
+    /** As the wallet's sync opens a confidential slot (dist/transaction/wallet/sync.js `decodeSlot`): body = embedded key (33) ‖ ciphertext. */
+    async openPayout({ data, txViewingPk, salt, slotIndex }) {
+      const c = await ctx();
+      const frame = decodeOutputData(data);
+      if (frame.encoding !== "encrypted" || frame.scheme !== EncryptedScheme.confidential || frame.body.length < 33) return undefined;
+      const [plain] = await c.keys.decrypt([
+        { ciphertext: frame.body.slice(33), viewingPublicKey: c.keys.address().viewingPublicKey, txViewingPublicKey: X25519PublicKey.fromBytes(txViewingPk), salt: salt as never, slotIndex, label: "transfer" },
+      ]);
+      const v = decodeConfidential(plain!);
+      return { mint: addressBytes(c.wallet.registry.resolve(v.assetId)), amount: v.amount, blinding: new Uint8Array(v.blinding), plain: v.ringProgramId === undefined && v.data.records().length === 0 };
+    },
     async decode(note: NoteOpening, leafIndex: bigint) {
       const c = await ctx();
       const { owner } = await userPda(c.payer, c.programId);
@@ -315,7 +326,8 @@ export function createLendSeams(ctx: () => Promise<LendContext>) {
     const c = await ctx();
     const me = c.keys.address();
     const { owner } = await userPda(c.payer, c.programId);
-    return { user: me.toBytes(), pda: owner.address(me.viewingPublicKey).toBytes(), viewing: me.viewingPublicKey.toBytes() };
+    const tags = [new Uint8Array(me.viewingPublicKey.x()), new Uint8Array(me.signingPublicKey.confidentialViewTag())];
+    return { user: me.toBytes(), pda: owner.address(me.viewingPublicKey).toBytes(), viewing: me.viewingPublicKey.toBytes(), tags };
   };
 
   return { build, chain, wasm, owners };
