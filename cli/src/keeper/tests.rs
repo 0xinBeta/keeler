@@ -1001,7 +1001,7 @@ fn racing_builds_on_one_reserve_resolve_by_output_hash() {
     let book = k.snapshot().unwrap();
     assert!(book.pending.is_empty());
     assert_eq!(book.reserve.as_ref().unwrap().hash, winner.notes[0].hash);
-    assert_eq!(book.reserve.as_ref().unwrap().leaf.is_some(), true);
+    assert!(book.reserve.as_ref().unwrap().leaf.is_some());
     let pos: PositionState = book.positions[0].state().unwrap();
     assert_eq!(pos.debt_shares, 0, "a's draw did not land");
     // A full redeem leaves an empty receipt out of the book... the fake's
@@ -1041,7 +1041,12 @@ fn redeem_takes_amount_or_shares() {
 #[test]
 fn shares_redeem_pays_what_burns_exactly_those_shares() {
     use keeler_lend_sdk::builders::redeem_amount_for_shares;
-    for price in [1_000_000_000_000u64, 1_000_000_000_001, 1_234_567_890_123, 3_000_000_000_000] {
+    for price in [
+        1_000_000_000_000u64,
+        1_000_000_000_001,
+        1_234_567_890_123,
+        3_000_000_000_000,
+    ] {
         let r = ReserveState {
             supply_price: price,
             ..fresh_reserve(u64::MAX / 4, 0)

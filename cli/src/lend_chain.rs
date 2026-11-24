@@ -361,7 +361,7 @@ impl LendChain {
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    ensure!(s.len() % 2 == 0, "odd hex");
+    ensure!(s.len().is_multiple_of(2), "odd hex");
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(Into::into))
         .collect()
@@ -373,6 +373,7 @@ fn hex_array<const N: usize>(s: &str) -> Result<[u8; N]> {
 
 /// Data-bearing confidential slots with their decryption index, as the swap
 /// SDK counts them, and the raw payload for the writer key.
+#[allow(clippy::type_complexity)]
 fn slots(tx: &ShieldedTransaction) -> Vec<(u32, [u8; 32], u64, [u8; 32], Vec<u8>, Vec<u8>)> {
     let mut next = 0u32;
     let mut out = Vec::new();
@@ -593,6 +594,7 @@ impl Ledger for LendChain {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn build(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built> {
         let salt = u128::from_le_bytes({
             let mut b = [0; 16];

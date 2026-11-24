@@ -225,6 +225,7 @@ fn spawn_dealer_with(net: &Net, test: u16, actor: u8, t: Terms, http: Option<Htt
         pubkey: Some(fixture::actor(actor).pubkey().to_string()),
         auto_pause_after: None,
         min_fee_lamports: None,
+        lend: None,
     };
     cfg.check().unwrap();
     let stop = Arc::new(AtomicBool::new(false));

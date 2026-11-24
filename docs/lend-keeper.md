@@ -35,6 +35,11 @@ The keeper runs inside the dealer, on the dealer's HTTP server, when the dealer 
 }
 ```
 
+On devnet `scripts/run-dealer.sh <config>` runs it: for a config with `lend` it builds the binary
+with the lend deploy's build parameters (from `target/devnet-<name>/program-id`, the swap deploy
+summary and the `keeler-devnet-deploy` Keychain item) in `target/devnet-<name>/dealer-cargo`; the
+keeper is the dealer key, and the Worker still gets only `DEALERS`.
+
 Or alone, with no swap program: `keeler keeper <config>`, where the config is
 
 ```json

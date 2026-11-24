@@ -227,7 +227,7 @@ pub struct Note {
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    ensure!(s.len() % 2 == 0, "odd hex");
+    ensure!(s.len().is_multiple_of(2), "odd hex");
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(Into::into))
         .collect()
@@ -500,6 +500,7 @@ pub trait Ledger: Sync {
     fn spent(&self, nullifiers: &[[u8; 32]]) -> Result<Vec<bool>>;
     /// The output hashes and leaf indices of the transaction that spent
     /// `nullifier`; `None` until the indexer has it.
+    #[allow(clippy::type_complexity)]
     fn spender(&self, nullifier: &[u8; 32]) -> Result<Option<Vec<([u8; 32], u64)>>>;
     /// Intents under `wallet`'s user PDA the keeper's viewing key opens,
     /// unspent.
@@ -1564,16 +1565,14 @@ fn apply(book: &mut Book, p: &Pending, outs: &[([u8; 32], u64)]) {
         match n.kind {
             KIND_RESERVE => book.reserve = Some(n),
             // A receipt redeemed in full holds nothing.
-            KIND_RECEIPT => {
-                if n.state::<ReceiptState>().is_ok_and(|s| s.supply_shares > 0) {
-                    book.receipts.push(n)
-                }
+            KIND_RECEIPT if n.state::<ReceiptState>().is_ok_and(|s| s.supply_shares > 0) => {
+                book.receipts.push(n)
             }
-            KIND_POSITION => {
-                // A position left with nothing in it is closed by its owner, if at all.
-                if n.amount > 0 || n.state::<PositionState>().is_ok_and(|s| s.debt_shares > 0) {
-                    book.positions.push(n)
-                }
+            // A position left with nothing in it is closed by its owner, if at all.
+            KIND_POSITION
+                if n.amount > 0 || n.state::<PositionState>().is_ok_and(|s| s.debt_shares > 0) =>
+            {
+                book.positions.push(n)
             }
             _ => {}
         }

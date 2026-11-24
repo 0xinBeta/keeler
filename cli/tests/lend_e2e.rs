@@ -453,11 +453,11 @@ fn debt(k: &Keeper<Probe>, owner: &Address, id: u64, now: u64) -> u64 {
 fn session<T>(
     probe: &Probe,
     cfg: &Lend,
-    state: &PathBuf,
+    state: &std::path::Path,
     f: impl FnOnce(&Keeper<Probe>) -> Result<T>,
 ) -> Result<T> {
     let signer = fixture::actor(0);
-    let k = Keeper::open(cfg, probe, &signer, state.clone())?;
+    let k = Keeper::open(cfg, probe, &signer, state.to_path_buf())?;
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], HTTP_PORT)))?;
     let stop = AtomicBool::new(false);
     thread::scope(|s| {
