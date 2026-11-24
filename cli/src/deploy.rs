@@ -631,16 +631,17 @@ impl ProgramPlan {
 
 /// Lamports as SOL, exactly.
 pub fn sol(lamports: u64) -> String {
-    format!("{}.{:09} SOL", lamports / 1_000_000_000, lamports % 1_000_000_000)
+    format!(
+        "{}.{:09} SOL",
+        lamports / 1_000_000_000,
+        lamports % 1_000_000_000
+    )
 }
 
 /// What a fresh deploy of `so_bytes` costs `payer`, with its balance; reads
 /// rent from the chain and needs no key.
 pub fn estimate(rpc: &SolanaRpc, payer: &Address, so_bytes: usize) -> Result<Estimate> {
-    let rent = |len| {
-        rpc.get_minimum_balance_for_rent_exemption(len)
-            .map_err(err)
-    };
+    let rent = |len| rpc.get_minimum_balance_for_rent_exemption(len).map_err(err);
     let buffer_rent = rent(BUFFER_HEADER + so_bytes)?;
     let program_data_rent = rent(PROGRAM_DATA_HEADER + so_bytes)?;
     let program_rent = rent(PROGRAM_LEN)?;

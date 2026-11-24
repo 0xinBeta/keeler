@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Deploys Keeler Lend to devnet as deployment <name> (default lend). NOT TO
+# BE RUN until the owner approves the SOL it needs: run with --estimate
+# first, which sends nothing. Safe to rerun after any failure: the deploy
+# resumes from its buffer and a finished one sends nothing.
+#
+#   scripts/deploy-lend-devnet.sh [--estimate] [name]
+#
+# 1. Creates the Keychain items keeler-devnet-<name>-program and
+#    keeler-devnet-<name>-buffer if absent. The funded keeler-devnet-deploy
+#    (the admin) and keeler-devnet-dealer (the keeper) must exist, and the
+#    dealer must be the one in target/devnet/deploy-summary.json, whose tSOL
+#    and tUSD become vault 1's collateral and debt mints.
+# 2. Builds the program once with those addresses compiled in and the
+#    test-price feature (the keeper sets the price; Pyth's devnet feeds are
+#    not used), and keeps that .so: reruns deploy the same bytes.
+# 3. Runs the deploy tool (cli/examples/deploy.rs `program`), which refuses
+#    any cluster but devnet and stops before sending if the deploy wallet
+#    holds less than the deploy still needs.
+#
+# Writes only target/devnet-<name>/: plan.json, summary.json, program-id,
+# keeler_lend.so, deploy.log, and the build directories build/ and cargo/.
+# Needs: security (macOS), python3, the main checkout's .tools/env, and the
+# Helius key in the Keychain item keeler-helius-api-key.
+set -euo pipefail
+
+estimate=false
+[[ ${1:-} == --estimate ]] && { estimate=true; shift; }
+name=${1:-lend}
+[[ $name =~ ^[a-z0-9-]{1,32}$ ]] || { echo "deployment name '$name': lowercase letters, digits and -" >&2; exit 1; }
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+out=$root/target/devnet-$name
+mkdir -p "$out"
+# Nothing here should print the Helius key; this catches it if a tool does.
+redact() { perl -pe 'BEGIN { $| = 1 } s/api-key=[^&"\s]+/api-key=REDACTED/g'; }
+exec > >(redact) 2> >(redact | tee -a "$out/deploy.log" >&2)
+
+have() { security find-generic-password -s "$1" >/dev/null 2>&1; }
+# The secret goes to security on stdin, never on a command line or in a file.
+store() { printf 'add-generic-password -s "%s" -a keeler -w "%s"\n' "$1" "$2" | security -i >/dev/null; }
+# The public key is bytes 32..64 of the keypair array, read from a pipe.
+address_of() {
+    security find-generic-password -s "$1" -w | python3 -c '
+import json, sys
+b = bytes(json.load(sys.stdin))[32:64]
+n = int.from_bytes(b, "big")
+abc = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+s = ""
+while n:
+    n, r = divmod(n, 58)
+    s = abc[r] + s
+print("1" * (len(b) - len(b.lstrip(b"\0"))) + s)'
+}
+is_address() { [[ $1 =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]]; }
+
+swap=$root/target/devnet/deploy-summary.json
+[[ -f $swap ]] || { echo "no $swap: the swap deploy (scripts/deploy-devnet.sh) gives the dealer and the mints" >&2; exit 1; }
+summary_field() { python3 -c 'import json, sys; s = json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, {"s": s}))' "$swap" "$1"; }
+keeper=$(summary_field 's["dealer"]')
+collateral=$(summary_field '{m: a for m, a, _ in s["mints"]}["tSOL"]')
+debt=$(summary_field '{m: a for m, a, _ in s["mints"]}["tUSD"]')
+for item in deploy dealer; do
+    have "keeler-devnet-$item" || { echo "no Keychain item keeler-devnet-$item" >&2; exit 1; }
+done
+admin=$(address_of keeler-devnet-deploy)
+# The keeper compiled in must be the key the dealer runs with, or every
+# keeper instruction fails on chain.
+[[ $(address_of keeler-devnet-dealer) == "$keeper" ]] || { echo "keeler-devnet-dealer is not the dealer $keeper in $swap" >&2; exit 1; }
+
+# shellcheck source=/dev/null
+. "$root/.tools/env"
+tool_target=$out/cargo
+tool=$tool_target/release/examples/deploy
+# Its own target, so the live dealer's target/release is left alone.
+CARGO_TARGET_DIR=$tool_target cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --example deploy
+
+for item in program buffer; do
+    if ! have "keeler-devnet-$name-$item"; then
+        json=$("$tool" keygen)
+        # An empty or broken item would block every rerun.
+        [[ $json =~ ^\[([0-9]{1,3},){63}[0-9]{1,3}\]$ ]] || { echo "keygen gave no keypair" >&2; exit 1; }
+        store "keeler-devnet-$name-$item" "$json"
+        echo "created Keychain item keeler-devnet-$name-$item" >&2
+    fi
+done
+program_id=$(address_of "keeler-devnet-$name-program")
+for a in "$program_id" "$admin" "$keeper" "$collateral" "$debt"; do
+    is_address "$a" || { echo "'$a' is not a base58 address" >&2; exit 1; }
+done
+if [[ -f $out/program-id && $(cat "$out/program-id") != "$program_id" ]]; then
+    echo "$out was built for $(cat "$out/program-id"), the Keychain holds $program_id; use another deployment name" >&2
+    exit 1
+fi
+
+so=$out/keeler_lend.so
+if [[ ! -f $so ]]; then
+    # The devnet price comes from the keeper's test price account, so the
+    # build must have test-price (a default feature today; this catches a change).
+    grep -qE '^default = \[.*"test-price"' "$root/lend/program/Cargo.toml" ||
+        { echo "lend/program's default features no longer include test-price" >&2; exit 1; }
+    before=$(git -C "$root" status --porcelain --untracked-files=no)
+    # The Pyth price account and feed stay at their defaults: unused when
+    # the test price account is passed.
+    KEELER_LEND_PROGRAM_ID=$program_id KEELER_LEND_ADMIN=$admin KEELER_LEND_KEEPER=$keeper \
+        KEELER_LEND_VAULT1_COLLATERAL_MINT=$collateral KEELER_LEND_VAULT1_DEBT_MINT=$debt \
+        KEELER_LEND_OUT=$out/build "$root/scripts/setup-lend.sh"
+    [[ $(git -C "$root" status --porcelain --untracked-files=no) == "$before" ]] ||
+        { echo "the build changed tracked files; nothing deployed" >&2; exit 1; }
+    cp "$out/build/deploy/keeler_lend.so" "$so.tmp"
+    mv "$so.tmp" "$so"
+    printf '%s\n' "$program_id" >"$out/program-id"
+fi
+
+python3 - "$out/plan.json" "$name" "$so" <<'EOF'
+import json, sys
+plan = {
+    "name": sys.argv[2],
+    "network": {
+        "rpc_url": "https://devnet.helius-rpc.com",
+        "indexer_url": "https://devnet.helius-rpc.com/v1/spr",
+        "prover": {"helius": {"keychain": "keeler-helius-api-key"}},
+    },
+    "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "deploy_key": {"keychain": "keeler-devnet-deploy"},
+    "program_key": {"keychain": f"keeler-devnet-{sys.argv[2]}-program"},
+    "buffer_key": {"keychain": f"keeler-devnet-{sys.argv[2]}-buffer"},
+    "program_so": sys.argv[3],
+}
+open(sys.argv[1], "w").write(json.dumps(plan, indent=2) + "\n")
+EOF
+
+echo "$name: program $program_id, admin $admin, keeper $keeper, tSOL $collateral, tUSD $debt" >&2
+if $estimate; then
+    "$tool" estimate "$out/plan.json"
+    exit 0
+fi
+"$tool" program "$out/plan.json" >"$out/summary.json.tmp"
+mv "$out/summary.json.tmp" "$out/summary.json"
+echo "wrote $out/summary.json; next: docs/lend-deploy.md, after the deploy" >&2

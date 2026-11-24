@@ -38,7 +38,11 @@ fn env_path(name: &str) -> PathBuf {
 
 fn key_file(dir: &Path, name: &str, kp: &Keypair) -> KeySource {
     let path = dir.join(format!("{name}.json"));
-    std::fs::write(&path, serde_json::to_string(&kp.to_bytes().to_vec()).unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_string(&kp.to_bytes().to_vec()).unwrap(),
+    )
+    .unwrap();
     KeySource::File(path)
 }
 
@@ -94,11 +98,7 @@ fn deploy_one_program_resumes_and_refuses() {
         e.peak,
         e.buffer_rent + e.program_data_rent + e.program_rent + e.fees
     );
-    eprintln!(
-        "lend .so {} bytes: peak {}",
-        so.len(),
-        deploy::sol(e.peak)
-    );
+    eprintln!("lend .so {} bytes: peak {}", so.len(), deploy::sol(e.peak));
     let fund = |lamports: u64| {
         let ixs = faucet::instructions(&rich.pubkey(), &deployer.pubkey(), &[], lamports);
         deploy::send(&rpc, &ixs, &rich, &[&rich]).unwrap();
@@ -146,7 +146,10 @@ fn deploy_one_program_resumes_and_refuses() {
     let mut changed = so.clone();
     *changed.last_mut().unwrap() ^= 1;
     std::fs::write(&other, &changed).unwrap();
-    let msg = format!("{:#}", deploy::deploy_one(&plan(&genesis, &other)).unwrap_err());
+    let msg = format!(
+        "{:#}",
+        deploy::deploy_one(&plan(&genesis, &other)).unwrap_err()
+    );
     assert!(msg.contains("other bytes"), "{msg}");
     assert_eq!(balance(), before);
 }
