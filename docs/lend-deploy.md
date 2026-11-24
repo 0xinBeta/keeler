@@ -48,11 +48,40 @@ The keeper sets the devnet price with the `set_test_price` command (instruction 
 `keeler_lend_sdk::vault::set_test_price`): price in debt base units per collateral base unit x
 1e12 (tSOL at 150 tUSD is `150_000_000_000`), a confidence in the same units, and the publish time.
 The first call creates the account, with the keeper paying its rent. `draw` and `liquidate` refuse a
-price older than 90 seconds, so the keeper must refresh it at least that often. Moving it down is how
-a liquidation is triggered by hand.
+price older than 90 seconds; the running keeper re-posts it every `price_refresh_secs` (default 45,
+`docs/lend-keeper.md`), each post a transaction fee. `keeler lend-set-price` sets the value the
+keeper keeps posting; moving it down is how a liquidation is triggered by hand.
 
-## After
+## After: the checklist
 
-The program still needs its reserves and vault set up by the keeper, and the Worker needs
-`LEND_PROGRAM_ID`, `LEND_POOLS` and `LEND_VAULTS` (`docs/lend-api.md`). The keeper is the dealer
-(the Worker forwards `/api/lend/*` to the first `DEALERS` entry).
+In order. **SOL** marks a step that spends SOL from a Keychain key; **public** one that changes what
+others see or use. Nothing here is done by the deploy script.
+
+1. **Keeper config.** Add a `lend` section to the dealer config (`docs/lend-keeper.md`):
+   `program_id` from `target/devnet-<name>/summary.json`, `network` equal to the Worker's
+   `NETWORK` (`devnet`), `key` the dealer's Keychain item, `admin_key` the `keeler-devnet-deploy`
+   item, `state_file`, `pause_file`, `price: "test"`, `price_refresh_secs` (45), `limits`. Check
+   that `limits.min_*` are not below the vault's minimums in `LEND_VAULTS`.
+2. **Reserve** (**SOL**, once): `keeler lend-init-reserve <config>`. The keeper pays the fee and the
+   admin co-signs. A second run refuses: the reserve exists.
+3. **First test price** (**SOL**: the account's rent and a fee): `keeler lend-set-price <config> 1
+   <price> <confidence>`, for example `150000000000 150000000` for 150 tUSD per tSOL with 0.1 %
+   confidence. It also writes the control file the keeper keeps posting.
+4. **Start the keeper** (**SOL**: a fee per price refresh, about one every 45 s, and the fees of
+   its fills and liquidations): `scripts/run-dealer.sh <config>`. Check its log shows the price
+   being posted and `GET /health` answers.
+5. **Fund the keeper's debt token** (moves tokens): shield enough tUSD to the keeper for
+   liquidations (at least the largest position's debt) and keep its SOL topped up.
+6. **Seed the pool** (**SOL**, moves tokens, **public**: the pool's figures change): a first
+   supply from a lender wallet through the page or the SDK, at least `minSupply`, so there is
+   something to borrow.
+7. **Worker variables** (**public**): set `LEND_PROGRAM_ID`, `LEND_POOLS` and `LEND_VAULTS`
+   (`worker/README.md`; the pool's curve, fee, max utilisation and minimum, and the vault's
+   factors and minimums exactly as compiled into the program), keep the keeper as the first
+   `DEALERS` entry, and `REFERENCE` or `PYTH_ACCOUNTS` for the page's fallback price. Optionally
+   the `LEND_*_LIMIT` rate limits. Deploy the Worker.
+8. **Site build** (**public**): `VITE_NETWORK=devnet`, `VITE_DEALERS`, `VITE_LEND_PROGRAM_ID` (the
+   program ID) and `VITE_LEND_KEEPER` (the keeper's pubkey), then `pnpm build` in `web/` and
+   deploy. The page reads the pools and vaults from `/api/config`.
+9. **Check**: open the Earn tab (the pool shows its figures and the price), make a small deposit,
+   borrow, repay all and close from a second wallet.

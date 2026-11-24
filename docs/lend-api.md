@@ -24,9 +24,9 @@ They hold note openings (amount, blinding, state) and transaction signatures, ne
 | Route | Method | Signed | Request | Reply |
 | --- | --- | --- | --- | --- |
 | `/lend/pools` | GET | no | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
-| `/lend/account` | GET | yes | query: the signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}` |
+| `/lend/account` | GET | yes | query: the signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}], index?: {supply, borrow, at}}` |
 | `/lend/ticket` | POST | yes | signed fields, `purpose`, `amount`, and `pool` (supply) or `vault` + `position` (deposit, repay) | `{id, expiry, signature}` |
-| `/lend/build` | POST | yes | signed fields, `op`; redeem: `pool` and exactly one of `amount`, `shares`; draw: `vault`, `position`, `borrow`, `withdraw` | `{transaction, outputs, now, bound?, index?}` |
+| `/lend/build` | POST | yes | signed fields, `op`; redeem: `pool`, exactly one of `amount`, `shares`, and optionally `receipt`; draw: `vault`, `position`, `borrow`, `withdraw` | `{transaction, outputs, now, bound?, index?}` |
 
 Amounts are decimal strings of base units (u64). `vault` is a number, `position` a decimal string
 of a u63.
@@ -37,22 +37,40 @@ of a u63.
   note opening, `amount u64 LE ‖ blinding [32] ‖ state` (the Borsh `ReceiptState` or
   `PositionState`). The page trusts none of it: it recomputes the note's hash under its own user
   PDA, checks the note is appended and unspent, and decodes the state with the WASM before using it.
-  `intents` are not used (the page finds its intents on chain).
+  `intents` are not used (the page finds its intents on chain). A wallet may hold several receipts
+  in one pool (each supply fill makes one); the page keeps and sums them all, keyed by note hash,
+  and drops a receipt of zero shares or a position of no collateral and no debt. `index` (when the
+  pool has a reserve) is the pool's supply and borrow price index accrued to chain time `at`, decimal
+  strings, 1e12-scaled; the page takes it only if it is not below the last index it saw and not
+  above that index grown at the curve's top rate for the time between.
 - **ticket**: `id` is 32 lowercase hex (16 bytes), `expiry` unix seconds, `signature` the keeper's
   Ed25519 signature over the ticket bytes below. The page refuses a ticket whose expiry is not
   between 60 s and 900 s after chain time.
-- **build**: `transaction` is a base64 wire transaction (at most 4,096 bytes), the keeper as fee
+- **build**: `transaction` is a base64 wire transaction (at most 4,096 bytes: the v1 message
+  followed by its signatures, what `@solana/kit`'s `getTransactionDecoder` reads and `sendTransaction`
+  takes; not a bincode or serde encoding of `VersionedTransaction`), the keeper as fee
   payer, signed by the keeper, waiting for the owner's signature. `outputs` are the transaction's
   output hashes in slot order (64 hex each). `now` is the `now` in the instruction args. `bound`
   (draw) is the price bound in the args, 1e12-scaled. `index` is the pool's price index the
   transaction used, 1e12-scaled (supply index for redeem, borrow index for draw); the page needs it
-  to recompute the owner's new note state and refuses a build without it.
+  to recompute the owner's new note state and refuses a build without it, and keeps it only once
+  the transaction passed its check.
 - **redeem by `amount` or `shares`**: with `amount` the keeper pays exactly that and burns
   `shares_to_burn(amount, index)` (rounded up). With `shares` (a decimal string, the same rules as an
   amount) it burns exactly that many and pays `assets_of(shares, index)` (rounded down). The page
   sends `shares` to withdraw everything, so the receipt ends at zero shares, and `amount` for a
   partial withdrawal. It checks the payout is `assets_of(shares, index)` and the new receipt holds
   `held − shares`. The Worker refuses a redeem with both or neither, and `shares` on a draw.
+- **`receipt`** (redeem only, 64 lowercase hex): the note hash of the receipt to spend. The page
+  sends it, so the receipt it checks against is the one the keeper spends; the keeper answers 404
+  when it holds no such receipt for the wallet. Without it the keeper picks the smallest receipt
+  that covers the request (the largest, for `shares`). The Worker refuses it on a draw.
+- **price**: on test networks `draw` and `liquidate` read the vault's test price account (PDA
+  `["price", vault u64 LE]` of the lend program, 24 bytes: price u64, confidence u64, publish time
+  i64, little-endian). The page reads that account through `/api/rpc` (`getAccountInfo`) for the
+  vault's price, falling back to `/api/prices` where there is none, so its limits and its bound
+  check use what the program reads. It sizes borrowing and withdrawals at
+  `(price − confidence) × (1 − 0.5 %)`, the keeper's default draw bound.
 
 ## Session authorisation
 

@@ -19,6 +19,7 @@ The keeper runs inside the dealer, on the dealer's HTTP server, when the dealer 
   "state_file": "/Users/me/.local/state/keeler/keeper.json",
   "pause_file": "/Users/me/.local/state/keeler/lend.pause",
   "price": "test",
+  "price_refresh_secs": 45,
   "limits": {
     "min_supply": 1000000,
     "min_collateral": 10000000,
@@ -60,6 +61,7 @@ Or alone, with no swap program: `keeler keeper <config>`, where the config is
 | `state_file` | Default `~/.local/state/keeler/keeper-<keeper pubkey>.json` |
 | `pause_file` | While this file exists: no new supply tickets or fills, no deposit tickets or fills that open a position, no borrowing |
 | `price` | `test`: the vault's test price account (local networks, devnet). `pyth`: the vault's Pyth `PriceUpdateV2` account compiled into the program |
+| `price_refresh_secs` | `price: "test"` only: how often the keeper re-posts the test price (5 to 80, default 45; the program refuses a price older than 90 s, the keeper's own draws one older than 60 s) |
 | `limits.min_*` | Ticket minimums; the program's own minimums are the floor |
 | `limits.tickets_per_wallet_hour` | Tickets one wallet may take in an hour |
 | `limits.max_open_intents` | Open (unfilled, unexpired) tickets across all wallets |
@@ -83,7 +85,18 @@ significant figures, recomputed at most once per bucket.
 | --- | --- |
 | `keeler keeper <keeper config>` | The keeper and its HTTP routes without a dealer |
 | `keeler lend-init-reserve <keeper config>` | Creates the pool's reserve once; the keeper pays, `lend.admin_key` co-signs |
-| `keeler lend-set-price <keeper config> <vault> <price> <confidence>` | Writes the vault's test price (debt base units per collateral base unit x 1e12, so $10 per tSOL in tUSD is `10000000000`). Refused when `network` is `mainnet`; the program refuses it in a build without `test-price` |
+| `keeler lend-set-price <keeper config> <vault> <price> <confidence>` | Writes the vault's test price (debt base units per collateral base unit x 1e12, so $10 per tSOL in tUSD is `10000000000`) and saves it as the value a running keeper keeps posting. Refused when `network` is `mainnet` or `price` is not `test`; the program refuses it in a build without `test-price` |
+
+## The test price
+
+With `price: "test"` (never on mainnet: the keeper refuses `test` there, and refuses to post a price
+with `pyth`) the keeper keeps the vault's test price fresh: before each pass, when the account is
+older than `price_refresh_secs` or does not hold the wanted value, it posts it again with chain time
+as the publish time. The wanted value is the control file `<state_file without extension>.price.json`
+(`{"vault", "price", "confidence"}`, mode 0600) that `keeler lend-set-price` writes, else the price
+already on chain. So `lend-set-price` moves the price a running keeper keeps (how a liquidation is
+triggered by hand), and the keeper never invents a price: with no control file and no account it
+posts nothing. Each post costs a transaction fee.
 
 ## The queue
 
@@ -148,7 +161,7 @@ made before it (their makers refund after expiry) and the account view shows no 
   record of tickets and of builds in flight. (An empty file is recoverable from the chain; a wrong
   one is not.)
 - Put the keeper or admin key in a file or the config. Use the Keychain (`{"keychain": "..."}`).
-- Run with `price: "test"` on mainnet, or expose the HTTP port beyond loopback; the Worker is the
+- Run with `price: "test"` on mainnet (the keeper refuses to), or expose the HTTP port beyond loopback; the Worker is the
   only client.
 - Let the keeper's debt-token balance run out: liquidations need it. Keep at least the largest
   position's debt in its private balance.
