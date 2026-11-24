@@ -106,18 +106,27 @@ impl ProofAuthority for Authority<'_> {
     }
 }
 
-/// Proves the SPP side through `indexer` and checks it covers the same
-/// transaction as the program proof.
+/// Proves the SPP side through `indexer` (whose prover is always the local
+/// one) and checks it covers the same transaction as the program proof.
 pub fn prove_transact(
     indexer: &SprIndexer,
     spp: SppProofInputs,
     wallet: &ShieldedKeypair,
 ) -> Result<(TransactIxData, Vec<Address>)> {
+    prove_transact_with(spp, |spp| {
+        indexer.prove_transact(spp, &Authority(wallet)).map_err(err)
+    })
+}
+
+/// [`prove_transact`] through any SPP prover, such as an `SprClient`'s
+/// configured one (`client.prove_transact(spp, None, &Authority(wallet))`).
+pub fn prove_transact_with(
+    spp: SppProofInputs,
+    prover: impl FnOnce(SppProofInputs) -> Result<TransactIxData>,
+) -> Result<(TransactIxData, Vec<Address>)> {
     let owners = spp.owner_signer_pubkeys().map_err(err)?;
     let hash = spp.padding_independent_private_tx_hash().map_err(err)?;
-    let ix = indexer
-        .prove_transact(spp, &Authority(wallet))
-        .map_err(err)?;
+    let ix = prover(spp)?;
     ensure!(
         ix.private_tx_hash == hash,
         "the SPP proof and the lend proof cover different transactions"

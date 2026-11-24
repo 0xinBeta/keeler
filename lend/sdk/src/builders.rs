@@ -5,6 +5,7 @@ use anyhow::Result;
 use solana_address::Address;
 use solana_instruction::{AccountMeta, Instruction};
 use spr_client::SprIndexer;
+use spr_interface::instruction::instruction_data::transact::TransactIxData;
 use spr_keypair::{ShieldedKeypair, X25519Pubkey};
 use spr_program::{CompressedProof, ProgramProofInputs, ProgramTransaction, TransactionOptions};
 use spr_transaction::{
@@ -20,7 +21,8 @@ use keeler_lend::circuits::{
 use crate::{
     decode, err, identity, instruction, mint_halves, pool_pda,
     proof::{self, CircuitId},
-    prove_transact, tag, user_pda, CancelIntentArgs, InitReserveArgs, IntentArgs, IntentState,
+    prove_transact, prove_transact_with, tag, user_pda, CancelIntentArgs, InitReserveArgs,
+    IntentArgs, IntentState,
 };
 
 mod earn;
@@ -102,7 +104,19 @@ impl Prepared {
         tree: Address,
         wallet: &ShieldedKeypair,
     ) -> Result<Instruction> {
-        let (spp, owners) = prove_transact(indexer, self.spp, wallet)?;
+        self.prove_with(tree, |spp| {
+            prove_transact(indexer, spp, wallet).map(|(ix, _)| ix)
+        })
+    }
+
+    /// [`Self::prove`] with the SPP side proved by `prover` (a remote prover,
+    /// say), checked against the transaction.
+    pub fn prove_with(
+        self,
+        tree: Address,
+        prover: impl FnOnce(SppProofInputs) -> Result<TransactIxData>,
+    ) -> Result<Instruction> {
+        let (spp, owners) = prove_transact_with(self.spp, prover)?;
         let proof = proof::prove(self.circuit, &self.proof_inputs)?;
         instruction(
             self.ix_tag,
