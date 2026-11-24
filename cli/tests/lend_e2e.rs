@@ -103,6 +103,9 @@ impl Ledger for Probe<'_> {
     fn quote(&self, v: u64) -> Result<Quote> {
         self.inner.quote(v)
     }
+    fn set_price(&self, v: u64, price: u64, conf: u64) -> Result<String> {
+        self.inner.set_price(v, price, conf)
+    }
     fn build(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built> {
         let b = self.inner.build(job, reserve, now)?;
         self.builds.lock().unwrap().push(b.pending.op);
@@ -345,7 +348,7 @@ impl Env {
         }
         let wire = B64.decode(v["transaction"].as_str().context("no transaction")?)?;
         ensure!(wire.len() <= 4096, "transaction too large");
-        let mut tx: VersionedTransaction = bincode::deserialize(&wire)?;
+        let mut tx: VersionedTransaction = wincode::deserialize(&wire)?;
         let keys = tx.message.static_account_keys().to_vec();
         ensure!(keys[0] == self.keeper_key.pubkey(), "the keeper pays");
         let i = keys

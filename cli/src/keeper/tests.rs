@@ -32,6 +32,8 @@ struct World {
     next: u64,
     /// Checked at each send: the state file must already hold the build.
     state: Option<PathBuf>,
+    /// Test prices posted: (vault, price, confidence).
+    posted: Vec<(u64, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -188,6 +190,16 @@ impl Ledger for Fake {
     }
     fn quote(&self, _: u64) -> Result<Quote> {
         self.w().quote.ok_or_else(|| anyhow!("no price"))
+    }
+    fn set_price(&self, vault: u64, price: u64, confidence: u64) -> Result<String> {
+        let mut w = self.w();
+        w.posted.push((vault, price, confidence));
+        w.quote = Some(Quote {
+            low: price.saturating_sub(confidence),
+            high: price + confidence,
+            published: w.now as i64,
+        });
+        Ok("price".into())
     }
     fn build(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built> {
         let mut w = self.w();
@@ -1039,6 +1051,42 @@ fn redeem_takes_amount_or_shares() {
 }
 
 #[test]
+fn redeem_spends_the_receipt_the_page_names() {
+    let s = Setup::new("named", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    fund_intent(&s, &k, &lender, purpose::SUPPLY, 1, 5 * USD);
+    assert_eq!(drain(&k), vec![Op::Supply]);
+    let book = k.snapshot().unwrap();
+    assert_eq!(book.receipts.len(), 2);
+    // The bigger receipt, named: the keeper would otherwise pick the smaller.
+    let big = book
+        .receipts
+        .iter()
+        .max_by_key(|r| r.state::<ReceiptState>().unwrap().supply_shares)
+        .unwrap();
+    let req = |h: &str| {
+        [
+            ("op", "redeem".to_owned()),
+            ("pool", vault1().debt_mint.to_string()),
+            ("amount", USD.to_string()),
+            ("receipt", h.to_owned()),
+        ]
+    };
+    assert_eq!(build_req(&k, &lender, &req(&h("nope", 1))).0, 404);
+    assert_eq!(build_req(&k, &lender, &req("zz")).0, 400);
+    let (st, v) = build_req(&k, &lender, &req(&big.hash));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(k.snapshot().unwrap().pending[0].inputs[1], big.nullifier);
+    // The account view states the pool's indices at chain time.
+    let f = lender.signed("GET", "/lend/account", &[], now_of(&k));
+    let (st, v) = k.http("GET", &query(&f), b"");
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["index"]["supply"], json!("1000000000000"));
+    assert_eq!(v["index"]["at"], json!(now_of(&k)));
+}
+
+#[test]
 fn shares_redeem_pays_what_burns_exactly_those_shares() {
     use keeler_lend_sdk::builders::redeem_amount_for_shares;
     for price in [
@@ -1245,4 +1293,50 @@ fn config_limits_are_checked() {
     main.network = "mainnet".into();
     assert!(main.check().is_err(), "the test price on mainnet");
     assert!(require_test_network(&main).is_err());
+    assert!(require_test_network(&lend_cfg(r#","price":"pyth""#)).is_err());
+    assert!(lend_cfg(r#","price_refresh_secs":90"#).check().is_err());
+}
+
+#[test]
+fn the_test_price_is_kept_fresh_and_follows_the_control_file() {
+    let s = Setup::new("price", r#","price_refresh_secs":45"#);
+    let k = s.keeper();
+    let posted = || s.fake.w().posted.clone();
+    // Fresh (published at T0): nothing to do.
+    assert!(!k.refresh_price().unwrap());
+    s.fake.advance(44);
+    assert!(!k.refresh_price().unwrap());
+    // 45 s old: the same price again.
+    s.fake.advance(1);
+    assert!(k.refresh_price().unwrap());
+    assert_eq!(posted(), vec![(1, 10 * DOLLAR, 10_000_000)]);
+    assert!(!k.refresh_price().unwrap());
+    // `keeler lend-set-price` names a new price: posted at once, then kept.
+    let want = TestPrice {
+        vault: 1,
+        price: 6 * DOLLAR,
+        confidence: 1_000,
+    };
+    write_private(&price_file(&s.state), &serde_json::to_vec(&want).unwrap()).unwrap();
+    assert!(k.refresh_price().unwrap());
+    assert!(!k.refresh_price().unwrap());
+    s.fake.advance(45);
+    assert!(k.refresh_price().unwrap());
+    assert_eq!(
+        posted()[1..],
+        [(1, 6 * DOLLAR, 1_000), (1, 6 * DOLLAR, 1_000)]
+    );
+    // No price on chain and no file: nothing to post.
+    std::fs::remove_file(price_file(&s.state)).unwrap();
+    s.fake.w().quote = None;
+    assert!(!k.refresh_price().unwrap());
+}
+
+#[test]
+fn the_price_is_never_posted_with_pyth() {
+    let s = Setup::new("price-pyth", r#","price":"pyth""#);
+    let k = s.keeper();
+    s.fake.advance(600);
+    assert!(!k.refresh_price().unwrap());
+    assert!(s.fake.w().posted.is_empty());
 }
