@@ -141,7 +141,7 @@ test("borrow: open, borrow, repay, withdraw, liquidation, repay all and close", 
   await expect(p.locator(".position .badge")).toHaveText("Liquidatable", { timeout: 4000 });
   await shot(page, info, "06-liquidatable", "panel");
   await expect(p.getByText(/^Liquidated /)).toBeVisible({ timeout: 15_000 });
-  await expect(p.getByText(/The position is back at 85% and the rest is still yours\./)).toBeVisible();
+  await expect(p.getByText(/The position is back to 85% or less, and the rest is still yours\./)).toBeVisible();
   await expect(meter).toHaveAttribute("aria-valuetext", /^8[45]\.\d%/);
   const collateral = units(await p.locator(".position dd").first().innerText(), 9);
   expect(collateral).toBeLessThan(3_500_000_000n);
@@ -192,7 +192,7 @@ test("a keeper that is offline is reported before anything is sent", async ({ pa
 test("landing: lend sections and FAQ", async ({ page }, info) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: /Jupiter-style lending\. Nobody sees your position\./ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Jupiter-style lending\. The chain never sees your position's size\./ })).toBeVisible();
   await expect(page.getByText(/supply APR now/)).toBeVisible();
   const privacy = page.locator("#lend-privacy");
   await privacy.getByRole("button", { name: "On Keeler" }).click();
@@ -200,7 +200,7 @@ test("landing: lend sections and FAQ", async ({ page }, info) => {
   for (const q of ["Who runs the pool?", "What if the keeper is offline?", "What is visible when I lend or borrow?", "Is Keeler on mainnet?"]) {
     await page.locator("#faq summary", { hasText: q }).click();
   }
-  await expect(page.getByText(/cannot take your principal/)).toBeVisible();
+  await expect(page.getByText(/By design it cannot take your principal/)).toBeVisible();
   // The lend buttons move focus into the panel (its heading, as on every panel change).
   await page.getByRole("button", { name: "Start earning" }).click();
   await expect(panel(page).getByRole("heading", { name: "Choose a wallet" })).toBeFocused();

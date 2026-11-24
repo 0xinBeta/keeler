@@ -625,7 +625,8 @@ export function BorrowTab(p: LendProps) {
           {st === "liquidatable" && (
             <p className="note note-error" role="status">
               <strong>Past {pct(vault.liquidationThresholdBps, 0)}.</strong> The keeper sells only enough collateral to bring the position back
-              to {pct(vault.liquidationThresholdBps, 0)}, plus the {pct(vault.penaltyBps, 0)} penalty. Repay or add collateral to keep more of it.
+              to {pct(vault.liquidationThresholdBps, 0)} (past {pct(vault.liquidationMaxLimitBps, 0)}, to repay the whole loan), plus the{" "}
+              {pct(vault.penaltyBps, 0)} penalty. Repay or add collateral to keep more of it.
             </p>
           )}
           {position.lastLiquidation && <LiquidatedNote position={position} vault={vault} debt={d} now={now} />}
@@ -735,7 +736,11 @@ function LiquidatedNote({ position, vault, debt, now }: { position: Position; va
       <strong>Liquidated {when}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt was repaid with{" "}
       <Amount value={l.collateralSold} asset={vault.collateral} />, the {pct(vault.penaltyBps, 0)} penalty included, at{" "}
       {priceText(l.price, vault)} {vault.debt.symbol}.{" "}
-      {debt === 0n ? "The whole loan is repaid; the rest of your collateral is still yours." : `The position is back at ${pct(vault.liquidationThresholdBps, 0)} and the rest is still yours.`}
+      {debt === 0n
+        ? "The whole loan is repaid; the rest of your collateral is still yours."
+        : position.collateral === 0n
+          ? "No collateral is left; the remaining debt stays on the position until you repay it."
+          : `The position is back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest is still yours.`}
     </div>
   );
 }
