@@ -2674,10 +2674,18 @@ name = "keeler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bincode",
+ "borsh",
+ "bs58",
+ "getrandom 0.2.17",
  "keeler-core",
+ "keeler-lend",
+ "keeler-lend-sdk",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "solana-account 4.7.0",
  "solana-address 2.7.0",
  "solana-instruction 3.5.1",
@@ -2686,6 +2694,7 @@ dependencies = [
  "solana-rpc-client-api",
  "solana-signature",
  "solana-signer",
+ "solana-transaction",
  "spr-client",
  "spr-interface",
  "spr-keypair",
@@ -2695,6 +2704,7 @@ dependencies = [
  "spr-user-registry-interface",
  "swap-program",
  "swap-sdk",
+ "wincode",
 ]
 
 [[package]]
@@ -2704,6 +2714,51 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "keeler-lend"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "groth16-solana",
+ "light-program-profiler",
+ "pinocchio 0.11.2",
+ "solana-address 2.7.0",
+ "solana-program-error",
+ "spr-account-checks",
+ "spr-hasher",
+ "spr-interface",
+ "spr-keypair",
+ "spr-program",
+ "spr-transaction",
+ "wincode",
+ "xark",
+]
+
+[[package]]
+name = "keeler-lend-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-ec 0.6.0",
+ "ark-poly 0.6.0",
+ "borsh",
+ "keeler-core",
+ "keeler-lend",
+ "sha2 0.10.9",
+ "solana-address 2.7.0",
+ "solana-instruction 3.5.1",
+ "spr-client",
+ "spr-hasher",
+ "spr-interface",
+ "spr-keypair",
+ "spr-program",
+ "spr-transaction",
+ "tempfile",
+ "wincode",
+ "xark",
+ "xark-groth16",
 ]
 
 [[package]]

@@ -9,6 +9,18 @@ publish = false
 # versions match that checkout's swap/xark/Cargo.toml.
 [dependencies]
 keeler-core = { path = "../core" }
+# The lending program and its SDK (its own workspace in lend/): the keeper.
+keeler-lend = { path = "../lend/program", features = ["circuits"] }
+keeler-lend-sdk = { path = "../lend/sdk" }
+sha2 = "0.10"
+borsh = { version = "1.5", default-features = false, features = ["derive"] }
+wincode = { version = "0.6", features = ["derive"] }
+bincode = "1.3"
+bs58 = "0.5"
+base64 = "0.22"
+getrandom = "0.2"
+solana-signature = "3.5"
+solana-transaction = { version = "4.3", features = ["serde"] }
 swap-sdk = { path = "../.tools/privacy-ring-examples/swap/xark/sdk" }
 swap-program = { path = "../.tools/privacy-ring-examples/swap/xark/program", features = ["circuits"] }
 spr-client = { version = "0.10.0", features = ["reqwest", "solana-rpc"] }
@@ -31,4 +43,3 @@ spr-program-test = { version = "0.10.0", features = ["localnet"] }
 solana-account = "4.3"
 solana-rpc-client = "4.3"
 solana-rpc-client-api = "4.3"
-solana-signature = "3.5"
