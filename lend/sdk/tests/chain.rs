@@ -1,15 +1,19 @@
 //! On a local network: init the reserve (a second init is refused), make an
-//! intent, cancel it after its expiry, and find the refund indexed.
+//! intent, cancel it after its expiry (refused before it, and resent with
+//! another expiry or bump), and find the refund indexed.
 //!
 //! Run through `lend/scripts/run-chain-test.sh` (port offset 2100, the tool
 //! paths from `.tools/env`, the SBF build in `lend/target/deploy`). Ignored in
 //! a plain `cargo test`.
+#[path = "tamper.rs"]
+mod tamper;
 #[path = "wallet.rs"]
 mod wallet;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
+use keeler_lend::{instructions::cancel_intent::CancelIntentArgs, USER_SEED};
 use keeler_lend_sdk::{
     builders, decode, pool_pda, purpose, user_pda, IntentState, ReserveState, ADMIN, KEEPER,
 };
@@ -24,9 +28,12 @@ use spr_program_test::{
     SprProgramTest,
 };
 use spr_transaction::{AssetRegistry, Mint, SppProofOutputUtxo, WalletUtxo};
+use tamper::{non_canonical, refused_with, tampered, INVALID_PROOF, INVALID_SEEDS, NOT_EXPIRED};
 use wallet::{deposit, send, wait_for_merkle_proof, TestWallet};
 
 const USER_FUNDS: u64 = 1_000_000;
+/// Long enough to prove the cancel before the intent expires.
+const EXPIRES_IN: u64 = 45;
 const INTENT_AMOUNT: u64 = 250_000;
 
 fn root() -> PathBuf {
@@ -130,7 +137,7 @@ fn reserve_intent_and_cancel() -> Result<()> {
         "reserve state {reserve:?}"
     );
 
-    // 2. An intent that has already expired, so it can be cancelled at once.
+    // 2. An intent that expires shortly.
     deposit(
         &localnet,
         &fixture::payer(),
@@ -147,7 +154,7 @@ fn reserve_intent_and_cancel() -> Result<()> {
     let source = wallet
         .spendable_utxo(mint, INTENT_AMOUNT)
         .context("no user note")?;
-    let expiry = chain_now(&localnet)? - 1;
+    let expiry = chain_now(&localnet)? + EXPIRES_IN;
     let viewing = keeper.viewing_pubkey();
     let intent = builders::intent(
         &user,
@@ -171,14 +178,49 @@ fn reserve_intent_and_cancel() -> Result<()> {
         "intent state {state:?}"
     );
 
-    // 3. Cancel it; the refund is the maker's, indexed.
+    // 3. Cancel it: refused before the expiry, and with the proof resent
+    //    under another expiry or a non-canonical bump; then, once expired, it
+    //    lands and the refund is the maker's, indexed.
     let cancel = builders::cancel_intent(&user, intent_utxo, viewing, tree_id)?;
     let refund = cancel.outputs[keeler_lend::circuits::CANCEL_REFUND_SLOT].clone();
     ensure!(
         refund.amount == INTENT_AMOUNT && refund.owner_address == Some(user.shielded_address()?),
         "refund {refund:?}"
     );
-    let sig = send(rpc, &[&user_key], cancel.prove(indexer, tree, &user)?)?;
+    let ix = cancel.prove(indexer, tree, &user)?;
+    ensure!(
+        chain_now(&localnet)? <= expiry,
+        "proving outlasted the expiry"
+    );
+    refused_with(
+        "cancel before expiry",
+        send(rpc, &[&user_key], ix.clone()),
+        NOT_EXPIRED,
+    )?;
+    refused_with(
+        "cancel resent with an earlier expiry",
+        send(
+            rpc,
+            &[&user_key],
+            tampered(&ix, |a: &mut CancelIntentArgs| a.expiry = expiry - 3600),
+        ),
+        INVALID_PROOF,
+    )?;
+    while chain_now(&localnet)? <= expiry {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    refused_with(
+        "cancel resent with a non-canonical user bump",
+        send(
+            rpc,
+            &[&user_key],
+            tampered(&ix, |a: &mut CancelIntentArgs| {
+                a.user_bump = non_canonical(USER_SEED, user_key.pubkey().as_array())
+            }),
+        ),
+        INVALID_SEEDS,
+    )?;
+    let sig = send(rpc, &[&user_key], ix)?;
     println!("cancel_intent: {sig}");
     wait_for_merkle_proof(indexer, tree, refund.hash(tree_id).map_err(err)?)?;
     println!("refund indexed");

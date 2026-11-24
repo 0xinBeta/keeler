@@ -293,7 +293,7 @@ pub fn compiled_refuses<P: xark::input::Input, T>(
         .collect();
     let program: P = xark::input::from_fields(&fields);
     let native = spr_program::checked(|| execute(&program).map(|_| ()));
-    let native = native.err().expect("changed inputs accepted natively");
+    let native = native.expect_err("changed inputs accepted natively");
     at(&format!("{native:?}"), file, needle);
 
     let (_dir, circuit) = checked_circuit(id).expect("the checked circuit");
