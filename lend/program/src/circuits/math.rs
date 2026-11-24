@@ -40,6 +40,36 @@ pub const TUSD_POOL: PoolParams = PoolParams {
     fee_bps: 1_000,
 };
 
+/// A vault's fixed parameters, in basis points: collateral factor,
+/// liquidation threshold, max limit and penalty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaultParams {
+    pub cf_bps: u64,
+    pub lt_bps: u64,
+    pub lml_bps: u64,
+    pub penalty_bps: u64,
+}
+
+impl VaultParams {
+    /// `cf < lt < lml <= 1e4` and `lt x (1e4 + penalty) < 1e8`: otherwise
+    /// liquidating would raise the loan-to-value (`core/src/lend.rs`).
+    pub const fn is_valid(&self) -> bool {
+        self.cf_bps < self.lt_bps
+            && self.lt_bps < self.lml_bps
+            && self.lml_bps <= BPS
+            && self.lt_bps * (BPS + self.penalty_bps) < BPS * BPS
+    }
+}
+
+/// tSOL collateral against tUSD debt: 80 / 85 / 90 / 1%.
+pub const TSOL_TUSD_VAULT: VaultParams = VaultParams {
+    cf_bps: 8_000,
+    lt_bps: 8_500,
+    lml_bps: 9_000,
+    penalty_bps: 100,
+};
+const _: () = assert!(TSOL_TUSD_VAULT.is_valid());
+
 fn f(x: u64) -> Field {
     Field::from(x)
 }
@@ -131,12 +161,20 @@ pub fn sub(a: u64, b: u64) -> u64 {
 
 /// `floor(shares x supply_price / 1e12)`.
 pub fn assets_of(shares: u64, supply_price: u64) -> u64 {
-    to_u64(div_floor::<128, 40>(f(shares), f(supply_price), f(PRICE_SCALE)))
+    to_u64(div_floor::<128, 40>(
+        f(shares),
+        f(supply_price),
+        f(PRICE_SCALE),
+    ))
 }
 
 /// `ceil(shares x borrow_price / 1e12)`.
 pub fn debt_of(shares: u64, borrow_price: u64) -> u64 {
-    to_u64(div_ceil::<128, 40>(f(shares), f(borrow_price), f(PRICE_SCALE)))
+    to_u64(div_ceil::<128, 40>(
+        f(shares),
+        f(borrow_price),
+        f(PRICE_SCALE),
+    ))
 }
 
 pub fn total_supply(state: &ReserveState) -> u64 {
@@ -225,11 +263,7 @@ pub fn accrue(state: &mut ReserveState, fee_bps: u64, now: u64) {
     // 16 + 40 bits.
     let rate_time = mul(rate, f(dt));
     // 64 + 56 bits over 39.
-    let borrow_inc = div_ceil::<120, 39>(
-        f(state.borrow_price),
-        rate_time,
-        f(BPS) * f(YEAR),
-    );
+    let borrow_inc = div_ceil::<120, 39>(f(state.borrow_price), rate_time, f(BPS) * f(YEAR));
     // 64 + (56 + 14 + 14) bits over 65.
     let supply_factor = mul(rate_time, mul(f(fee_share), f(util)));
     let supply_inc = div_floor::<148, 65>(
@@ -303,11 +337,7 @@ pub fn repay_shares(shares: u64, amount: u64, borrow_price: u64) -> (u64, u64) {
     // Only a partial repay divides; it has a nonzero debt, so a nonzero price.
     let partial = if full { 0 } else { amount };
     let price = if full { 1 } else { borrow_price };
-    let removed = to_u64(div_floor::<104, 64>(
-        f(partial),
-        f(PRICE_SCALE),
-        f(price),
-    ));
+    let removed = to_u64(div_floor::<104, 64>(f(partial), f(PRICE_SCALE), f(price)));
     let left = if full { 0 } else { sub(shares, removed) };
     (left, change)
 }
@@ -360,17 +390,42 @@ mod tests {
             let name = format!("{} / {}", case["fn"], case["name"]);
             let i = &case["in"];
             let got: Option<Value> = match case["fn"].as_str().unwrap() {
-                "total_supply" => run(|| total_supply(&reserve(&i["reserve"]))).map(|x| x.to_string().into()),
-                "total_debt" => run(|| total_debt(&reserve(&i["reserve"]))).map(|x| x.to_string().into()),
-                "utilisation_bps" => run(|| reserve_utilisation_bps(&reserve(&i["reserve"]))).map(|x| x.to_string().into()),
-                "curve_rate" => run(|| curve_rate(kinks(&i["curve"]), num(&i["util_bps"]))).map(|x| x.to_string().into()),
-                "shares_for_supply" => run(|| shares_for_supply(num(&i["amount"]), num(&i["supply_price"]))).map(|x| x.to_string().into()),
-                "shares_to_burn" => run(|| shares_to_burn(num(&i["amount"]), num(&i["supply_price"]))).map(|x| x.to_string().into()),
-                "assets_of" => run(|| assets_of(num(&i["shares"]), num(&i["supply_price"]))).map(|x| x.to_string().into()),
-                "debt_of" => run(|| debt_of(num(&i["shares"]), num(&i["borrow_price"]))).map(|x| x.to_string().into()),
-                "borrow_shares" => run(|| borrow_shares(num(&i["amount"]), num(&i["borrow_price"]))).map(|x| x.to_string().into()),
-                "repay_shares" => run(|| repay_shares(num(&i["shares"]), num(&i["amount"]), num(&i["borrow_price"])))
-                    .map(|(s, c)| serde_json::json!({"shares": s.to_string(), "change": c.to_string()})),
+                "total_supply" => {
+                    run(|| total_supply(&reserve(&i["reserve"]))).map(|x| x.to_string().into())
+                }
+                "total_debt" => {
+                    run(|| total_debt(&reserve(&i["reserve"]))).map(|x| x.to_string().into())
+                }
+                "utilisation_bps" => run(|| reserve_utilisation_bps(&reserve(&i["reserve"])))
+                    .map(|x| x.to_string().into()),
+                "curve_rate" => run(|| curve_rate(kinks(&i["curve"]), num(&i["util_bps"])))
+                    .map(|x| x.to_string().into()),
+                "shares_for_supply" => {
+                    run(|| shares_for_supply(num(&i["amount"]), num(&i["supply_price"])))
+                        .map(|x| x.to_string().into())
+                }
+                "shares_to_burn" => {
+                    run(|| shares_to_burn(num(&i["amount"]), num(&i["supply_price"])))
+                        .map(|x| x.to_string().into())
+                }
+                "assets_of" => run(|| assets_of(num(&i["shares"]), num(&i["supply_price"])))
+                    .map(|x| x.to_string().into()),
+                "debt_of" => run(|| debt_of(num(&i["shares"]), num(&i["borrow_price"])))
+                    .map(|x| x.to_string().into()),
+                "borrow_shares" => {
+                    run(|| borrow_shares(num(&i["amount"]), num(&i["borrow_price"])))
+                        .map(|x| x.to_string().into())
+                }
+                "repay_shares" => run(|| {
+                    repay_shares(
+                        num(&i["shares"]),
+                        num(&i["amount"]),
+                        num(&i["borrow_price"]),
+                    )
+                })
+                .map(
+                    |(s, c)| serde_json::json!({"shares": s.to_string(), "change": c.to_string()}),
+                ),
                 "accrue" => run(|| {
                     let mut s = reserve(&i["reserve"]);
                     accrue(&mut s, num(&i["fee_bps"]), num(&i["now"]));
