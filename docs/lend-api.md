@@ -3,7 +3,13 @@
 What the web page (`web/src/keeler/lend*.ts`) sends to the keeper and what it accepts back. The
 Worker (`worker/src/index.ts`, `worker/README.md`) sits between them: it checks the shape of every
 request and reply, rate-limits, and forwards `/api/lend/<route>` to the keeper's `/lend/<route>`.
-It verifies no signature; the keeper verifies all of them.
+Before it charges a global limit or forwards a signed request, it checks `sessionAuth` (the
+authorisation text rebuilt from its own `NETWORK` and `LEND_PROGRAM_ID`) and the request
+`signature` exactly as the keeper does (steps 2 and 3 below), and answers 401 when either fails.
+Expiry, freshness and replay need chain time and the nonce store, so only the keeper checks them;
+the keeper also checks everything the Worker did. Every `LEND_POOLS` mint and `LEND_VAULTS`
+collateral and debt mint must be in `ASSETS` (the page reads lend amounts with its decimals), or
+every lend route and `/api/config` answer 500.
 
 `web/tests/fixtures/lend-requests.json` holds signed requests and a signed ticket made from fixed
 keys, with every intermediate byte string in hex, so a Rust keeper can test its verifier against
