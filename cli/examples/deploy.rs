@@ -4,6 +4,13 @@
 //!
 //! `deploy setup <plan.json>`: every setup step, idempotent; prints a JSON
 //! summary (program ID, dealer, faucet, mints) on stdout.
+//! `deploy program <program-plan.json>`: deploys one named program and
+//! nothing else (`deploy::deploy_one`), idempotent; prints a JSON summary
+//! (name, program ID, upgrade authority) on stdout. Stops before sending
+//! anything if the deploy wallet holds less than the deploy still needs.
+//! `deploy estimate <program-plan.json>`: prints what that deploy needs at
+//! peak and the wallet's balance; reads the chain, sends nothing, and reads
+//! only the deploy key (for its address), not the program or buffer keys.
 //! `deploy keygen`: prints a new keypair as a JSON array on stdout, for the
 //! caller to pipe into the Keychain.
 //! `deploy set-authority <plan.json> <program> <new-authority>`: hands the
@@ -14,10 +21,12 @@ use std::io::BufRead;
 use anyhow::{bail, ensure, Context, Result};
 use keeler::{
     config::{parse_address, redact},
-    deploy::{self, Plan},
+    deploy::{self, Plan, ProgramPlan},
 };
+use serde::de::DeserializeOwned;
+use solana_signer::Signer;
 
-fn plan(path: &str) -> Result<Plan> {
+fn plan<T: DeserializeOwned>(path: &str) -> Result<T> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("plan {path}: {e}"))
 }
@@ -26,8 +35,25 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["setup", path] => {
-            let summary = deploy::setup(&plan(path)?)?;
+            let summary = deploy::setup(&plan::<Plan>(path)?)?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
+        ["program", path] => {
+            let summary = deploy::deploy_one(&plan(path)?)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
+        ["estimate", path] => {
+            let plan: ProgramPlan = plan(path)?;
+            let rpc = plan.rpc()?;
+            let payer = plan.deploy_key.keypair()?.pubkey();
+            let e = deploy::estimate(&rpc, &payer, plan.so()?.len())?;
+            deploy::log_estimate(&plan.name, &payer, &e);
+            if e.balance < e.peak {
+                eprintln!("the wallet is short by {}", deploy::sol(e.peak - e.balance));
+            }
+            println!("{}", serde_json::to_string_pretty(&e)?);
             Ok(())
         }
         ["keygen"] => {
@@ -36,7 +62,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         ["set-authority", path, program, new] => {
-            let plan = plan(path)?;
+            let plan: Plan = plan(path)?;
             let rpc = plan.rpc()?;
             let (program, new) = (parse_address(program)?, parse_address(new)?);
             eprintln!(
@@ -51,7 +77,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         _ => bail!(
-            "usage: deploy setup <plan.json> | deploy keygen | deploy set-authority <plan.json> <program> <new-authority>"
+            "usage: deploy setup <plan.json> | deploy program <program-plan.json> | \
+             deploy estimate <program-plan.json> | deploy keygen | deploy set-authority <plan.json> <program> <new-authority>"
         ),
     }
 }

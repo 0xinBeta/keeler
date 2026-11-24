@@ -422,7 +422,6 @@ export function createKeeler(): Keeler {
       config: c.lend,
       assets: c.assets,
       wallet: owner,
-      paused: async () => (await quotingConfig()).paused,
       http: (path, init) => fetch(path, init),
       chainNow,
       sessionSeed: () => {

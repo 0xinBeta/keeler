@@ -48,8 +48,10 @@ export type LendWasm = Hashing & {
   /** The nullifier of a note the user PDA owns. */
   nullifier(hash: Uint8Array, blinding: Uint8Array): Uint8Array;
   /** Decodes and checks a state against its opening (throws unless it reproduces `note.hash`); returns the fields the page reads. */
-  decode(note: NoteOpening): Promise<{ ownerIsMe: boolean; pool?: bigint; vault?: bigint; positionId?: bigint; shares: bigint }>;
+  decode(note: NoteOpening, leafIndex: bigint): Promise<{ ownerIsMe: boolean; pool?: bigint; vault?: bigint; positionId?: bigint; shares: bigint }>;
 };
+
+export type Owners = { user: Uint8Array; pda: Uint8Array; viewing: Uint8Array };
 
 export type LendDeps = {
   network: string;
@@ -58,7 +60,6 @@ export type LendDeps = {
   config: LendServerConfig;
   assets: Asset[];
   wallet(): Address;
-  paused(): Promise<boolean>;
   http(path: string, init?: RequestInit): Promise<Response>;
   chainNow(): Promise<number>;
   /** The session seed derived at unlock; throws not-registered while locked. */
@@ -69,8 +70,8 @@ export type LendDeps = {
   sync(): Promise<void>;
   /** Unspent private notes of `mint`, as `{ amount, utxo }`. */
   notes(mint: string): { amount: bigint; utxo: unknown }[];
-  /** Shielded address bytes: the user's own, and the user PDA's under the keeper's viewing key. */
-  owners(): Promise<{ user: Uint8Array; pda: Uint8Array }>;
+  /** The user's shielded address, the user PDA's under the user's viewing key (receipts, positions), and that key. */
+  owners(): Promise<Owners>;
   chain: LendChain;
   build: LendBuilder;
   wasm: LendWasm;
@@ -313,7 +314,7 @@ export function createLend(d: LendDeps): KeelerLend {
       const where = await d.chain.note(hash, blinding);
       if (where.leafIndex === undefined || where.spentBy) return undefined;
       const note: NoteOpening = { hash, mint, amount: o.amount, blinding, state: o.state, kind: noteKind };
-      const decoded = await d.wasm.decode(note);
+      const decoded = await d.wasm.decode(note, where.leafIndex);
       return decoded.ownerIsMe ? { note, decoded } : undefined;
     } catch {
       return undefined;
@@ -395,7 +396,6 @@ export function createLend(d: LendDeps): KeelerLend {
   /** supply, deposit, repay: ticket, intent proof, sign, send; resolves at step "keeper". */
   const intent = (kind: LendKind, purpose: Purpose, mint: string, amount: bigint, target: bigint, place: { pool: string; vault: number | null; positionId: string | null }, ticket: Fields, on: (s: LendStep) => void) =>
     exclusive("lend", async () => {
-      if (await d.paused()) throw err("paused", "Lending is paused. Your deposits and positions are safe; refunds of unfilled requests still work.");
       if (amount <= 0n) throw err("below-minimum", "Enter an amount above zero.");
       await d.sync();
       const source = d.notes(mint).filter((n) => n.amount >= amount).sort((a, b) => (a.amount < b.amount ? -1 : 1))[0];
@@ -472,7 +472,7 @@ export function createLend(d: LendDeps): KeelerLend {
     kind: "redeem" | "draw",
     request: Fields,
     spent: NoteOpening,
-    expect: (reply: BuildReply & { index?: bigint }, owners: { user: Uint8Array; pda: Uint8Array }) => { notes: ExpectedNote[]; reference?: bigint; creates: (blindings: Map<number, Uint8Array>, outputs: Uint8Array[]) => OpRecord["creates"] },
+    expect: (reply: BuildReply & { index?: bigint }, owners: Owners) => { notes: ExpectedNote[]; reference?: bigint; creates: (blindings: Map<number, Uint8Array>, outputs: Uint8Array[]) => OpRecord["creates"] },
     place: Pick<LendOperation, "pool" | "vault" | "positionId" | "amounts">,
     on: (s: LendStep) => void,
   ) => {
@@ -483,7 +483,7 @@ export function createLend(d: LendDeps): KeelerLend {
     const seed = d.wasm.seed(SEED_DOMAIN[kind], spent.blinding);
     const checked = await checkKeeperTransaction(
       reply,
-      { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
+      { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
       d.wasm,
     );
     const blindings = new Map<number, Uint8Array>();
@@ -594,7 +594,6 @@ export function createLend(d: LendDeps): KeelerLend {
 
     redeem: (pool, amount, on) =>
       exclusive("lend", async () => {
-        if (await d.paused()) throw err("paused", "Lending is paused. Your deposits and positions are safe; refunds of unfilled requests still work.");
         const receipt = mustHave(d.store().all("receipt").find((r) => r.pool === pool), "a deposit in this pool");
         const mint = mintBytes(pool);
         let left = 0n;
@@ -624,7 +623,6 @@ export function createLend(d: LendDeps): KeelerLend {
 
     draw: (positionId, borrow, withdraw, on) =>
       exclusive("lend", async () => {
-        if (await d.paused()) throw err("paused", "Lending is paused. Your deposits and positions are safe; refunds of unfilled requests still work.");
         if (borrow < 0n || withdraw < 0n || (borrow === 0n && withdraw === 0n)) throw err("below-minimum", "Enter an amount to borrow or to withdraw.");
         const p = positionRecord(positionId);
         const v = vaultOf(p.vault);

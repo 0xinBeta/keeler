@@ -9,8 +9,14 @@
 # scripts/setup.sh there once) and changes nothing outside lend/target.
 #
 # Build parameters (environment): KEELER_LEND_PROGRAM_ID, KEELER_LEND_ADMIN,
-# KEELER_LEND_KEEPER (see lend/program/build.rs; the defaults are local test
-# keys). Pass --update-checksums after changing a circuit.
+# KEELER_LEND_KEEPER and the KEELER_LEND_VAULT1_* (see lend/program/build.rs;
+# the defaults are local test keys). Pass --update-checksums after changing a
+# circuit.
+#
+# KEELER_LEND_OUT (default lend/target) is where the .so and keeler-lend-env
+# go, so a build for another network leaves the local test build alone. The
+# circuits, keys and browser package do not depend on the build parameters
+# (the checksum check below fails if they ever do) and stay in lend/target.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 lend=$root/lend
@@ -43,22 +49,24 @@ for c in intent cancel_intent close; do
     mkdir -p "$wasm/$c"
     cp "$keys/$c/"{pk.bin,vk.bin,circuit.xbc} "$wasm/$c/"
 done
-# close, once the program has it.
-if [[ -f $keys/close/vk.bin ]]; then
-    mkdir -p "$wasm/close"
-    cp "$keys/close/"{pk.bin,vk.bin,circuit.xbc} "$wasm/close/"
-fi
 # The web app serves the package from web/public/lend (git-ignored); vite.config.ts pins its digests.
 web_lend=$root/web/public/lend
 rm -rf "$web_lend"
 mkdir -p "$web_lend"
 cp -R "$wasm/." "$web_lend/"
 
-cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 --sbf-out-dir target/deploy -- --locked --features bpf-entrypoint
-so=$lend/target/deploy/keeler_lend.so
+out=${KEELER_LEND_OUT:-$lend/target}
+if [[ $out == "$lend/target" ]]; then
+    cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 --sbf-out-dir target/deploy -- --locked --features bpf-entrypoint
+else
+    # Its own cargo target too: the build parameters are compiled in.
+    mkdir -p "$out"
+    CARGO_TARGET_DIR=$out/cargo cargo build-sbf --manifest-path program/Cargo.toml --tools-version v1.54 --sbf-out-dir "$out/deploy" -- --locked --features bpf-entrypoint
+fi
+so=$out/deploy/keeler_lend.so
 [[ -f $so ]] || { echo "build-sbf left no $so" >&2; exit 1; }
 
-env_file=$lend/target/keeler-lend-env
+env_file=$out/keeler-lend-env
 {
     printf 'export %s=%q\n' \
         KEELER_LEND_PROGRAM_ID "${KEELER_LEND_PROGRAM_ID:-A7qaBKJ1gJRcKwMWyyRdr9YhmbBmnMaemM9Sijah3EbC}" \

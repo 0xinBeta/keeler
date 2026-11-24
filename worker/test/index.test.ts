@@ -681,18 +681,21 @@ describe("/api/lend/*", () => {
     expect((await call(req("/api/lend/pools"), local)).res.status).toBe(200);
   });
 
-  it("PAUSED refuses tickets and builds; pools and account still answer", async () => {
-    mockFetch((url) => Response.json(new URL(url).pathname === "/lend/pools" ? POOLS_REPLY : ACCOUNT_REPLY));
+  it("PAUSED does not touch lending: every route still reaches the keeper, whose own pause answers", async () => {
+    const replies: Record<string, unknown> = {
+      "/lend/pools": POOLS_REPLY,
+      "/lend/account": ACCOUNT_REPLY,
+      "/lend/ticket": { id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG },
+      "/lend/build": { transaction: TX, outputs: [OUT], now: 1_800_000_000 },
+    };
+    mockFetch((url) => Response.json(replies[new URL(url).pathname]));
     const e = lendEnv({ PAUSED: "1" });
-    const [pools, account, ticket, build] = routes();
-    for (const r of [ticket!, build!]) {
-      const { res, body } = await call(r, e);
-      expect(res.status).toBe(503);
-      expect(body).toEqual({ error: "Swaps are paused." });
-    }
-    expect(calls).toHaveLength(0);
-    expect((await call(pools!, e)).res.status).toBe(200);
-    expect((await call(account!, e)).res.status).toBe(200);
+    for (const r of routes()) expect((await call(r, e)).res.status).toBe(200);
+    expect(calls).toHaveLength(4);
+    mockFetch(() => Response.json({ error: "Lending is paused for new deposits and borrowing." }, { status: 403 }));
+    const { res, body } = await call(post("/api/lend/ticket", TICKET), e);
+    expect(res.status).toBe(403);
+    expect(body.error).toMatch(/paused/);
   });
 
   it("leaves the page CSP unchanged", async () => {

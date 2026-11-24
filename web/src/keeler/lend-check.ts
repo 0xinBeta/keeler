@@ -98,8 +98,10 @@ export type Expected = {
   /** The owner's wallet: must sign read-only and nowhere else. */
   owner: Address;
   chainNow: number;
-  /** Nullifier of the owner's note the keeper must spend (the receipt, the position). */
+  /** Nullifier of the owner's note the keeper must spend first (the receipt, the position): the output blindings derive from it. */
   spends: Uint8Array;
+  /** The owner's 33-byte viewing key: the new receipt or position is encrypted to it (`owner_viewing`). */
+  ownerViewing: Uint8Array;
   /** Blinding seed of the outputs below (`SEED_DOMAIN`). */
   seed: Uint8Array;
   notes: ExpectedNote[];
@@ -188,6 +190,7 @@ export async function checkKeeperTransaction(reply: BuildReply, e: Expected, h: 
   } catch {
     return refuse("its shielded transfer does not decode");
   }
+  if (!equal(args.subarray(layout.ownerViewing, layout.ownerViewing + 33), e.ownerViewing)) refuse("it encrypts your new note to another key");
   const now = u64At(args, layout.now);
   if (BigInt(reply.now) !== now) refuse("the time it states differs from its instruction");
   const chain = BigInt(e.chainNow);
@@ -208,9 +211,8 @@ export async function checkKeeperTransaction(reply: BuildReply, e: Expected, h: 
   if (reply.outputs.length !== transact.outputs.length || reply.outputs.some((o, i) => !equal(o, transact.outputs[i]!))) {
     refuse("the outputs it lists differ from its transfer");
   }
-  if (!transact.nullifiers.some((n) => equal(n, e.spends))) refuse("it does not spend your note");
   const first = transact.nullifiers[0];
-  if (!first) return refuse("it spends nothing");
+  if (!first || !equal(first, e.spends)) return refuse("it does not spend your note first");
   for (const note of e.notes) {
     const got = transact.outputs[note.slot];
     const want = await h.hash({ ...note, blinding: await h.blinding(first, e.seed, note.slot) });
