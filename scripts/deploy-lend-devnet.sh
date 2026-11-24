@@ -96,9 +96,9 @@ fi
 so=$out/keeler_lend.so
 if [[ ! -f $so ]]; then
     # The devnet price comes from the keeper's test price account, so the
-    # build must have test-price (a default feature today; this catches a change).
-    grep -qE '^default = \[.*"test-price"' "$root/lend/program/Cargo.toml" ||
-        { echo "lend/program's default features no longer include test-price" >&2; exit 1; }
+    # build must have test-price (setup-lend.sh passes it; this catches a change).
+    grep -q 'bpf-entrypoint,test-price' "$root/scripts/setup-lend.sh" ||
+        { echo "scripts/setup-lend.sh no longer builds with test-price" >&2; exit 1; }
     before=$(git -C "$root" status --porcelain --untracked-files=no)
     # The Pyth price account and feed stay at their defaults: unused when
     # the test price account is passed.

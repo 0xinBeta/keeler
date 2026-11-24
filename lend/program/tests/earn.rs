@@ -23,7 +23,7 @@ use spr_interface::{
 use spr_program::CompressedProof;
 
 const SBF_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/deploy");
-const MINT: [u8; 32] = [9; 32];
+const MINT: [u8; 32] = keeler_lend::pool::TUSD_MINT.to_bytes();
 const NOW: i64 = 1_800_000_000;
 
 fn setup() -> Mollusk {
@@ -293,4 +293,77 @@ fn redeem_refuses_a_stale_now_and_a_transact_without_inputs() {
         &accounts,
         code(LendError::InvalidInstructionData),
     );
+}
+
+/// A bump below the canonical one that still derives a PDA.
+fn non_canonical(seed: &[u8], key: &[u8; 32]) -> u8 {
+    let id = pk(&keeler_lend::ID);
+    (0..bump(seed, key))
+        .rev()
+        .find(|b| Pubkey::create_program_address(&[seed, key, &[*b]], &id).is_ok())
+        .unwrap()
+}
+
+#[test]
+fn supply_and_redeem_refuse_a_non_canonical_bump_and_a_foreign_mint() {
+    let mollusk = setup();
+    let user = Pubkey::new_unique();
+    let foreign = [9; 32];
+    let keeper = pk(&KEEPER);
+    let supplies = [
+        (
+            SupplyArgs {
+                pool_bump: non_canonical(POOL_SEED, &MINT),
+                ..supply_args(&user, NOW, NOW)
+            },
+            LendError::InvalidSeeds,
+        ),
+        (
+            SupplyArgs {
+                user_bump: non_canonical(USER_SEED, &user.to_bytes()),
+                ..supply_args(&user, NOW, NOW)
+            },
+            LendError::InvalidSeeds,
+        ),
+        (
+            SupplyArgs {
+                mint: foreign,
+                pool_bump: bump(POOL_SEED, &foreign),
+                ..supply_args(&user, NOW, NOW)
+            },
+            LendError::UnknownMint,
+        ),
+    ];
+    for (args, err) in supplies {
+        let (ix, accounts) = supply(keeper, true, &args, 2);
+        expect_err_exact(&mollusk, &ix, &accounts, code(err));
+    }
+    let redeems = [
+        (
+            RedeemArgs {
+                pool_bump: non_canonical(POOL_SEED, &MINT),
+                ..redeem_args(&user, NOW)
+            },
+            LendError::InvalidSeeds,
+        ),
+        (
+            RedeemArgs {
+                user_bump: non_canonical(USER_SEED, &user.to_bytes()),
+                ..redeem_args(&user, NOW)
+            },
+            LendError::InvalidSeeds,
+        ),
+        (
+            RedeemArgs {
+                mint: foreign,
+                pool_bump: bump(POOL_SEED, &foreign),
+                ..redeem_args(&user, NOW)
+            },
+            LendError::UnknownMint,
+        ),
+    ];
+    for (args, err) in redeems {
+        let (ix, accounts) = redeem(keeper, user, (true, true), &args, 2);
+        expect_err_exact(&mollusk, &ix, &accounts, code(err));
+    }
 }

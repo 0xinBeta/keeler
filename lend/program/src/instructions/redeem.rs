@@ -6,8 +6,8 @@ use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
-    check_now, cpi, identity, mint_halves, parse, require_keeper, supply::first_nullifier,
-    verified, Pda,
+    check_now, cpi, identity, mint_halves, parse, require_keeper, require_pool_mint,
+    supply::first_nullifier, verified, Pda,
 };
 use crate::{verifier::redeem as v, POOL_SEED, USER_SEED};
 
@@ -34,6 +34,7 @@ pub fn process(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     let owner = *iter.next_signer("owner")?.address();
     let (args, transact, bytes) = parse::<RedeemArgs>(data)?;
     check_now(args.now)?;
+    require_pool_mint(&args.mint)?;
     let pool = Pda::new(POOL_SEED, &args.mint, args.pool_bump)?;
     let user = Pda::new(USER_SEED, owner.as_array(), args.user_bump)?;
     let (mint_hi, mint_lo) = mint_halves(&args.mint);

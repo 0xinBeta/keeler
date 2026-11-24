@@ -40,8 +40,8 @@ for SOL.
 
 ## The price on devnet
 
-The devnet build has the `test-price` feature (a default feature of `lend/program`; never in a
-mainnet build). The vault's Pyth account and feed stay at their defaults and are not used: `draw`
+The devnet build has the `test-price` feature (not a default: `scripts/setup-lend.sh` passes it,
+and it cannot build with `mainnet`). The vault's Pyth account and feed stay at their defaults and are not used: `draw`
 and `liquidate` are given the vault's test price account, the PDA `["price", vault id (u64 LE)]`.
 
 The keeper sets the devnet price with the `set_test_price` command (instruction tag 12,

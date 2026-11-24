@@ -1,6 +1,6 @@
 //! The Vault instructions' refusals that need no real proof, and the price
 //! check, on the SBF build in `lend/target/deploy` (a `test-price` build:
-//! the default features).
+//! `scripts/setup-lend.sh` passes the feature).
 mod mollusk;
 
 use keeler_lend::{
@@ -232,6 +232,92 @@ fn repay_refusals_before_the_proof() {
     ] {
         expect_err_exact(&mollusk, &ix, &accounts, err);
     }
+}
+
+/// A bump below the canonical one that still derives a PDA.
+fn non_canonical(seed: &[u8], key: &[u8; 32]) -> u8 {
+    (0..bump(seed, key))
+        .rev()
+        .find(|b| Pubkey::create_program_address(&[seed, key, &[*b]], &id()).is_ok())
+        .unwrap()
+}
+
+#[test]
+fn vault_instructions_refuse_a_non_canonical_bump() {
+    let mollusk = setup();
+    let keeper = pk(&KEEPER);
+    let now = NOW as u64;
+    let owner = [7; 32];
+    let (bad_pool, bad_user) = (
+        non_canonical(POOL_SEED, TSOL_TUSD.debt_mint.as_array()),
+        non_canonical(USER_SEED, &owner),
+    );
+    let ix = |ix_tag: u8, args: Vec<u8>| Instruction {
+        program_id: id(),
+        accounts: vec![AccountMeta::new(keeper, true)],
+        data: data(ix_tag, args, 1),
+    };
+    let accounts = [(keeper, account())];
+    let deposit = DepositArgs {
+        proof: proof(),
+        vault: 1,
+        owner,
+        owner_viewing: [2; 33],
+        user_bump: bad_user,
+        now,
+        expiry: now,
+    };
+    for ix_tag in [tag::DEPOSIT, tag::DEPOSIT_ADD] {
+        expect_err_exact(
+            &mollusk,
+            &ix(ix_tag, wincode::serialize(&deposit).unwrap()),
+            &accounts,
+            lend(LendError::InvalidSeeds),
+        );
+    }
+    let repay = |pool_bump, user_bump| RepayArgs {
+        proof: proof(),
+        vault: 1,
+        pool_viewing: [2; 33],
+        pool_bump,
+        owner,
+        owner_viewing: [2; 33],
+        user_bump,
+        now,
+        expiry: now,
+    };
+    for args in [
+        repay(bad_pool, bump(USER_SEED, &owner)),
+        repay(pool_bump(), bad_user),
+    ] {
+        expect_err_exact(
+            &mollusk,
+            &ix(tag::REPAY, wincode::serialize(&args).unwrap()),
+            &accounts,
+            lend(LendError::InvalidSeeds),
+        );
+    }
+    // Liquidate, past a good price check.
+    let feed = pk(&TSOL_TUSD.price_account);
+    let mut liq = liquidate(keeper, feed, now, HIGH);
+    let args = LiquidateArgs {
+        proof: proof(),
+        vault: 1,
+        pool_viewing: [2; 33],
+        pool_bump: bad_pool,
+        owner,
+        owner_viewing: [2; 33],
+        user_bump: bump(USER_SEED, &owner),
+        now,
+        bound: HIGH,
+    };
+    liq.data = data(tag::LIQUIDATE, wincode::serialize(&args).unwrap(), 1);
+    expect_err_exact(
+        &mollusk,
+        &liq,
+        &[(keeper, account()), (feed, good_pyth())],
+        lend(LendError::InvalidSeeds),
+    );
 }
 
 // --- the price account ---
@@ -568,6 +654,34 @@ fn test_price_is_the_keepers_and_is_checked_like_pyth() {
         draw_at(forged, 1),
         fails(vault_err(VaultError::WrongTestPriceAccount))
     );
+}
+
+#[test]
+fn test_price_account_is_created_when_the_address_already_holds_lamports() {
+    let mollusk = setup();
+    let keeper = pk(&KEEPER);
+    let test = pk(&test_price_address(1).0);
+    let rent = mollusk.sysvars.rent.minimum_balance(24);
+    // One lamport sent ahead (the keeper tops it up), and more than the rent.
+    for held in [1, rent + 5] {
+        let prefunded = Account {
+            lamports: held,
+            ..Account::default()
+        };
+        let result = mollusk.process_instruction(
+            &set_test_price(keeper, test, 150_000_000_000, 0, NOW),
+            &[
+                (keeper, account()),
+                (test, prefunded),
+                keyed_account_for_system_program(),
+            ],
+        );
+        assert_eq!(result.program_result, ProgramResult::Success, "{held}");
+        let created = result.get_account(&test).unwrap();
+        assert_eq!((created.owner, created.data.len()), (id(), 24));
+        assert_eq!(created.lamports, held.max(rent));
+        assert_eq!(&created.data[..8], &150_000_000_000u64.to_le_bytes());
+    }
 }
 
 // --- close ---
