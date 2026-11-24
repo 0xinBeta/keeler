@@ -199,8 +199,8 @@ export interface KeelerLend {
   lendAccount(): Promise<LendAccount>;
   /** Earn: `amount` of the pool's asset from one private note into the pool. */
   supply(pool: string, amount: bigint, on: (step: LendStep) => void): Promise<LendOperation>;
-  /** Earn: `amount` of the pool's asset out of the receipt into the private balance. */
-  redeem(pool: string, amount: bigint, on: (step: LendStep) => void): Promise<LendOperation>;
+  /** Earn: `amount` of the pool's asset out of the receipt into the private balance; "all" burns every share. */
+  redeem(pool: string, amount: bigint | "all", on: (step: LendStep) => void): Promise<LendOperation>;
   /** Adds collateral from one private note; `positionId` null opens a new position. */
   deposit(vault: number, positionId: string | null, amount: bigint, on: (step: LendStep) => void): Promise<LendOperation>;
   /** Borrows `borrow` debt and withdraws `withdraw` collateral in one keeper-built transaction; either may be 0n. */

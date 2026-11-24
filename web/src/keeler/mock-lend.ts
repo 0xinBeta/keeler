@@ -248,11 +248,13 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       }, on);
     },
 
-    async redeem(_poolId, amount, on) {
+    async redeem(_poolId, asked, on) {
       s.need();
       keeper();
       accrueAll();
       const value = L.assetsOf(myShares, r.supplyPrice);
+      const all = asked === "all";
+      let amount = all ? value : asked;
       if (amount > value) throw new KeelerError("insufficient-note", "That is more than your deposit is worth. Enter a smaller amount.");
       const idle = supplied() - borrowed();
       if (s.scenario === "no-liquidity" || amount > idle)
@@ -263,7 +265,9 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       step(o, "signing", on);
       await sleep(900);
       accrueAll();
-      const burn = amount >= L.assetsOf(myShares, r.supplyPrice) ? myShares : L.sharesToBurn(amount, r.supplyPrice);
+      // As the keeper: by shares, burn them all and pay their worth now; by amount, burn rounded up.
+      if (all) amount = o.amounts[0]!.amount = L.assetsOf(myShares, r.supplyPrice);
+      const burn = all ? myShares : L.sharesToBurn(amount, r.supplyPrice);
       myShares -= burn;
       r = { ...r, supplyShares: r.supplyShares - burn };
       s.addNote(tUSD, amount);

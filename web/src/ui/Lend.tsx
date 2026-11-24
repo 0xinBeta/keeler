@@ -289,7 +289,8 @@ export function EarnTab(p: LendProps) {
     if (!f.ok || f.parsed === null) return;
     const amount = f.parsed;
     op.start(mode === "in" ? "supply" : "redeem", [{ asset: a, amount }], (on) =>
-      mode === "in" ? p.lend.supply(pool.id, amount, on) : p.lend.redeem(pool.id, amount, on),
+      // The whole deposit's worth withdraws every share, so no dust stays in the receipt.
+      mode === "in" ? p.lend.supply(pool.id, amount, on) : p.lend.redeem(pool.id, amount === max ? "all" : amount, on),
     );
   };
 

@@ -26,7 +26,7 @@ They hold note openings (amount, blinding, state) and transaction signatures, ne
 | `/lend/pools` | GET | no | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
 | `/lend/account` | GET | yes | query: the signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}` |
 | `/lend/ticket` | POST | yes | signed fields, `purpose`, `amount`, and `pool` (supply) or `vault` + `position` (deposit, repay) | `{id, expiry, signature}` |
-| `/lend/build` | POST | yes | signed fields, `op`; redeem: `pool`, `amount`; draw: `vault`, `position`, `borrow`, `withdraw` | `{transaction, outputs, now, bound?, index?}` |
+| `/lend/build` | POST | yes | signed fields, `op`; redeem: `pool` and exactly one of `amount`, `shares`; draw: `vault`, `position`, `borrow`, `withdraw` | `{transaction, outputs, now, bound?, index?}` |
 
 Amounts are decimal strings of base units (u64). `vault` is a number, `position` a decimal string
 of a u63.
@@ -47,6 +47,12 @@ of a u63.
   (draw) is the price bound in the args, 1e12-scaled. `index` is the pool's price index the
   transaction used, 1e12-scaled (supply index for redeem, borrow index for draw); the page needs it
   to recompute the owner's new note state and refuses a build without it.
+- **redeem by `amount` or `shares`**: with `amount` the keeper pays exactly that and burns
+  `shares_to_burn(amount, index)` (rounded up). With `shares` (a decimal string, the same rules as an
+  amount) it burns exactly that many and pays `assets_of(shares, index)` (rounded down). The page
+  sends `shares` to withdraw everything, so the receipt ends at zero shares, and `amount` for a
+  partial withdrawal. It checks the payout is `assets_of(shares, index)` and the new receipt holds
+  `held − shares`. The Worker refuses a redeem with both or neither, and `shares` on a draw.
 
 ## Session authorisation
 
