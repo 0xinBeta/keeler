@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -51,6 +51,28 @@ pub struct Chain {
     pub registry: AssetRegistry,
     /// Mint decimals never change.
     decimals: Mutex<HashMap<Address, u8>>,
+}
+
+/// Notes one part of this process picked to spend, by hash, with when. The
+/// swap dealer and the lend keeper share one wallet in one process, so
+/// [`Chain::notes`] hides a claimed note from both until its spend has
+/// landed or died and the indexer has caught up.
+static CLAIMED: Mutex<Vec<([u8; 32], Instant)>> = Mutex::new(Vec::new());
+const CLAIM: Duration = Duration::from_secs(180);
+
+/// Claims `note` for a spend about to be built.
+pub fn claim(note: &WalletUtxo) {
+    if let Ok(mut c) = CLAIMED.lock() {
+        c.retain(|(_, at)| at.elapsed() < CLAIM);
+        c.push((note.utxo_hash, Instant::now()));
+    }
+}
+
+fn claimed(note: &WalletUtxo) -> bool {
+    CLAIMED.lock().is_ok_and(|c| {
+        c.iter()
+            .any(|(h, at)| *h == note.utxo_hash && at.elapsed() < CLAIM)
+    })
 }
 
 /// Unix time from the Clock sysvar's data.
@@ -183,7 +205,7 @@ impl Chain {
             .map(|b| b.utxos.clone())
             .unwrap_or_default()
             .into_iter()
-            .filter(|u| u.utxo.ring_program_id.is_none())
+            .filter(|u| u.utxo.ring_program_id.is_none() && !claimed(u))
             .collect())
     }
 
@@ -205,7 +227,7 @@ impl Chain {
     }
 
     /// A note of exactly `amount`, making one with a self-transfer from a
-    /// larger note when there is none.
+    /// larger note when there is none. Both are claimed.
     pub fn exact_note(
         &self,
         kp: &ShieldedKeypair,
@@ -214,6 +236,7 @@ impl Chain {
     ) -> Result<WalletUtxo> {
         let notes = self.notes(kp, mint)?;
         if let Some(note) = notes.iter().find(|u| u.utxo.amount == amount) {
+            claim(note);
             return Ok(note.clone());
         }
         let source = notes
@@ -221,6 +244,7 @@ impl Chain {
             .filter(|u| u.utxo.amount > amount)
             .min_by_key(|u| u.utxo.amount)
             .ok_or_else(|| anyhow!("no note of {mint} covers {amount}"))?;
+        claim(&source);
         let payer = kp.pubkey();
         let me = kp.shielded_address()?;
         let mut tx = ConfidentialTransaction::new(vec![source], payer)?;
@@ -236,10 +260,13 @@ impl Chain {
         Submission::new(&signed, payer, kp)
             .send_sync(&self.client, &[kp])
             .map_err(|e| anyhow!("self-transfer: {e:?}"))?;
-        self.notes(kp, mint)?
+        let note = self
+            .notes(kp, mint)?
             .into_iter()
             .find(|u| u.utxo.amount == amount)
-            .ok_or_else(|| anyhow!("split note of {amount} not found after self-transfer"))
+            .ok_or_else(|| anyhow!("split note of {amount} not found after self-transfer"))?;
+        claim(&note);
+        Ok(note)
     }
 
     /// Locks `source_amount` of `source` into an order designated to `taker`.
