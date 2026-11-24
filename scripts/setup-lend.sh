@@ -43,11 +43,6 @@ for c in intent cancel_intent close; do
     mkdir -p "$wasm/$c"
     cp "$keys/$c/"{pk.bin,vk.bin,circuit.xbc} "$wasm/$c/"
 done
-# close, once the program has it.
-if [[ -f $keys/close/vk.bin ]]; then
-    mkdir -p "$wasm/close"
-    cp "$keys/close/"{pk.bin,vk.bin,circuit.xbc} "$wasm/close/"
-fi
 # The web app serves the package from web/public/lend (git-ignored); vite.config.ts pins its digests.
 web_lend=$root/web/public/lend
 rm -rf "$web_lend"

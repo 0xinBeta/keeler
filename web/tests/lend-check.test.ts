@@ -41,6 +41,8 @@ const PDA_ADDR = new Uint8Array(64).fill(2);
 const RESERVE_NULLIFIER = new Uint8Array(32).fill(0xaa);
 const RECEIPT_NULLIFIER = new Uint8Array(32).fill(0xbb);
 const SEED = new Uint8Array(32).fill(5);
+const VIEWING = new Uint8Array(33).fill(6);
+const PRICE = address("SysvarS1otHashes111111111111111111111111111");
 const REFERENCE = 142_370_000_000n;
 
 const sha = (...parts: Uint8Array[]) => {
@@ -80,6 +82,7 @@ const expected = (op: Op, over: Partial<Expected> = {}): Expected => ({
   owner: USER,
   chainNow: NOW,
   spends: RECEIPT_NULLIFIER,
+  ownerViewing: VIEWING,
   seed: SEED,
   notes: notes(op),
   ...(op === "draw" ? { reference: REFERENCE } : {}),
@@ -99,6 +102,8 @@ type Build = {
   extra?: Instruction[];
   lut?: boolean;
   nonce?: boolean;
+  viewing?: Uint8Array;
+  spentSecond?: boolean;
 };
 
 async function build(o: Build = {}) {
@@ -109,7 +114,7 @@ async function build(o: Build = {}) {
   const outputs = await Promise.all(
     [0, 1, 2, 3].map(async (slot) => {
       const n = (o.notes ?? notes(op)).find((x) => x.slot === slot);
-      return n ? hashing.hash({ ...n, blinding: await hashing.blinding(RESERVE_NULLIFIER, SEED, slot) }) : sha(Uint8Array.of(slot));
+      return n ? hashing.hash({ ...n, blinding: await hashing.blinding(RECEIPT_NULLIFIER, SEED, slot) }) : sha(Uint8Array.of(slot));
     }),
   );
   const transact = encodeTransactInstructionData({
@@ -122,20 +127,19 @@ async function build(o: Build = {}) {
     privateTxHash: new Uint8Array(32),
     circuit: { kind: "confidentialSigner", inputs: 2, outputs: 4, publicAssetSlots: 0 },
     proof: { a: new Uint8Array(32), b: new Uint8Array(128), c: new Uint8Array(32) },
-    inputs: [
-      { nullifierHash: RESERVE_NULLIFIER, treeIndex: 0 },
-      { nullifierHash: RECEIPT_NULLIFIER, treeIndex: 0 },
-    ],
+    // The owner's note is the first input: the output blindings derive from its nullifier.
+    inputs: (o.spentSecond ? [RESERVE_NULLIFIER, RECEIPT_NULLIFIER] : [RECEIPT_NULLIFIER, RESERVE_NULLIFIER]).map((nullifierHash) => ({ nullifierHash, treeIndex: 0 })),
     treeContexts: [{ utxoTreeRootIndex: 0, nullifierTreeRootIndex: 0 }],
   } as never);
   const layout = op === "redeem" ? ARGS.redeem : ARGS.draw;
   const args = new Uint8Array(layout.length);
   args.set(u64Bytes(BigInt(now)), layout.now);
+  args.set(o.viewing ?? VIEWING, layout.ownerViewing);
   if (op === "draw") args.set(u64Bytes(bound), ARGS.draw.bound);
   const data = Uint8Array.of(o.tag ?? (op === "redeem" ? TAG.redeem : TAG.draw), ...args, ...transact);
   const lend: Instruction = {
     programAddress: PROGRAM,
-    accounts: [ws(KEEPER), { address: USER, role: o.ownerRole ?? AccountRole.READONLY_SIGNER }, ws(KEEPER), w(TREE), r(SPP), r(SYSTEM), w(TREE), r(OTHER)],
+    accounts: [ws(KEEPER), { address: USER, role: o.ownerRole ?? AccountRole.READONLY_SIGNER }, ...(op === "draw" ? [r(PRICE)] : []), ws(KEEPER), w(TREE), r(SPP), r(SYSTEM), w(TREE), r(OTHER)],
     data,
   };
   const budget: Instruction = { programAddress: COMPUTE_BUDGET_PROGRAM, data: Uint8Array.of(2, 0x80, 0x5c, 0x15, 0) };
@@ -163,7 +167,7 @@ describe("the signing check", () => {
   it("accepts the honest redeem and draw", async () => {
     const redeem = await checkKeeperTransaction(await build(), expected("redeem"), hashing);
     expect(redeem.now).toBe(BigInt(NOW));
-    expect(redeem.firstNullifier).toEqual(RESERVE_NULLIFIER);
+    expect(redeem.firstNullifier).toEqual(RECEIPT_NULLIFIER);
     const draw = await checkKeeperTransaction(await build({ op: "draw" }), expected("draw"), hashing);
     expect(draw.bound).toBe((REFERENCE * 99n) / 100n);
   });
@@ -208,14 +212,14 @@ describe("the signing check", () => {
 
   it("refuses a different payout amount", async () => {
     const less = notes("redeem").map((n) => (n.slot === SLOT.redeem.payout ? { ...n, amount: 249_000000n } : n));
-    expect(await refusal(checkKeeperTransaction(await build({ notes: less }), expected("redeem"), hashing))).toMatch(/output 1/);
+    expect(await refusal(checkKeeperTransaction(await build({ notes: less }), expected("redeem"), hashing))).toMatch(/output 2/);
   });
 
   it("refuses a payout to a different owner, and a receipt with fewer shares", async () => {
     const theirs = notes("draw").map((n) => (n.slot === SLOT.draw.debtPayout ? { ...n, owner: new Uint8Array(64).fill(9) } : n));
     expect(await refusal(checkKeeperTransaction(await build({ op: "draw", notes: theirs }), expected("draw"), hashing))).toMatch(/output 2/);
     const fewer = notes("redeem").map((n) => (n.slot === SLOT.redeem.receipt ? { ...n, state: new Uint8Array(40).fill(1) } : n));
-    expect(await refusal(checkKeeperTransaction(await build({ notes: fewer }), expected("redeem"), hashing))).toMatch(/output 2/);
+    expect(await refusal(checkKeeperTransaction(await build({ notes: fewer }), expected("redeem"), hashing))).toMatch(/output 0/);
   });
 
   it("refuses a stale or future now, and an expiry out of range", async () => {
@@ -238,6 +242,13 @@ describe("the signing check", () => {
     expect(await refusal(checkKeeperTransaction(lying, expected("redeem"), hashing))).toMatch(/outputs it lists/);
     expect(await refusal(checkKeeperTransaction(honest, expected("redeem", { spends: new Uint8Array(32).fill(1) }), hashing))).toMatch(/does not spend your note/);
     expect(await refusal(checkKeeperTransaction({ ...honest, now: NOW - 1 }, expected("redeem"), hashing))).toMatch(/states differs/);
+    expect(await refusal(checkKeeperTransaction(await build({ spentSecond: true }), expected("redeem"), hashing))).toMatch(/does not spend your note first/);
+  });
+
+  it("refuses a new receipt or position encrypted to another viewing key", async () => {
+    const theirs = new Uint8Array(33).fill(8);
+    expect(await refusal(checkKeeperTransaction(await build({ viewing: theirs }), expected("redeem"), hashing))).toMatch(/another key/);
+    expect(await refusal(checkKeeperTransaction(await build({ op: "draw", viewing: theirs }), expected("draw"), hashing))).toMatch(/another key/);
   });
 
   it("decodes what the SDK encodes and refuses trailing bytes", async () => {

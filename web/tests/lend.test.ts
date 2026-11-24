@@ -122,6 +122,8 @@ async function world() {
     build: undefined as undefined | ((b: Record<string, unknown>) => Promise<unknown>),
     status: 200,
     paused: false,
+    /** Position ids the keeper knows: a deposit to one adds collateral, which its pause allows. */
+    positions: new Set<string>(),
   };
   const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
   const PURPOSE: Record<string, number> = { supply: 1, deposit: 2, repay: 3 };
@@ -137,6 +139,9 @@ async function world() {
     if (!ok || body.wallet !== USER) return reply(401, { error: "Bad signature." });
     if (Math.abs(Number(body.timestamp) - clock.now) > 120) return reply(401, { error: "Stale." });
     if (route === "/api/lend/account") return reply(200, keeper.account);
+    // The keeper's own pause: new supply, new positions and borrowing only.
+    const opening = (route === "/api/lend/ticket" && (body.purpose === "supply" || (body.purpose === "deposit" && !keeper.positions.has(String(body.position))))) || (route === "/api/lend/build" && body.op === "draw" && body.borrow !== "0");
+    if (keeper.paused && opening) return reply(403, { error: "Lending is paused for new deposits and borrowing." });
     if (route === "/api/lend/ticket") {
       const t = keeper.ticket(body);
       const target = body.pool ? 1n : BigInt(String(body.position));
@@ -168,7 +173,6 @@ async function world() {
     config,
     assets,
     wallet: () => USER,
-    paused: async () => keeper.paused,
     http,
     chainNow: async () => clock.now,
     sessionSeed: () => new Uint8Array(32).fill(0x44),
@@ -180,7 +184,7 @@ async function world() {
     send,
     sync: async () => {},
     notes: (mint) => (mint === TUSD ? [{ amount: 500_000000n, utxo: "tusd-note" }] : [{ amount: 5_000000000n, utxo: "tsol-note" }]),
-    owners: async () => ({ user: USER_ADDR, pda: PDA_ADDR }),
+    owners: async () => ({ user: USER_ADDR, pda: PDA_ADDR, viewing: new Uint8Array(33).fill(6) }),
     chain: {
       note: async (hash) => notes.get(hex(hash)) ?? {},
       signatureStatus: async (s) => sigs.get(s) ?? null,
@@ -215,9 +219,10 @@ const decode = (bytes: Uint8Array): Transaction => getTransactionDecoder().decod
 /** The keeper's honest build of a redeem or draw for `spent`, the note it spends; `tamper` changes a note first. */
 async function keeperBuild(W: World, op: "redeem" | "draw", spent: { hash: Uint8Array; blinding: Uint8Array }, notes: { slot: number; owner: Uint8Array; mint: Uint8Array; amount: bigint; kind: number; state: Uint8Array }[], extra: Instruction[] = [], bound?: bigint) {
   const seed = wasm.seed(SEED_DOMAIN[op], spent.blinding);
+  const first = wasm.nullifier(spent.hash, spent.blinding);
   const outputs = await Promise.all([0, 1, 2, 3].map(async (slot) => {
     const n = notes.find((x) => x.slot === slot);
-    return n ? wasm.hash({ ...n, blinding: await wasm.blinding(RESERVE_NF, seed, slot) }) : sha("pad", Uint8Array.of(slot));
+    return n ? wasm.hash({ ...n, blinding: await wasm.blinding(first, seed, slot) }) : sha("pad", Uint8Array.of(slot));
   }));
   const transact = encodeTransactInstructionData({
     expiryUnixTs: BigInt(W.clock.now + 60),
@@ -229,14 +234,16 @@ async function keeperBuild(W: World, op: "redeem" | "draw", spent: { hash: Uint8
     privateTxHash: new Uint8Array(32),
     circuit: { kind: "confidentialSigner", inputs: 2, outputs: 4, publicAssetSlots: 0 },
     proof: { a: new Uint8Array(32), b: new Uint8Array(128), c: new Uint8Array(32) },
-    inputs: [{ nullifierHash: RESERVE_NF, treeIndex: 0 }, { nullifierHash: wasm.nullifier(spent.hash, spent.blinding), treeIndex: 0 }],
+    inputs: [{ nullifierHash: first, treeIndex: 0 }, { nullifierHash: RESERVE_NF, treeIndex: 0 }],
     treeContexts: [{ utxoTreeRootIndex: 0, nullifierTreeRootIndex: 0 }],
   } as never);
   const layout = op === "redeem" ? ARGS.redeem : ARGS.draw;
   const args = new Uint8Array(layout.length);
   args.set(u64Bytes(BigInt(W.clock.now)), layout.now);
+  args.set(new Uint8Array(33).fill(6), layout.ownerViewing);
   if (op === "draw") args.set(u64Bytes(bound!), ARGS.draw.bound);
-  const ix: Instruction = { programAddress: PROGRAM, accounts: [ws(W.KEEPER), rs(W.USER), ws(W.KEEPER), w(address(TUSD))], data: Uint8Array.of(op === "redeem" ? TAG.redeem : TAG.draw, ...args, ...transact) };
+  const price = op === "draw" ? [{ address: address("SysvarS1otHashes111111111111111111111111111"), role: AccountRole.READONLY }] : [];
+  const ix: Instruction = { programAddress: PROGRAM, accounts: [ws(W.KEEPER), rs(W.USER), ...price, ws(W.KEEPER), w(address(TUSD))], data: Uint8Array.of(op === "redeem" ? TAG.redeem : TAG.draw, ...args, ...transact) };
   const tx = wire(W.KEEPER, [{ programAddress: COMPUTE_BUDGET_PROGRAM, data: Uint8Array.of(2, 0, 0, 0x15, 0) }, ix, ...extra]);
   return { transaction: getBase64Decoder().decode(tx), outputs: outputs.map(hex), now: W.clock.now, index: INDEX.toString(), ...(bound === undefined ? {} : { bound: bound.toString() }) };
 }
@@ -322,9 +329,23 @@ describe("intents: supply, deposit, repay", () => {
     expect((await refusal(W.lend.supply(TUSD, 999_999n, () => {}))).code).toBe("below-minimum");
     expect((await refusal(W.lend.supply(TUSD, 600_000000n, () => {}))).code).toBe("insufficient-note");
     expect((await refusal(W.lend.deposit(1, null, 10_000000n, () => {}))).code).toBe("below-minimum");
-    W.keeper.paused = true;
-    expect((await refusal(W.lend.supply(TUSD, 250_000000n, () => {}))).code).toBe("paused");
     expect(W.log.requests).toHaveLength(0);
+  });
+
+  it("shows the keeper's own pause, which still lets repayments through", async () => {
+    await W.lend.supply(TUSD, 1_000000n, () => {}); // opens the session, so the account view brings the position in
+    await givePosition(W, 42n, 4_000000000n, 1_000000n);
+    await W.lend.lendAccount();
+    W.keeper.paused = true;
+    W.keeper.positions.add("42");
+    const e = await refusal(W.lend.supply(TUSD, 250_000000n, () => {}));
+    expect(e.code).toBe("paused");
+    expect(e.message).toMatch(/paused for new deposits and borrowing/);
+    const borrow = await refusal(W.lend.draw("42", 1_000000n, 0n, () => {}));
+    expect(borrow.code).toBe("paused");
+    // A repayment is not the Worker's or the page's to refuse: its ticket comes back signed and the intent is sent.
+    const op = await W.lend.repay("42", 1_000000n, () => {});
+    expect(op).toMatchObject({ kind: "repay", step: "keeper", positionId: "42" });
   });
 
   it("names the new position in the ticket and the intent", async () => {

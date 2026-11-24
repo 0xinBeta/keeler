@@ -16,8 +16,8 @@ network peer, so the Helius key and the dealer key never reach the browser.
 | `/api/faucet` | POST | `{wallet}` sent to the first dealer's `/faucet`. 404 unless `FAUCET` is `"1"`; 503 while paused |
 | `/api/lend/pools` | GET | Keeper `GET /lend/pools`. No query. See "Lending" below |
 | `/api/lend/account` | GET | Keeper `GET /lend/account?wallet&nonce&timestamp&sessionKey&sessionExpiry&sessionAuth&signature` |
-| `/api/lend/ticket` | POST | Keeper `POST /lend/ticket`. 503 while paused |
-| `/api/lend/build` | POST | Keeper `POST /lend/build` (30 s). 503 while paused |
+| `/api/lend/ticket` | POST | Keeper `POST /lend/ticket`. Not affected by `PAUSED` |
+| `/api/lend/build` | POST | Keeper `POST /lend/build` (30 s). Not affected by `PAUSED` |
 | everything else | | Static files. HTML gets the CSP, `nosniff` and `no-referrer`; `/assets/*-<hash>.*` is cached for a year |
 
 Allowed RPC methods: `getAccountInfo getMultipleAccounts getProgramAccounts getLatestBlockhash
@@ -55,7 +55,7 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `BAND_BPS`, `MIN_TTL_SECS`, `MAX_TTL_SECS` | var | Numbers |
 | `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}`: fixed prices for mints without a Pyth account. Ignored on `mainnet` |
 | `FAUCET` | var | `"1"` turns on `/api/faucet` |
-| `PAUSED` | var | `"1"` stops `/api/quotes`, `/api/faucet`, `/api/lend/ticket` and `/api/lend/build` (503); everything else keeps working |
+| `PAUSED` | var | `"1"` stops `/api/quotes` and `/api/faucet` (503); everything else keeps working. It does not apply to `/api/lend/*`: repayments and withdrawals must work while liquidations run, so lending is paused at the keeper, which refuses only new supply, new positions and borrowing (a 403) |
 | `PYTH_ACCOUNTS` | var | JSON `{"<mint>":{"account":"<base58>","feedId":"<64 hex>"}}`: Pyth price update accounts (e.g. mainnet SOL/USD `7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE`) |
 | `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_ACCOUNTS`. A price older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
 | `LEND_PROGRAM_ID` | var | Lend program ID (base58) |
