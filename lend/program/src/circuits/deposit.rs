@@ -13,8 +13,8 @@ use super::{
     math::add,
     purpose,
     vault::{
-        assert_first_nullifier, assert_position, assert_seed, vault_rules,
-        DEPOSIT_BLINDING_DOMAIN, POSITION_BLINDING_DOMAIN,
+        assert_first_nullifier, assert_position, assert_seed, vault_rules, DEPOSIT_BLINDING_DOMAIN,
+        POSITION_BLINDING_DOMAIN,
     },
     IntentState, PositionState,
 };
@@ -141,7 +141,13 @@ impl DepositAdd {
         let rules = vault_rules(public.vault);
         let user = public.user_owner.owner();
         let mut position = DataUtxo::new_mut(&p.position_utxo, &p.position_state)?;
-        assert_position(&position, user, public.coll_hi, public.coll_lo, public.vault);
+        assert_position(
+            &position,
+            user,
+            public.coll_hi,
+            public.coll_lo,
+            public.vault,
+        );
         let mut intent = deposit_intent(
             &p.intent_utxo,
             &p.intent_state,

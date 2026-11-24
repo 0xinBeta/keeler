@@ -90,7 +90,13 @@ impl Draw {
         let pool = public.pool_owner.owner();
 
         let mut position = DataUtxo::new_mut(&p.position_utxo, &p.position_state)?;
-        assert_position(&position, user, public.coll_hi, public.coll_lo, public.vault);
+        assert_position(
+            &position,
+            user,
+            public.coll_hi,
+            public.coll_lo,
+            public.vault,
+        );
         let owner = position.owner;
         require_eq(owner.key().identity()?, public.owner_identity);
         require_eq(*p.owner_address.owner(), owner);
@@ -111,10 +117,9 @@ impl Draw {
         let added = borrow_shares(p.borrow, reserve.borrow_price);
         reserve.debt_shares = add(reserve.debt_shares, added);
         position.debt_shares = add(position.debt_shares, added);
-        let over_cap = (Field::from(math::total_debt(&reserve)) * Field::from(math::BPS))
-            .gt::<80>(
-                Field::from(math::total_supply(&reserve)) * Field::from(math::MAX_BORROW_UTIL_BPS),
-            );
+        let over_cap = (Field::from(math::total_debt(&reserve)) * Field::from(math::BPS)).gt::<80>(
+            Field::from(math::total_supply(&reserve)) * Field::from(math::MAX_BORROW_UTIL_BPS),
+        );
         require(!(borrowing && over_cap));
         let mut debt_payout = TokenUtxos::new_init(&owner, &p.debt_mint).with_zero_output();
         reserve.transfer(&mut debt_payout, &p.borrow)?;

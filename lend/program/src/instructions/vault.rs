@@ -130,7 +130,9 @@ fn pyth_quote(account: &AccountView, vault: &Vault) -> Result<Quote, ProgramErro
 
 /// Requires `|clock - published| <= PRICE_MAX_AGE`.
 fn check_age(published: i64) -> ProgramResult {
-    let age = clock()?.checked_sub(published).ok_or(VaultError::StalePrice)?;
+    let age = clock()?
+        .checked_sub(published)
+        .ok_or(VaultError::StalePrice)?;
     if age.checked_abs().is_none_or(|a| a > PRICE_MAX_AGE) {
         return Err(VaultError::StalePrice.into());
     }
@@ -170,7 +172,7 @@ fn scale(value: u128, shift: i64, up: bool) -> Result<u64, ProgramError> {
     } else {
         let divisor = power(-shift)?;
         let q = value / divisor;
-        if up && value % divisor != 0 {
+        if up && !value.is_multiple_of(divisor) {
             q + 1
         } else {
             q

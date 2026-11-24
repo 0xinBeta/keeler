@@ -17,7 +17,9 @@ use solana_program_error::ProgramError;
 #[cfg(all(feature = "test-price", not(feature = "insecure-test-setup")))]
 compile_error!("the test-price feature lets the keeper set the oracle price: enable it only with insecure-test-setup, for local networks and devnet");
 #[cfg(all(feature = "test-price", feature = "mainnet"))]
-compile_error!("the test-price feature lets the keeper set the oracle price: never in a mainnet build");
+compile_error!(
+    "the test-price feature lets the keeper set the oracle price: never in a mainnet build"
+);
 
 /// A vault: one collateral mint, one debt mint (whose reserve it borrows
 /// from) and the oracle that prices the collateral in the debt token.

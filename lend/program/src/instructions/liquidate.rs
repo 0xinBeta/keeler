@@ -8,9 +8,9 @@ use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
-    check_now, cpi, parse, require_keeper, verified,
+    check_now, cpi, parse, require_keeper,
     vault::{check_liquidate_bound, first_nullifier, mints, vault},
-    Pda,
+    verified, Pda,
 };
 use crate::{verifier::liquidate as v, POOL_SEED, USER_SEED};
 

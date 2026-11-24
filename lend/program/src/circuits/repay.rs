@@ -15,8 +15,7 @@ use super::{
     math::{accrue, refresh, repay_shares, sub, TUSD_POOL},
     purpose, reserve_address,
     vault::{
-        assert_first_nullifier, assert_position, assert_seed, vault_rules,
-        POSITION_BLINDING_DOMAIN,
+        assert_first_nullifier, assert_position, assert_seed, vault_rules, POSITION_BLINDING_DOMAIN,
     },
     IntentState, PositionState, ReserveState,
 };
@@ -79,7 +78,13 @@ impl Repay {
         let pool = public.pool_owner.owner();
 
         let mut position = DataUtxo::new_mut(&p.position_utxo, &p.position_state)?;
-        assert_position(&position, user, public.coll_hi, public.coll_lo, public.vault);
+        assert_position(
+            &position,
+            user,
+            public.coll_hi,
+            public.coll_lo,
+            public.vault,
+        );
 
         let mut intent = DataUtxo::new_mut(&p.intent_utxo, &p.intent_state)?.close();
         require_eq(intent.owner(), *user);

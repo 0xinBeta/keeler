@@ -16,9 +16,9 @@ pub mod client;
 mod wasm;
 
 pub mod error;
-pub mod vaults;
 #[cfg(all(not(feature = "build-circuits"), not(xark)))]
 pub mod instructions;
+pub mod vaults;
 #[cfg(all(not(feature = "build-circuits"), not(xark)))]
 #[rustfmt::skip] // The generator's exact output.
 #[allow(clippy::useless_conversion)]

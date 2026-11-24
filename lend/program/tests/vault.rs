@@ -120,7 +120,14 @@ fn pool_bump() -> u8 {
 
 // --- deposit, repay: keeper, now, expiry, vault, inputs ---
 
-fn deposit(ix_tag: u8, keeper: Pubkey, vault: u64, now: u64, expiry: u64, inputs: usize) -> Instruction {
+fn deposit(
+    ix_tag: u8,
+    keeper: Pubkey,
+    vault: u64,
+    now: u64,
+    expiry: u64,
+    inputs: usize,
+) -> Instruction {
     let owner = [7; 32];
     let args = DepositArgs {
         proof: proof(),
@@ -147,14 +154,35 @@ fn deposit_refusals_before_the_proof() {
     for ix_tag in [tag::DEPOSIT, tag::DEPOSIT_ADD] {
         let accounts = [(keeper, account()), (other, account())];
         let cases = [
-            (deposit(ix_tag, other, 1, now, now, 1), lend(LendError::NotKeeper)),
-            (deposit(ix_tag, keeper, 1, now - 121, now, 1), lend(LendError::StaleNow)),
-            (deposit(ix_tag, keeper, 1, now + 1, now + 1, 1), lend(LendError::StaleNow)),
-            (deposit(ix_tag, keeper, 1, now - 10, now - 1, 1), vault_err(VaultError::IntentExpired)),
-            (deposit(ix_tag, keeper, 2, now, now, 1), vault_err(VaultError::UnknownVault)),
-            (deposit(ix_tag, keeper, 1, now, now, 0), vault_err(VaultError::NoInputs)),
+            (
+                deposit(ix_tag, other, 1, now, now, 1),
+                lend(LendError::NotKeeper),
+            ),
+            (
+                deposit(ix_tag, keeper, 1, now - 121, now, 1),
+                lend(LendError::StaleNow),
+            ),
+            (
+                deposit(ix_tag, keeper, 1, now + 1, now + 1, 1),
+                lend(LendError::StaleNow),
+            ),
+            (
+                deposit(ix_tag, keeper, 1, now - 10, now - 1, 1),
+                vault_err(VaultError::IntentExpired),
+            ),
+            (
+                deposit(ix_tag, keeper, 2, now, now, 1),
+                vault_err(VaultError::UnknownVault),
+            ),
+            (
+                deposit(ix_tag, keeper, 1, now, now, 0),
+                vault_err(VaultError::NoInputs),
+            ),
             // The expiry is the clock's second: still fillable.
-            (deposit(ix_tag, keeper, 1, now, now, 1), lend(LendError::InvalidProof)),
+            (
+                deposit(ix_tag, keeper, 1, now, now, 1),
+                lend(LendError::InvalidProof),
+            ),
         ];
         for (ix, err) in cases {
             expect_err_exact(&mollusk, &ix, &accounts, err);
@@ -192,9 +220,15 @@ fn repay_refusals_before_the_proof() {
     for (ix, err) in [
         (repay(other, now, now, 1), lend(LendError::NotKeeper)),
         (repay(keeper, now - 121, now, 1), lend(LendError::StaleNow)),
-        (repay(keeper, now - 5, now - 1, 1), vault_err(VaultError::IntentExpired)),
+        (
+            repay(keeper, now - 5, now - 1, 1),
+            vault_err(VaultError::IntentExpired),
+        ),
         (repay(keeper, now, now, 0), vault_err(VaultError::NoInputs)),
-        (repay(keeper, now, now + 60, 1), lend(LendError::InvalidProof)),
+        (
+            repay(keeper, now, now + 60, 1),
+            lend(LendError::InvalidProof),
+        ),
     ] {
         expect_err_exact(&mollusk, &ix, &accounts, err);
     }
@@ -227,7 +261,14 @@ fn good_pyth() -> Account {
     pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, NOW - 30))
 }
 
-fn draw(keeper: Pubkey, owner: Pubkey, owner_signs: bool, price: Pubkey, now: u64, bound: u64) -> Instruction {
+fn draw(
+    keeper: Pubkey,
+    owner: Pubkey,
+    owner_signs: bool,
+    price: Pubkey,
+    now: u64,
+    bound: u64,
+) -> Instruction {
     let args = DrawArgs {
         proof: proof(),
         vault: 1,
@@ -274,7 +315,11 @@ fn liquidate(keeper: Pubkey, price: Pubkey, now: u64, bound: u64) -> Instruction
 
 /// Draw at `bound` with `price` as the vault's Pyth account.
 fn draw_with(mollusk: &Mollusk, price: Account, bound: u64) -> ProgramResult {
-    let (keeper, owner, feed) = (pk(&KEEPER), Pubkey::new_unique(), pk(&TSOL_TUSD.price_account));
+    let (keeper, owner, feed) = (
+        pk(&KEEPER),
+        Pubkey::new_unique(),
+        pk(&TSOL_TUSD.price_account),
+    );
     run(
         mollusk,
         &draw(keeper, owner, true, feed, NOW as u64, bound),
@@ -289,13 +334,20 @@ fn fails(e: ProgramError) -> ProgramResult {
 #[test]
 fn draw_needs_the_keeper_and_the_owner() {
     let mollusk = setup();
-    let (keeper, owner, feed) = (pk(&KEEPER), Pubkey::new_unique(), pk(&TSOL_TUSD.price_account));
+    let (keeper, owner, feed) = (
+        pk(&KEEPER),
+        Pubkey::new_unique(),
+        pk(&TSOL_TUSD.price_account),
+    );
     let accounts = [(keeper, account()), (owner, account()), (feed, good_pyth())];
     let ix = draw(owner, keeper, true, feed, NOW as u64, LOW);
     expect_err_exact(&mollusk, &ix, &accounts, lend(LendError::NotKeeper));
     // Unsigned by the owner: the account checks refuse it.
     let ix = draw(keeper, owner, false, feed, NOW as u64, LOW);
-    assert!(matches!(run(&mollusk, &ix, &accounts), ProgramResult::Failure(_)));
+    assert!(matches!(
+        run(&mollusk, &ix, &accounts),
+        ProgramResult::Failure(_)
+    ));
     let ix = draw(keeper, owner, true, feed, NOW as u64 - 121, LOW);
     expect_err_exact(&mollusk, &ix, &accounts, lend(LendError::StaleNow));
     let ix = draw(keeper, owner, true, feed, NOW as u64, LOW);
@@ -305,7 +357,10 @@ fn draw_needs_the_keeper_and_the_owner() {
 #[test]
 fn draw_bound_at_most_price_minus_confidence() {
     let mollusk = setup();
-    assert_eq!(draw_with(&mollusk, good_pyth(), LOW), fails(lend(LendError::InvalidProof)));
+    assert_eq!(
+        draw_with(&mollusk, good_pyth(), LOW),
+        fails(lend(LendError::InvalidProof))
+    );
     assert_eq!(
         draw_with(&mollusk, good_pyth(), LOW + 1),
         fails(vault_err(VaultError::BoundAbovePrice))
@@ -343,7 +398,11 @@ fn pyth_account_refusals() {
     let mollusk = setup();
     let bound = LOW;
     let check = |account: Account, err: VaultError| {
-        assert_eq!(draw_with(&mollusk, account, bound), fails(vault_err(err)), "{err:?}");
+        assert_eq!(
+            draw_with(&mollusk, account, bound),
+            fails(vault_err(err)),
+            "{err:?}"
+        );
     };
     // Owner, discriminator, length, verification level, feed.
     let mut a = good_pyth();
@@ -363,22 +422,44 @@ fn pyth_account_refusals() {
     d[50] ^= 1;
     check(pyth_account(d), VaultError::WrongFeed);
     // Age: 90 s either way is the limit.
-    check(pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, NOW - 91)), VaultError::StalePrice);
-    check(pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, NOW + 91)), VaultError::StalePrice);
-    check(pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, i64::MIN)), VaultError::StalePrice);
+    check(
+        pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, NOW - 91)),
+        VaultError::StalePrice,
+    );
+    check(
+        pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, NOW + 91)),
+        VaultError::StalePrice,
+    );
+    check(
+        pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, i64::MIN)),
+        VaultError::StalePrice,
+    );
     for published in [NOW - 90, NOW + 90] {
         assert_eq!(
-            draw_with(&mollusk, pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, published)), bound),
+            draw_with(
+                &mollusk,
+                pyth_account(pyth_data(PYTH_150, PYTH_CONF, -8, published)),
+                bound
+            ),
             fails(lend(LendError::InvalidProof))
         );
     }
     // Non-positive prices, confidence as wide as the price, exponents that do not fit.
     for price in [0, -1, i64::MIN] {
-        check(pyth_account(pyth_data(price, 0, -8, NOW)), VaultError::BadPrice);
+        check(
+            pyth_account(pyth_data(price, 0, -8, NOW)),
+            VaultError::BadPrice,
+        );
     }
-    check(pyth_account(pyth_data(PYTH_150, PYTH_150 as u64, -8, NOW)), VaultError::BadPrice);
+    check(
+        pyth_account(pyth_data(PYTH_150, PYTH_150 as u64, -8, NOW)),
+        VaultError::BadPrice,
+    );
     for expo in [30, i32::MAX, i32::MIN] {
-        check(pyth_account(pyth_data(PYTH_150, PYTH_CONF, expo, NOW)), VaultError::PriceOverflow);
+        check(
+            pyth_account(pyth_data(PYTH_150, PYTH_CONF, expo, NOW)),
+            VaultError::PriceOverflow,
+        );
     }
     // Any other account, even with a good update in it.
     let (keeper, owner, elsewhere) = (pk(&KEEPER), Pubkey::new_unique(), Pubkey::new_unique());
@@ -386,7 +467,11 @@ fn pyth_account_refusals() {
         run(
             &mollusk,
             &draw(keeper, owner, true, elsewhere, NOW as u64, bound),
-            &[(keeper, account()), (owner, account()), (elsewhere, good_pyth())],
+            &[
+                (keeper, account()),
+                (owner, account()),
+                (elsewhere, good_pyth())
+            ],
         ),
         fails(vault_err(VaultError::WrongPriceAccount))
     );
@@ -394,7 +479,13 @@ fn pyth_account_refusals() {
 
 // --- the test price account ---
 
-fn set_test_price(keeper: Pubkey, account: Pubkey, price: u64, conf: u64, published: i64) -> Instruction {
+fn set_test_price(
+    keeper: Pubkey,
+    account: Pubkey,
+    price: u64,
+    conf: u64,
+    published: i64,
+) -> Instruction {
     let mut data = vec![tag::SET_TEST_PRICE];
     data.extend(
         wincode::serialize(&SetTestPriceArgs {
@@ -461,7 +552,10 @@ fn test_price_is_the_keepers_and_is_checked_like_pyth() {
             &[(keeper, account()), (owner, account()), (test, price)],
         )
     };
-    assert_eq!(draw_at(created.clone(), 149_900_000_000), fails(lend(LendError::InvalidProof)));
+    assert_eq!(
+        draw_at(created.clone(), 149_900_000_000),
+        fails(lend(LendError::InvalidProof))
+    );
     assert_eq!(
         draw_at(created.clone(), 149_900_000_001),
         fails(vault_err(VaultError::BoundAbovePrice))
@@ -470,7 +564,10 @@ fn test_price_is_the_keepers_and_is_checked_like_pyth() {
     // Not the program's: refused.
     let mut forged = created;
     forged.owner = Pubkey::new_unique();
-    assert_eq!(draw_at(forged, 1), fails(vault_err(VaultError::WrongTestPriceAccount)));
+    assert_eq!(
+        draw_at(forged, 1),
+        fails(vault_err(VaultError::WrongTestPriceAccount))
+    );
 }
 
 // --- close ---
@@ -495,7 +592,20 @@ fn close_is_the_owners() {
         ),
     };
     let accounts = [(owner, account())];
-    expect_err_exact(&mollusk, &close(2, true), &accounts, vault_err(VaultError::UnknownVault));
-    assert!(matches!(run(&mollusk, &close(1, false), &accounts), ProgramResult::Failure(_)));
-    expect_err_exact(&mollusk, &close(1, true), &accounts, lend(LendError::InvalidProof));
+    expect_err_exact(
+        &mollusk,
+        &close(2, true),
+        &accounts,
+        vault_err(VaultError::UnknownVault),
+    );
+    assert!(matches!(
+        run(&mollusk, &close(1, false), &accounts),
+        ProgramResult::Failure(_)
+    ));
+    expect_err_exact(
+        &mollusk,
+        &close(1, true),
+        &accounts,
+        lend(LendError::InvalidProof),
+    );
 }

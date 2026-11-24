@@ -17,15 +17,12 @@ use spr_program::{
 
 use super::{
     assert_mint, assert_note,
-    math::{
-        accrue, add, debt_of, refresh, repay_shares, sub, to_u64, BPS, PRICE_SCALE,
-        TUSD_POOL,
-    },
+    math::{accrue, add, debt_of, refresh, repay_shares, sub, to_u64, BPS, PRICE_SCALE, TUSD_POOL},
     reserve_address,
     vault::{
-        div_floor,
         above_max_limit, assert_first_nullifier, assert_position, assert_seed,
-        at_or_past_threshold, is_liquidatable, value, vault_rules, POSITION_BLINDING_DOMAIN,
+        at_or_past_threshold, div_floor, is_liquidatable, value, vault_rules,
+        POSITION_BLINDING_DOMAIN,
     },
     PositionState, ReserveState,
 };
@@ -92,7 +89,13 @@ impl Liquidate {
         let pool = public.pool_owner.owner();
 
         let mut position = DataUtxo::new_mut(&p.position_utxo, &p.position_state)?;
-        assert_position(&position, user, public.coll_hi, public.coll_lo, public.vault);
+        assert_position(
+            &position,
+            user,
+            public.coll_hi,
+            public.coll_lo,
+            public.vault,
+        );
 
         let mut funds = TokenUtxos::new_mut(core::slice::from_ref(&p.funds))?.with_zero_output();
         let liquidator = funds.owner();

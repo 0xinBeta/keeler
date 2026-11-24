@@ -141,7 +141,10 @@ pub fn deposit_open(
             first_nullifier: nullifier(&intent)?,
         },
     }
-    .prepare(&keeper.shielded_address().map_err(err)?, keeper_key(keeper)?)
+    .prepare(
+        &keeper.shielded_address().map_err(err)?,
+        keeper_key(keeper)?,
+    )
     .map_err(err)?;
     deposit_prepared(
         keeper,
@@ -191,7 +194,10 @@ pub fn deposit_add(
             first_nullifier: nullifier(&position)?,
         },
     }
-    .prepare(&keeper.shielded_address().map_err(err)?, keeper_key(keeper)?)
+    .prepare(
+        &keeper.shielded_address().map_err(err)?,
+        keeper_key(keeper)?,
+    )
     .map_err(err)?;
     deposit_prepared(
         keeper,
@@ -305,7 +311,10 @@ pub fn draw(
             first_nullifier: nullifier(&position)?,
         },
     }
-    .prepare(&keeper.shielded_address().map_err(err)?, keeper_key(keeper)?)
+    .prepare(
+        &keeper.shielded_address().map_err(err)?,
+        keeper_key(keeper)?,
+    )
     .map_err(err)?;
     let (pool_bump, user_bump) = (pool.bump, user.bump);
     let owner_viewing = *owner.viewing_pubkey.as_bytes();
@@ -387,7 +396,10 @@ pub fn repay(
             first_nullifier: nullifier(&position)?,
         },
     }
-    .prepare(&keeper.shielded_address().map_err(err)?, keeper_key(keeper)?)
+    .prepare(
+        &keeper.shielded_address().map_err(err)?,
+        keeper_key(keeper)?,
+    )
     .map_err(err)?;
     let (pool_bump, user_bump) = (pool.bump, user.bump);
     let owner_bytes = owner_key.to_bytes();
@@ -516,7 +528,10 @@ pub fn liquidate_with(
             first_nullifier: nullifier(&position)?,
         },
     }
-    .prepare(&keeper.shielded_address().map_err(err)?, keeper_key(keeper)?)
+    .prepare(
+        &keeper.shielded_address().map_err(err)?,
+        keeper_key(keeper)?,
+    )
     .map_err(err)?;
     let (pool_bump, user_bump) = (pool.bump, user.bump);
     let owner_bytes = owner_key.to_bytes();

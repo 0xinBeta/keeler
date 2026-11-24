@@ -6,9 +6,9 @@ use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
-    cpi, identity, parse, verified,
+    cpi, identity, parse,
     vault::{mints, vault},
-    Pda,
+    verified, Pda,
 };
 use crate::{verifier::close as v, USER_SEED};
 

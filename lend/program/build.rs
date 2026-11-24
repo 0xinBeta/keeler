@@ -31,7 +31,10 @@ const DEFAULTS: [(&str, &str); 6] = [
         "KEELER_LEND_VAULT1_COLLATERAL_MINT",
         "11111111111111111111111111111111",
     ),
-    ("KEELER_LEND_VAULT1_DEBT_MINT", "2moKCsA6LcKd7e6v1zCNAMFkoYiExZVGfEagvAZD1rYh"),
+    (
+        "KEELER_LEND_VAULT1_DEBT_MINT",
+        "2moKCsA6LcKd7e6v1zCNAMFkoYiExZVGfEagvAZD1rYh",
+    ),
     (
         "KEELER_LEND_VAULT1_PRICE_ACCOUNT",
         "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",

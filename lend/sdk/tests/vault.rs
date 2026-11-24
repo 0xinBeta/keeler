@@ -163,7 +163,15 @@ fn draw(
 
 /// `user`'s position (1 tSOL) after borrowing `borrow`, and the reserve.
 fn borrowed(user: &ShieldedKeypair, borrow: u64) -> (WalletUtxo, WalletUtxo) {
-    let p = draw(user, reserve(1_000 * USD), open(user, SOL, 7), borrow, 0, P150).unwrap();
+    let p = draw(
+        user,
+        reserve(1_000 * USD),
+        open(user, SOL, 7),
+        borrow,
+        0,
+        P150,
+    )
+    .unwrap();
     (
         pda_input(user, &p.outputs[DRAW_POSITION_SLOT], 4),
         reserve_out(&p, DRAW_RESERVE_SLOT),
@@ -185,7 +193,12 @@ fn deposit_open_credits_the_maker_and_the_keeper_reads_it() {
     let state: PositionState = decode(&pda_input(&user, out, 2)).unwrap();
     let maker: IntentState = decode(&intent).unwrap();
     assert_eq!(
-        (state.owner, state.vault, state.position_id, state.debt_shares),
+        (
+            state.owner,
+            state.vault,
+            state.position_id,
+            state.debt_shares
+        ),
         (maker.maker, V, 7, 0)
     );
     // The blinding seed comes from the intent, whose nullifier is published first.
@@ -196,7 +209,10 @@ fn deposit_open_credits_the_maker_and_the_keeper_reads_it() {
     );
     // The keeper recovers the outputs through its transaction viewing key.
     let read = read_outputs(&keeper(), &p.first_nullifier, &p.spp).unwrap();
-    assert_eq!(read[DEPOSIT_POSITION_SLOT].as_ref().unwrap().amount, 2 * SOL);
+    assert_eq!(
+        read[DEPOSIT_POSITION_SLOT].as_ref().unwrap().amount,
+        2 * SOL
+    );
 }
 
 #[test]
@@ -213,7 +229,13 @@ fn deposit_open_refusals() {
     let junk = intent_full(&user, debt(), SOL, purpose::DEPOSIT, 7);
     assert!(vault::deposit_open(&k, &addr(&user), junk, V, NOW, TREE).is_err());
     // Below the minimum, after expiry, an unknown vault.
-    let small = intent_full(&user, coll(), TSOL_TUSD_MIN_COLLATERAL - 1, purpose::DEPOSIT, 7);
+    let small = intent_full(
+        &user,
+        coll(),
+        TSOL_TUSD_MIN_COLLATERAL - 1,
+        purpose::DEPOSIT,
+        7,
+    );
     assert!(vault::deposit_open(&k, &addr(&user), small, V, NOW, TREE).is_err());
     assert!(vault::deposit_open(&k, &addr(&user), good(), V, EXPIRY + 1, TREE).is_err());
     assert!(vault::deposit_open(&k, &addr(&user), good(), 2, NOW, TREE).is_err());
@@ -271,7 +293,8 @@ fn draw_borrows_to_the_owner() {
     assert_eq!(payout.amount, 100 * USD);
     assert_eq!(payout.owner_address, Some(addr(&user)));
     assert_eq!(p.outputs[DRAW_COLLATERAL_SLOT].amount, 0);
-    let state: PositionState = decode(&pda_input(&user, &p.outputs[DRAW_POSITION_SLOT], 4)).unwrap();
+    let state: PositionState =
+        decode(&pda_input(&user, &p.outputs[DRAW_POSITION_SLOT], 4)).unwrap();
     assert_eq!(
         state.debt_shares,
         core::borrow_shares(100 * USD, 1_000_000_000_000).unwrap()
@@ -291,7 +314,15 @@ fn draw_borrows_to_the_owner() {
     let read = read_outputs(&keeper(), &p.first_nullifier, &p.spp).unwrap();
     assert_eq!(read[DRAW_DEBT_SLOT].as_ref().unwrap().amount, 100 * USD);
     // Exactly at the collateral factor: $150 x 80%.
-    assert!(draw(&user, reserve(1_000 * USD), open(&user, SOL, 7), 120 * USD, 0, P150).is_ok());
+    assert!(draw(
+        &user,
+        reserve(1_000 * USD),
+        open(&user, SOL, 7),
+        120 * USD,
+        0,
+        P150
+    )
+    .is_ok());
 }
 
 #[test]
@@ -330,12 +361,22 @@ fn draw_refusals() {
     let (pos, r) = borrowed(&user, 100 * USD);
     assert!(draw(&user, r.clone(), pos.clone(), 0, SOL / 5, P150).is_err());
     assert!(draw(&user, r.clone(), pos.clone(), 0, SOL / 100, P150).is_ok());
-    let p = draw(&user, big(), position(), 0, SOL - TSOL_TUSD_MIN_COLLATERAL + 1, P150);
+    let p = draw(
+        &user,
+        big(),
+        position(),
+        0,
+        SOL - TSOL_TUSD_MIN_COLLATERAL + 1,
+        P150,
+    );
     assert!(p.is_err());
     // All of it with no debt is fine, paid to the owner.
     let p = draw(&user, big(), position(), 0, SOL, P150).unwrap();
     assert_eq!(p.outputs[DRAW_COLLATERAL_SLOT].amount, SOL);
-    assert_eq!(p.outputs[DRAW_COLLATERAL_SLOT].owner_address, Some(addr(&user)));
+    assert_eq!(
+        p.outputs[DRAW_COLLATERAL_SLOT].owner_address,
+        Some(addr(&user))
+    );
 }
 
 #[test]
@@ -357,7 +398,8 @@ fn draw_accrues_first() {
         (expected.borrow_price, expected.supply_price, NOW)
     );
     // The new shares are at the accrued price.
-    let state: PositionState = decode(&pda_input(&user, &p.outputs[DRAW_POSITION_SLOT], 4)).unwrap();
+    let state: PositionState =
+        decode(&pda_input(&user, &p.outputs[DRAW_POSITION_SLOT], 4)).unwrap();
     assert_eq!(
         state.debt_shares,
         core::borrow_shares(10 * USD, expected.borrow_price).unwrap()
@@ -373,7 +415,17 @@ fn repay(
     position: WalletUtxo,
     intent: WalletUtxo,
 ) -> anyhow::Result<Prepared> {
-    vault::repay(&keeper(), &addr(user), r, position, intent, V, NOW, SALT, TREE)
+    vault::repay(
+        &keeper(),
+        &addr(user),
+        r,
+        position,
+        intent,
+        V,
+        NOW,
+        SALT,
+        TREE,
+    )
 }
 
 #[test]
@@ -388,7 +440,8 @@ fn repay_partial_and_with_change() {
         intent_full(&user, debt(), 40 * USD, purpose::REPAY, 7),
     )
     .unwrap();
-    let after: PositionState = decode(&pda_input(&user, &p.outputs[REPAY_POSITION_SLOT], 5)).unwrap();
+    let after: PositionState =
+        decode(&pda_input(&user, &p.outputs[REPAY_POSITION_SLOT], 5)).unwrap();
     let want = core::repay_shares(shares, 40 * USD, 1_000_000_000_000).unwrap();
     assert_eq!(after.debt_shares, want.shares);
     assert_eq!(p.outputs[REPAY_CHANGE_SLOT].amount, 0);
@@ -401,7 +454,8 @@ fn repay_partial_and_with_change() {
         intent_full(&user, debt(), 150 * USD, purpose::REPAY, 7),
     )
     .unwrap();
-    let after: PositionState = decode(&pda_input(&user, &p.outputs[REPAY_POSITION_SLOT], 5)).unwrap();
+    let after: PositionState =
+        decode(&pda_input(&user, &p.outputs[REPAY_POSITION_SLOT], 5)).unwrap();
     assert_eq!(after.debt_shares, 0);
     let change = &p.outputs[REPAY_CHANGE_SLOT];
     assert_eq!(
@@ -495,8 +549,7 @@ fn liquidate_back_to_the_threshold() {
     let (p, plan) = liquidate(&user, r.clone(), pos.clone(), bound).unwrap();
     assert!(plan.repay > 0 && plan.repay < 120 * USD);
     assert_eq!(plan.buffer, plan.repay / 100);
-    let formula =
-        ((plan.repay + plan.buffer) as u128 * 1_000_000_000_000 / bound as u128) as u64;
+    let formula = ((plan.repay + plan.buffer) as u128 * 1_000_000_000_000 / bound as u128) as u64;
     assert_eq!(plan.payout, formula.min(SOL));
     let payout = &p.outputs[LIQUIDATE_PAYOUT_SLOT];
     assert_eq!(
@@ -515,7 +568,10 @@ fn liquidate_back_to_the_threshold() {
     let change = &p.outputs[LIQUIDATE_CHANGE_SLOT];
     assert_eq!(
         (change.amount, change.owner_address),
-        (1_000 * USD - plan.repay - plan.buffer, Some(addr(&keeper())))
+        (
+            1_000 * USD - plan.repay - plan.buffer,
+            Some(addr(&keeper()))
+        )
     );
     // The buffer stays in the reserve without shares.
     let after: ReserveState = decode(&reserve_out(&p, LIQUIDATE_RESERVE_SLOT)).unwrap();
