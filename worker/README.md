@@ -7,13 +7,17 @@ network peer, so the Helius key and the dealer key never reach the browser.
 
 | Route | Method | What it does |
 | --- | --- | --- |
-| `/api/config` | GET | Public config: `{network, rpcPath, sprPath, programId, assets:[{mint,symbol,decimals,maxSell?}], dealers:[{pubkey}], bandBps, minTtlSecs, maxTtlSecs, faucet, paused}` |
+| `/api/config` | GET | Public config: `{network, rpcPath, sprPath, programId, assets:[{mint,symbol,decimals,maxSell?}], dealers:[{pubkey}], bandBps, minTtlSecs, maxTtlSecs, faucet, paused, lend?: {programId, pools, vaults}}` |
 | `/api/prices` | GET | `{[mint]: {price: "<int>", expo, publishTime}}` from Pyth's on-chain price accounts when `PYTH_ACCOUNTS` is set, otherwise the fixed `REFERENCE` values stamped now and marked `"fixed": true` |
 | `/api/rpc` | POST | Solana JSON-RPC proxy. Method allowlist, batches checked per element, 64 KiB body cap |
 | `/v1/spr/*` | GET, POST | Helius Privacy Rings indexer and TEE prover proxy. Exact path allowlist, 1 MiB request cap, response cap 10 MiB (indexer) / 1 MiB (prover) |
 | `/api/tee-policy` | GET | The signed TEE policy for `devnet`/`mainnet` (the browser checks the signatures). 404 on `local` |
 | `/api/quotes` | POST | `{sell_mint, buy_mint, sell_amount, trader}` sent to every dealer's `/quote` (3 s each) → `[{dealer, quote: {buy_amount, expiry, signature}\|null}]`. A signature that is not 128 lowercase hex makes the quote `null`; the Worker never verifies it. 503 while paused |
 | `/api/faucet` | POST | `{wallet}` sent to the first dealer's `/faucet`. 404 unless `FAUCET` is `"1"`; 503 while paused |
+| `/api/lend/pools` | GET | Keeper `GET /lend/pools`. No query. See "Lending" below |
+| `/api/lend/account` | GET | Keeper `GET /lend/account?wallet&nonce&timestamp&signature` |
+| `/api/lend/ticket` | POST | Keeper `POST /lend/ticket`. 503 while paused |
+| `/api/lend/build` | POST | Keeper `POST /lend/build` (30 s). 503 while paused |
 | everything else | | Static files. HTML gets the CSP, `nosniff` and `no-referrer`; `/assets/*-<hash>.*` is cached for a year |
 
 Allowed RPC methods: `getAccountInfo getMultipleAccounts getProgramAccounts getLatestBlockhash
@@ -51,9 +55,39 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `BAND_BPS`, `MIN_TTL_SECS`, `MAX_TTL_SECS` | var | Numbers |
 | `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}`: fixed prices for mints without a Pyth account. Ignored on `mainnet` |
 | `FAUCET` | var | `"1"` turns on `/api/faucet` |
-| `PAUSED` | var | `"1"` stops `/api/quotes` and `/api/faucet` (503); everything else keeps working |
+| `PAUSED` | var | `"1"` stops `/api/quotes`, `/api/faucet`, `/api/lend/ticket` and `/api/lend/build` (503); everything else keeps working |
 | `PYTH_ACCOUNTS` | var | JSON `{"<mint>":{"account":"<base58>","feedId":"<64 hex>"}}`: Pyth price update accounts (e.g. mainnet SOL/USD `7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE`) |
 | `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_ACCOUNTS`. A price older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
+| `LEND_PROGRAM_ID` | var | Lend program ID (base58) |
+| `LEND_POOLS` | var | JSON `[{"mint","curve":[{"utilisationBps","rateBps"}],"feeBps","maxUtilisationBps","minSupply"}]`. The curve has 2 to 8 points, utilisation strictly rising from 0 to 10000 |
+| `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps` |
+
+## Lending
+
+With none of `LEND_PROGRAM_ID`, `LEND_POOLS` and `LEND_VAULTS` set, `/api/config` has no `lend`
+and every `/api/lend/*` route is a 404. With any of them set, all three must be valid or
+`/api/config` and the lend routes are a 500. `/api/config` then carries
+`lend: {programId, pools, vaults}` exactly as configured.
+
+Each route goes to the keeper, which for now is the first `DEALERS` entry, with `x-keeler-key`.
+Bodies and queries must have exactly the fields below (unknown fields are refused, 400);
+amounts and ids are decimal strings that fit a u64, `timestamp`, `expiry`, `now` and `at` are
+whole seconds, `vault` is 0 to 65535. The Worker forwards only the checked fields, and returns
+only a reply of exactly the shape below; anything else is a 502. A keeper 4xx with
+`{"error": "<text>"}` is passed through (text cut to 200 characters). Bodies and replies are
+capped at 16 KiB. Timeout 30 s for `build`, 10 s for the rest.
+
+Signed fields, on `ticket`, `build` and `account` (the keeper checks the signature and freshness):
+`wallet` (base58), `nonce` (32 lowercase hex), `timestamp`, `signature` (128 lowercase hex).
+
+| Route | Request | Reply |
+| --- | --- | --- |
+| `pools` | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
+| `account` | query: signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}`, each at most 8; `message` is base64 up to 512 characters; `status` is `waiting`, `filled` or `refundable` |
+| `ticket` | signed fields, `purpose` (`supply`, `deposit`, `repay`), `amount`, optional `pool`, `vault`, `position` | `{id (32 hex), expiry, signature (128 hex)}` |
+| `build` | signed fields, `op` (`redeem`, `draw`), optional `pool`, `vault`, `position`, `amount`, `borrow`, `withdraw` | `{transaction (base64, at most 5,464 characters = 4,096 bytes), outputs: [64 hex] (1 to 8), now, bound?}` |
+
+Which optional fields an operation needs is the keeper's check, not the Worker's.
 
 Prices: one `getMultipleAccounts` (base64) to the RPC upstream reads every configured account.
 Each must exist, be owned by Pyth's receiver `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`,
@@ -83,6 +117,18 @@ constant key for everyone. These are settings: tune them to your Helius plan. A 
 | `PROVE_GLOBAL_LIMIT` | 30 | global | POST `/prove/*` |
 | `QUOTE_LIMIT` | 30 | client | `/api/quotes` |
 | `FAUCET_LIMIT` | 3 | client | `/api/faucet` |
+| `LEND_READ_LIMIT` | 60 | client | `/api/lend/pools`, `/api/lend/account` |
+| `LEND_READ_GLOBAL_LIMIT` | 600 | global | same |
+| `LEND_TICKET_LIMIT` | 10 | client | `/api/lend/ticket` |
+| `LEND_TICKET_GLOBAL_LIMIT` | 60 | global | same |
+| `LEND_BUILD_LIMIT` | 6 | client | `/api/lend/build` (each is two keeper proofs) |
+| `LEND_BUILD_GLOBAL_LIMIT` | 12 | global | same |
+
+The client limit is checked first. A global limit is charged only after the request passed
+every check (method, path, size, content type, shape), so malformed requests cannot use up
+everyone's share. A proof POST must be a JSON object (`application/json`) or a TEE-encrypted
+body (`application/octet-stream` with `Spr-Tee`, `Spr-Tee-Enc` and at least 16 bytes);
+anything else is a 400 or 415 before `PROVE_GLOBAL_LIMIT` is touched.
 
 When a binding is missing, `NETWORK=local` means no limit. On any other network the request
 is refused with a 503.
