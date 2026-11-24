@@ -1013,6 +1013,48 @@ fn racing_builds_on_one_reserve_resolve_by_output_hash() {
 }
 
 #[test]
+fn redeem_takes_amount_or_shares() {
+    let s = Setup::new("shares", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let pool = || ("pool", vault1().debt_mint.to_string());
+    let op = || ("op", "redeem".to_owned());
+    let both = [op(), pool(), ("amount", "1".into()), ("shares", "1".into())];
+    assert_eq!(build_req(&k, &lender, &both).0, 400);
+    assert_eq!(build_req(&k, &lender, &[op(), pool()]).0, 400);
+    let over = [op(), pool(), ("shares", (100 * USD + 1).to_string())];
+    assert_eq!(build_req(&k, &lender, &over).0, 422);
+    // Every share: the whole receipt's worth leaves the reserve, and the
+    // zero-share receipt leaves the book.
+    let before = k.snapshot().unwrap().reserve.unwrap().amount;
+    let all = [op(), pool(), ("shares", (100 * USD).to_string())];
+    let (st, v) = build_req(&k, &lender, &all);
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    let book = k.snapshot().unwrap();
+    assert_eq!(book.reserve.unwrap().amount, before - 100 * USD);
+    assert!(book.receipts.is_empty());
+}
+
+#[test]
+fn shares_redeem_pays_what_burns_exactly_those_shares() {
+    use keeler_lend_sdk::builders::redeem_amount_for_shares;
+    for price in [1_000_000_000_000u64, 1_000_000_000_001, 1_234_567_890_123, 3_000_000_000_000] {
+        let r = ReserveState {
+            supply_price: price,
+            ..fresh_reserve(u64::MAX / 4, 0)
+        };
+        for shares in [1u64, 7, 999_999, 100 * USD, 123_456_789_012] {
+            let amount = redeem_amount_for_shares(&r, shares, T0).unwrap();
+            assert_eq!(amount, core::assets_of(shares, price).unwrap());
+            assert_eq!(core::shares_to_burn(amount, price).unwrap(), shares);
+        }
+    }
+}
+
+#[test]
 fn records_come_before_sends_and_a_failed_save_sends_nothing() {
     let s = Setup::new("records", "");
     let k = s.keeper();

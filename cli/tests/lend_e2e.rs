@@ -755,10 +755,21 @@ fn keeper_end_to_end() -> Result<()> {
         ];
         let (st, v, unsent) = env.build(&borrower, &draw)?;
         ensure!(st == 200, "draw: {v}");
+        // The lender withdraws everything in their smallest receipt, by
+        // shares: that receipt ends at exactly zero.
+        let receipts = |b: &Book| -> Vec<u64> {
+            b.receipts
+                .iter()
+                .filter(|r| r.wallet.as_deref() == Some(&lender.addr().to_string()))
+                .map(|r| r.state::<ReceiptState>().unwrap().supply_shares)
+                .collect()
+        };
+        let held = receipts(&k.snapshot()?);
+        let smallest = *held.iter().min().unwrap();
         let redeem = vec![
             ("op", "redeem".to_string()),
             ("pool", tusd.to_string()),
-            ("amount", USD.to_string()),
+            ("shares", smallest.to_string()),
         ];
         ensure!(
             env.build(&lender, &redeem)?.0 == 409,
@@ -775,6 +786,11 @@ fn keeper_end_to_end() -> Result<()> {
         ensure!(env.send(unsent.unwrap()).is_err(), "the loser cannot land");
         settle(k, "race resolved", 120, |b| b.pending.is_empty())?;
         ensure!(mine(&k.snapshot()?) == left, "the withdrawal did not land");
+        let after = receipts(&k.snapshot()?);
+        ensure!(
+            after.len() == held.len() - 1 && !after.contains(&0),
+            "the shares redeem emptied one receipt: {held:?} -> {after:?}"
+        );
         Ok(())
     })?;
 

@@ -7,8 +7,12 @@
 #   scripts/run-dealer.sh [dealer-config]   (default target/devnet/dealer-config.json)
 #
 # Needs cloudflared, wrangler logged in, the config from deploy-devnet.sh and
-# the .tools build for the config's program_id.
-# Pause quoting without stopping settlement: touch the config's pause_file.
+# the .tools build for the config's program_id. A config with a `lend`
+# section (docs/lend-keeper.md) also runs the keeper on the same port and
+# tunnel; it needs the lend deploy (target/devnet-<name>/program-id) and the
+# Keychain item keeler-devnet-deploy. The Worker still gets only DEALERS.
+# Pause quoting without stopping settlement: touch the config's pause_file;
+# pause new lending: touch lend.pause_file.
 set -euo pipefail
 
 redact() { perl -pe 'BEGIN { $| = 1 } s/api-key=[^&"\s]+/api-key=REDACTED/g'; }
@@ -40,8 +44,46 @@ if [[ $built != "$program_id" ]]; then
     exit 1
 fi
 
-cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
-bin=$target/release/keeler
+# A config with a `lend` section also runs the keeper, which needs the lend
+# program's build parameters compiled in exactly as scripts/deploy-lend-devnet.sh
+# compiled them into the deployed program: the program ID, the admin (the
+# deploy key), the keeper (the dealer) and vault 1's mints (the swap deploy's
+# tSOL and tUSD). That binary gets its own cargo target, so the swap-only
+# build in target/release is left alone.
+lend_program=$(field 'c.get("lend", {}).get("program_id", "")')
+if [[ -n $lend_program ]]; then
+    [[ $lend_program =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || { echo "$cfg: lend.program_id '$lend_program' is not a base58 address" >&2; exit 1; }
+    [[ $(field 'c["lend"].get("key", "")') == "" ]] || { echo "$cfg: the devnet keeper is the dealer; drop lend.key" >&2; exit 1; }
+    deployment=""
+    for d in "$root"/target/devnet-*/; do
+        if [[ -f $d/program-id && $(cat "$d/program-id") == "$lend_program" ]]; then deployment=${d%/}; fi
+    done
+    [[ -n $deployment ]] || { echo "no target/devnet-*/program-id holds $lend_program: deploy it with scripts/deploy-lend-devnet.sh first" >&2; exit 1; }
+    swap=$root/target/devnet/deploy-summary.json
+    summary_field() { python3 -c 'import json, sys; s = json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, {"s": s}))' "$swap" "$1"; }
+    [[ $(summary_field 's["dealer"]') == "$dealer" ]] || { echo "$swap's dealer is not $dealer, the keeper the lend program was built for" >&2; exit 1; }
+    # The admin's public key: bytes 32..64 of the deploy keypair, read from a
+    # pipe, never a file or the command line.
+    admin=$(security find-generic-password -s keeler-devnet-deploy -w | python3 -c '
+import json, sys
+b = bytes(json.load(sys.stdin))[32:64]
+n = int.from_bytes(b, "big")
+abc = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+s = ""
+while n:
+    n, r = divmod(n, 58)
+    s = abc[r] + s
+print("1" * (len(b) - len(b.lstrip(b"\0"))) + s)')
+    KEELER_LEND_PROGRAM_ID=$lend_program KEELER_LEND_ADMIN=$admin KEELER_LEND_KEEPER=$dealer \
+        KEELER_LEND_VAULT1_COLLATERAL_MINT=$(summary_field '{m: a for m, a, _ in s["mints"]}["tSOL"]') \
+        KEELER_LEND_VAULT1_DEBT_MINT=$(summary_field '{m: a for m, a, _ in s["mints"]}["tUSD"]') \
+        CARGO_TARGET_DIR=$deployment/dealer-cargo \
+        cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
+    bin=$deployment/dealer-cargo/release/keeler
+else
+    cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
+    bin=$target/release/keeler
+fi
 
 dealer_pid="" tunnel_pid=""
 trap 'kill $dealer_pid $tunnel_pid 2>/dev/null || true' EXIT

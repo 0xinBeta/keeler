@@ -1338,17 +1338,29 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             "POST",
             "/lend/build",
             &[
-                "op", "pool", "vault", "position", "amount", "borrow", "withdraw",
+                "op", "pool", "vault", "position", "amount", "shares", "borrow", "withdraw",
             ],
         )?;
         let op = fields.get("op").map(String::as_str);
         let num = |k: &str| decimal(fields.get(k)).ok_or((400, format!("bad {k}")));
-        let (borrow, withdraw, amount) = match op {
+        let mut shares = None;
+        let (borrow, withdraw, mut amount) = match op {
             Some("redeem") => {
                 if fields.get("pool") != Some(&vault1().debt_mint.to_string()) {
                     return refuse(404, "no such pool");
                 }
-                (0, 0, num("amount")?)
+                // Exactly one of `amount` and `shares`.
+                match (fields.contains_key("amount"), fields.contains_key("shares")) {
+                    (true, false) => (0, 0, num("amount")?),
+                    (false, true) => {
+                        shares = Some(num("shares")?);
+                        if shares == Some(0) {
+                            return refuse(400, "bad shares");
+                        }
+                        (0, 0, 0)
+                    }
+                    _ => return refuse(400, "give amount or shares, not both"),
+                }
             }
             Some("draw") => {
                 if fields.get("vault").map(String::as_str) != Some("1") {
@@ -1407,10 +1419,32 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 return refuse(404, "no such receipt");
             }
             held.sort_by_key(|(a, _)| *a);
-            let (_, receipt) = held
-                .iter()
-                .find(|(a, _)| *a >= amount)
-                .ok_or((422, "more than one receipt holds".to_owned()))?;
+            let shares_of = |n: &Note| n.state::<ReceiptState>().map_or(0, |s| s.supply_shares);
+            let receipt = match shares {
+                // The receipt holding exactly that many shares, else the
+                // smallest holding more.
+                Some(want) => {
+                    let mut fit: Vec<&Note> = held
+                        .iter()
+                        .map(|(_, n)| *n)
+                        .filter(|n| shares_of(n) >= want)
+                        .collect();
+                    fit.sort_by_key(|n| (shares_of(n) != want, shares_of(n)));
+                    let receipt = *fit
+                        .first()
+                        .ok_or((422, "more shares than one receipt holds".to_owned()))?;
+                    let state: ReserveState = reserve.state().map_err(internal)?;
+                    amount = keeler_lend_sdk::builders::redeem_amount_for_shares(&state, want, now)
+                        .map_err(|e| (422, format!("refused: {e}")))?;
+                    receipt
+                }
+                None => {
+                    held.iter()
+                        .find(|(a, _)| *a >= amount)
+                        .ok_or((422, "more than one receipt holds".to_owned()))?
+                        .1
+                }
+            };
             let s: ReceiptState = receipt.state().map_err(internal)?;
             core::redeem(
                 &r,
@@ -1422,7 +1456,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             .map_err(cerr)?;
             (
                 Job::Redeem {
-                    receipt: (*receipt).clone(),
+                    receipt: receipt.clone(),
                     amount,
                 },
                 r.supply_price,
