@@ -48,7 +48,7 @@ export type LendWasm = Hashing & {
   /** The nullifier of a note the user PDA owns. */
   nullifier(hash: Uint8Array, blinding: Uint8Array): Uint8Array;
   /** Decodes and checks a state against its opening (throws unless it reproduces `note.hash`); returns the fields the page reads. */
-  decode(note: NoteOpening): Promise<{ ownerIsMe: boolean; pool?: bigint; vault?: bigint; positionId?: bigint; shares: bigint }>;
+  decode(note: NoteOpening, leafIndex: bigint): Promise<{ ownerIsMe: boolean; pool?: bigint; vault?: bigint; positionId?: bigint; shares: bigint }>;
 };
 
 export type Owners = { user: Uint8Array; pda: Uint8Array; viewing: Uint8Array };
@@ -314,7 +314,7 @@ export function createLend(d: LendDeps): KeelerLend {
       const where = await d.chain.note(hash, blinding);
       if (where.leafIndex === undefined || where.spentBy) return undefined;
       const note: NoteOpening = { hash, mint, amount: o.amount, blinding, state: o.state, kind: noteKind };
-      const decoded = await d.wasm.decode(note);
+      const decoded = await d.wasm.decode(note, where.leafIndex);
       return decoded.ownerIsMe ? { note, decoded } : undefined;
     } catch {
       return undefined;
