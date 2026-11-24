@@ -135,10 +135,9 @@ export function App({ keeler }: { keeler: Keeler }) {
   const [account, setAccount] = useState<LendAccount | null>(null);
   const lendSeen = useRef(new Map<string, string>());
   const refreshMarket = useCallback(() => (lend ? lend.pools().then(setMarket) : Promise.resolve()), [lend]);
-  const refreshLend = useCallback(async () => {
+  const refreshAccount = useCallback(async () => {
     if (!lend) return;
-    const [m, a] = await Promise.all([lend.pools(), lend.lendAccount()]);
-    setMarket(m);
+    const a = await lend.lendAccount();
     setAccount(a);
     // A keeper fill or a liquidation changes private balances too.
     let changed = false;
@@ -148,10 +147,15 @@ export function App({ keeler }: { keeler: Keeler }) {
     }
     if (changed) refreshBalances().catch(() => {});
   }, [lend, refreshBalances]);
+  // After an action: market and account each on their own, so a keeper or price outage still shows the account.
+  const refreshLend = useCallback(async () => {
+    const [, a] = await Promise.allSettled([refreshMarket(), refreshAccount()]);
+    if (a.status === "rejected") throw a.reason;
+  }, [refreshMarket, refreshAccount]);
 
   useEffect(() => {
     refreshMarket().catch(() => {});
-    const id = setInterval(() => refreshMarket().catch(() => {}), 30_000);
+    const id = setInterval(() => refreshMarket().catch(() => {}), 60_000);
     return () => clearInterval(id);
   }, [refreshMarket]);
   useEffect(() => {
@@ -159,13 +163,31 @@ export function App({ keeler }: { keeler: Keeler }) {
   }, [ready, refreshLend]);
 
   // Poll quickly while an operation is in flight, slower while a loan is open (the keeper may liquidate it).
-  const lendPending = account?.operations.some((o) => o.status === "pending") ?? false;
+  // A fill that just landed counts as pending for two minutes: the keeper and the indexer may not show its new note yet.
+  const lendPending = account?.operations.some((o) => o.status === "pending" || (o.status === "landed" && account.asOf - o.createdAt < 120)) ?? false;
   const owing = account?.positions.some((x) => x.debt > 0n) ?? false;
+  // Never overlapping, backing off on errors (the swap poller's loop); the account only, the market has its own timer.
   useEffect(() => {
     if (!lendPending && !owing) return;
-    const id = setInterval(() => refreshLend().catch(() => {}), lendPending ? 2000 : 5000);
-    return () => clearInterval(id);
-  }, [lendPending, owing, refreshLend]);
+    const base = lendPending ? 3000 : 10_000;
+    let stopped = false;
+    let delay = base;
+    let timer = 0;
+    const tick = async () => {
+      try {
+        await refreshAccount();
+        delay = base;
+      } catch {
+        delay = Math.min(delay * 2, 60_000);
+      }
+      if (!stopped) timer = window.setTimeout(tick, delay);
+    };
+    timer = window.setTimeout(tick, delay);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [lendPending, owing, refreshAccount]);
 
   const [tab, setTab] = useState<Tab>("swap");
   const ringInput = useMemo(() => ({ dealers: lights, proving, settled }), [lights, proving, settled]);

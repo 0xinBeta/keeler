@@ -121,7 +121,8 @@ test("borrow: open, borrow, repay, withdraw, liquidation, repay all and close", 
   await p.locator("#borrow-amt").fill("500");
   await expect(p.getByText("Loan-to-value after")).toBeVisible();
   await p.getByRole("button", { name: "Borrow", exact: true }).last().click();
-  await expect(p.getByText(/That would take you past 80%\. You can borrow up to 455\.58/)).toBeVisible();
+  // 4 tSOL at 142.37, less the keeper's 0.5% draw margin, at 80%: 453.30.
+  await expect(p.getByText(/That would take you past 80%\. You can borrow up to 453\.30/)).toBeVisible();
   await p.locator("#borrow-amt").fill("400");
   await shot(page, info, "04-borrow-preview", "panel");
   await p.getByRole("button", { name: "Borrow", exact: true }).last().click();
