@@ -20,6 +20,7 @@ pub mod error;
 pub mod instructions;
 #[cfg(all(not(feature = "build-circuits"), not(xark)))]
 #[rustfmt::skip] // The generator's exact output.
+#[allow(clippy::useless_conversion)]
 pub mod verifier;
 
 /// One tag per instruction; the order is the plan's table.

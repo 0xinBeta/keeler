@@ -10,6 +10,9 @@
 //! Every refusal (overflow, time going backwards, a zero price, zero shares)
 //! is a failed `require`: the circuit has no proof for it and the client gets
 //! `RequirementFailed`.
+// Branches, not `saturating_sub`: the clamp after a `require` is the form
+// Xark lowers (see the helpers below).
+#![allow(clippy::implicit_saturating_sub)]
 use spr_program::{require, require_eq, xark, Field};
 
 use super::ReserveState;

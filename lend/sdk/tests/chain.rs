@@ -4,7 +4,6 @@
 //! Run through `lend/scripts/run-chain-test.sh` (port offset 2100, the tool
 //! paths from `.tools/env`, the SBF build in `lend/target/deploy`). Ignored in
 //! a plain `cargo test`.
-#[allow(dead_code)]
 #[path = "wallet.rs"]
 mod wallet;
 

@@ -1,7 +1,6 @@
 //! The builders, natively (no network, no proofs): the refusals the circuits
 //! make, and every output's blinding and hash recomputed from its contents
 //! and the first nullifier.
-#[allow(dead_code)]
 mod utxo;
 
 use keeler_lend_sdk::{

@@ -126,6 +126,7 @@ pub fn prove_transact(
 /// `[tag] ++ args ++ transact`, with `head` then the SPP transact accounts.
 /// The PDAs among the owner signers go in as non-signers: the program signs
 /// for them.
+#[allow(clippy::too_many_arguments)]
 pub fn instruction(
     ix_tag: u8,
     args: Vec<u8>,
