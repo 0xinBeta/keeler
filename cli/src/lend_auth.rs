@@ -200,7 +200,9 @@ pub fn authenticate(
     if timestamp.abs_diff(now) > FRESH_SECS {
         return Err("the request is stale");
     }
-    nonces.0.retain(|_, until| *until > now);
+    // Kept through `until`: a request stamped `now + FRESH_SECS` is still
+    // fresh at exactly `now + NONCE_SECS`.
+    nonces.0.retain(|_, until| *until >= now);
     if nonces.0.contains_key(&(wallet, nonce)) {
         return Err("the request was replayed");
     }
@@ -432,6 +434,20 @@ mod tests {
         let mut missing = fields(&r["fields"]);
         missing.remove("nonce");
         assert_eq!(run(&missing, "devnet"), Err("missing signed fields"));
+    }
+
+    #[test]
+    fn a_nonce_outlives_its_request() {
+        let f = fx();
+        let ts: u64 = fields(&f.v["requests"][1]["fields"])["timestamp"]
+            .parse()
+            .unwrap();
+        let mut nonces = Nonces::default();
+        assert!(f.check(1, ts - FRESH_SECS, &mut nonces).is_ok());
+        assert_eq!(
+            f.check(1, ts + FRESH_SECS, &mut nonces),
+            Err("the request was replayed")
+        );
     }
 
     #[test]
