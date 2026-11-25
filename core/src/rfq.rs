@@ -29,13 +29,16 @@ pub struct Quote {
     pub signature: [u8; 64],
 }
 
-pub const QUOTE_DOMAIN: &[u8; 15] = b"keeler-quote-v1";
-pub const QUOTE_MESSAGE_LEN: usize = 167;
+pub const QUOTE_DOMAIN: &[u8; 15] = b"keeler-quote-v2";
+pub const QUOTE_MESSAGE_LEN: usize = 168;
 
-/// What a dealer signs: the domain, then the program ID, sell mint, buy mint
-/// and trader (32 bytes each), then the sell amount, buy amount and expiry
-/// (u64 little-endian each).
+/// What a dealer signs: the domain, the network byte (0 local, 1 devnet,
+/// 2 mainnet), then the program ID, sell mint, buy mint and trader (32 bytes
+/// each), then the sell amount, buy amount and expiry (u64 little-endian
+/// each).
+#[allow(clippy::too_many_arguments)]
 pub fn quote_message(
+    network: u8,
     program_id: &[u8; 32],
     sell_mint: &[u8; 32],
     buy_mint: &[u8; 32],
@@ -45,8 +48,9 @@ pub fn quote_message(
     expiry: u64,
 ) -> [u8; QUOTE_MESSAGE_LEN] {
     let mut m = [0u8; QUOTE_MESSAGE_LEN];
-    let parts: [&[u8]; 8] = [
+    let parts: [&[u8]; 9] = [
         QUOTE_DOMAIN,
+        &[network],
         program_id,
         sell_mint,
         buy_mint,
@@ -347,13 +351,20 @@ mod tests {
 
     #[test]
     fn quote_message_layout() {
-        let m = quote_message(&[1; 32], &[2; 32], &[3; 32], &[4; 32], 5, 6, 7);
-        assert_eq!(&m[..15], b"keeler-quote-v1");
-        assert_eq!(&m[15..47], &[1; 32]);
-        assert_eq!(&m[111..143], &[4; 32]);
-        assert_eq!(&m[143..151], &5u64.to_le_bytes());
-        assert_eq!(&m[151..159], &6u64.to_le_bytes());
-        assert_eq!(&m[159..167], &7u64.to_le_bytes());
+        let m = quote_message(2, &[1; 32], &[2; 32], &[3; 32], &[4; 32], 5, 6, 7);
+        assert_eq!(m.len(), 168);
+        assert_eq!(&m[..15], b"keeler-quote-v2");
+        assert_eq!(m[15], 2);
+        assert_eq!(&m[16..48], &[1; 32]);
+        assert_eq!(&m[112..144], &[4; 32]);
+        assert_eq!(&m[144..152], &5u64.to_le_bytes());
+        assert_eq!(&m[152..160], &6u64.to_le_bytes());
+        assert_eq!(&m[160..168], &7u64.to_le_bytes());
+        // One network's signature is never another's.
+        assert_ne!(
+            m,
+            quote_message(1, &[1; 32], &[2; 32], &[3; 32], &[4; 32], 5, 6, 7)
+        );
     }
 
     #[test]

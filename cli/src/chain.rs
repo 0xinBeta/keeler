@@ -45,10 +45,78 @@ pub const CLOCK_SYSVAR: &str = "SysvarC1ock11111111111111111111111111111111";
 /// The SDK hashes discovered orders under tree id 0 only.
 const TREE_ID: u16 = 0;
 
+/// The cluster, from its genesis hash: what the quote signature's network
+/// byte and every mainnet refusal go by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cluster {
+    Local,
+    Devnet,
+    Mainnet,
+}
+
+pub const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+pub const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VL2xqa1wcae8vDXMa1d";
+const TESTNET_GENESIS: &str = "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY";
+
+impl Cluster {
+    pub fn of_genesis(hash: &str) -> Result<Self> {
+        Ok(match hash {
+            MAINNET_GENESIS => Cluster::Mainnet,
+            DEVNET_GENESIS => Cluster::Devnet,
+            TESTNET_GENESIS => bail!("testnet is not supported"),
+            _ => Cluster::Local,
+        })
+    }
+
+    /// The cluster a config's network name says: any name with `mainnet`
+    /// in it, any with `devnet`, else a local network.
+    pub fn of_name(name: &str) -> Self {
+        if name.contains("mainnet") {
+            Cluster::Mainnet
+        } else if name.contains("devnet") {
+            Cluster::Devnet
+        } else {
+            Cluster::Local
+        }
+    }
+
+    /// The quote signature's network byte.
+    pub fn byte(self) -> u8 {
+        self as u8
+    }
+}
+
+/// The cluster `rpc_url` serves, from `getGenesisHash`.
+pub fn cluster_at(rpc_url: &str) -> Result<Cluster> {
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getGenesisHash" });
+    let v: serde_json::Value = reqwest::blocking::Client::new()
+        .post(rpc_url)
+        .timeout(Duration::from_secs(30))
+        .json(&body)
+        .send()
+        .map_err(|_| anyhow!("getGenesisHash failed"))?
+        .json()
+        .map_err(|_| anyhow!("getGenesisHash returned no JSON"))?;
+    Cluster::of_genesis(v["result"].as_str().context("no genesis hash")?)
+}
+
+/// A compute budget of `cu_limit` with `micro_lamports` per unit on top.
+pub fn budget(cu_limit: u32, micro_lamports: u64) -> ComputeBudgetConfig {
+    let b = ComputeBudgetConfig::new(cu_limit);
+    match u64::try_from((u128::from(cu_limit) * u128::from(micro_lamports)).div_ceil(1_000_000)) {
+        Ok(0) => b,
+        Ok(fee) => b.with_priority_fee(fee),
+        Err(_) => b.with_priority_fee(u64::MAX),
+    }
+}
+
 pub struct Chain {
     pub client: SprClient<SolanaRpc>,
     pub tree: Address,
     pub registry: AssetRegistry,
+    pub cluster: Cluster,
+    /// `network.priority_fee`, micro-lamports per compute unit.
+    pub priority_fee: u64,
     /// Mint decimals never change.
     decimals: Mutex<HashMap<Address, u8>>,
 }
@@ -96,6 +164,7 @@ impl Chain {
     /// pool's asset id of every mint in `mints`.
     pub fn connect(network: &Network, mints: &[Address]) -> Result<Self> {
         let (rpc_url, indexer_url) = network.urls()?;
+        let cluster = cluster_at(&rpc_url)?;
         let client = match &network.prover {
             // The local prover (`ZOLANA_PROVER_URL`); proof data comes from
             // our own indexer.
@@ -123,6 +192,13 @@ impl Chain {
                 .with_proof_data_source(ProofDataSource::Prover)
             }
         };
+        // The client's own sends (self-transfers) pay the same rate.
+        let client = match budget(client.compute_budget().cu_limit, network.priority_fee)
+            .priority_fee_lamports
+        {
+            Some(fee) => client.with_priority_fee(fee),
+            None => client,
+        };
         let tree = spr_interface::pda::tree(TREE_ID);
         let account = client
             .rpc()
@@ -145,6 +221,8 @@ impl Chain {
             client,
             tree,
             registry,
+            cluster,
+            priority_fee: network.priority_fee,
             decimals: Mutex::default(),
         })
     }
@@ -369,7 +447,7 @@ impl Chain {
             std::slice::from_ref(&ix),
             kp.pubkey(),
             &[kp],
-            ComputeBudgetConfig::new(COMPUTE_UNIT_LIMIT),
+            budget(COMPUTE_UNIT_LIMIT, self.priority_fee),
         )?;
         self.client
             .confirm_private_transaction_sync(sig)
@@ -527,4 +605,38 @@ pub fn shielded(kp: &solana_keypair::Keypair) -> Result<ShieldedKeypair> {
 
 pub fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clusters_by_genesis_and_name() {
+        assert_eq!(
+            Cluster::of_genesis(MAINNET_GENESIS).unwrap(),
+            Cluster::Mainnet
+        );
+        assert_eq!(
+            Cluster::of_genesis(DEVNET_GENESIS).unwrap(),
+            Cluster::Devnet
+        );
+        assert!(Cluster::of_genesis(TESTNET_GENESIS).is_err());
+        assert_eq!(Cluster::of_genesis("local").unwrap(), Cluster::Local);
+        assert_eq!(Cluster::of_name("mainnet-beta"), Cluster::Mainnet);
+        assert_eq!(Cluster::of_name("devnet"), Cluster::Devnet);
+        assert_eq!(Cluster::of_name("localnet"), Cluster::Local);
+        assert_eq!(
+            [Cluster::Local, Cluster::Devnet, Cluster::Mainnet].map(Cluster::byte),
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn priority_fee_is_per_compute_unit() {
+        assert_eq!(budget(1_400_000, 0).priority_fee_lamports, None);
+        // 1,000 micro-lamports a unit over 1.4M units: 1,400 lamports.
+        assert_eq!(budget(1_400_000, 1_000).priority_fee_lamports, Some(1_400));
+        assert_eq!(budget(200_000, 1).priority_fee_lamports, Some(1));
+    }
 }

@@ -17,7 +17,7 @@ use swap_sdk::{
 };
 
 use crate::{
-    chain::{hex, shielded, Chain, Status},
+    chain::{hex, shielded, Chain, Cluster, Status},
     config::{parse_address, Common, Pricer, TraderConfig},
 };
 
@@ -68,12 +68,14 @@ pub fn fair_at(
 /// The message a dealer signs for a quote of `buy_amount` until `expiry`
 /// answering `rfq`, under this build's swap program ID.
 pub fn quote_message_for(
+    network: Cluster,
     rfq: &Rfq,
     buy_amount: u64,
     expiry: u64,
 ) -> Result<[u8; QUOTE_MESSAGE_LEN]> {
     let key = |s: &str| Ok::<_, anyhow::Error>(*parse_address(s)?.as_array());
     Ok(quote_message(
+        network.byte(),
         swap_program::ID.as_array(),
         &key(&rfq.sell_mint)?,
         &key(&rfq.buy_mint)?,
@@ -84,8 +86,14 @@ pub fn quote_message_for(
     ))
 }
 
-pub fn sign_quote(dealer: &Keypair, rfq: &Rfq, buy_amount: u64, expiry: u64) -> Result<Quote> {
-    let sig = dealer.sign_message(&quote_message_for(rfq, buy_amount, expiry)?);
+pub fn sign_quote(
+    dealer: &Keypair,
+    network: Cluster,
+    rfq: &Rfq,
+    buy_amount: u64,
+    expiry: u64,
+) -> Result<Quote> {
+    let sig = dealer.sign_message(&quote_message_for(network, rfq, buy_amount, expiry)?);
     Ok(Quote {
         buy_amount,
         expiry,
@@ -94,8 +102,8 @@ pub fn sign_quote(dealer: &Keypair, rfq: &Rfq, buy_amount: u64, expiry: u64) -> 
 }
 
 /// Whether `dealer` signed `q` as an answer to `rfq`.
-pub fn signed_by(dealer: &Address, rfq: &Rfq, q: &Quote) -> bool {
-    quote_message_for(rfq, q.buy_amount, q.expiry)
+pub fn signed_by(dealer: &Address, network: Cluster, rfq: &Rfq, q: &Quote) -> bool {
+    quote_message_for(network, rfq, q.buy_amount, q.expiry)
         .is_ok_and(|m| PublicKey::from_ed25519(dealer.as_array()).verify_message(&m, &q.signature))
 }
 
@@ -143,7 +151,7 @@ pub fn swap(
         .enumerate()
         .map(|(i, (q, pk))| {
             q.filter(|q| {
-                let ok = signed_by(pk, &rfq, q);
+                let ok = signed_by(pk, chain.cluster, &rfq, q);
                 if !ok {
                     log!("trader: dropped dealer {i}'s quote: bad signature");
                 }
@@ -295,24 +303,25 @@ mod tests {
     #[test]
     fn signed_quote_round_trips_and_tampering_fails() {
         let dealer = Keypair::new_from_array([1; 32]);
-        let q = sign_quote(&dealer, &rfq(), 999, 1_000).unwrap();
-        assert!(signed_by(&dealer.pubkey(), &rfq(), &q));
+        let q = sign_quote(&dealer, Cluster::Devnet, &rfq(), 999, 1_000).unwrap();
+        assert!(signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &q));
+        assert!(!signed_by(&dealer.pubkey(), Cluster::Mainnet, &rfq(), &q), "another network");
         let other = Keypair::new_from_array([9; 32]).pubkey();
-        assert!(!signed_by(&other, &rfq(), &q), "another dealer's key");
+        assert!(!signed_by(&other, Cluster::Devnet, &rfq(), &q), "another dealer's key");
         let more = Quote {
             buy_amount: 1_000,
             ..q
         };
-        assert!(!signed_by(&dealer.pubkey(), &rfq(), &more), "buy amount");
+        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &more), "buy amount");
         let later = Quote { expiry: 1_001, ..q };
-        assert!(!signed_by(&dealer.pubkey(), &rfq(), &later), "expiry");
+        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &later), "expiry");
         let bigger = Rfq {
             sell_amount: 1,
             ..rfq()
         };
-        assert!(!signed_by(&dealer.pubkey(), &bigger, &q), "request");
+        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &bigger, &q), "request");
         let mut bad = q;
         bad.signature[0] ^= 1;
-        assert!(!signed_by(&dealer.pubkey(), &rfq(), &bad), "signature bit");
+        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &bad), "signature bit");
     }
 }

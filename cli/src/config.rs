@@ -18,6 +18,10 @@ pub enum KeySource {
 }
 
 impl KeySource {
+    pub fn is_file(&self) -> bool {
+        matches!(self, KeySource::File(_))
+    }
+
     pub fn secret(&self) -> Result<String> {
         Ok(match self {
             KeySource::File(path) => std::fs::read_to_string(path)
@@ -52,6 +56,9 @@ pub struct Network {
     pub rpc_url: String,
     pub indexer_url: String,
     pub prover: Prover,
+    /// Micro-lamports per compute unit on every transaction sent; default 0.
+    #[serde(default)]
+    pub priority_fee: u64,
 }
 
 impl Network {
@@ -60,6 +67,7 @@ impl Network {
             rpc_url,
             indexer_url,
             prover: Prover::Local,
+            priority_fee: 0,
         }
     }
 
@@ -644,6 +652,7 @@ mod tests {
             prover: Prover::Helius {
                 keychain: "k".into(),
             },
+            priority_fee: 0,
         };
         assert!(net("https://devnet.helius-rpc.com").check().is_ok());
         assert!(net("http://devnet.helius-rpc.com").check().is_err());
@@ -708,6 +717,7 @@ mod tests {
             prover: Prover::Helius {
                 keychain: "keeler-helius-api-key".into(),
             },
+            priority_fee: 0,
         };
         let (rpc_url, _) = net.urls().unwrap();
         let common = Common {
