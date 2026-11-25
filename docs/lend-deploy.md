@@ -80,8 +80,9 @@ others see or use. Nothing here is done by the deploy script.
    `NETWORK` (`devnet`), `pool_key` `{"keychain": "keeler-devnet-<name>-pool"}` (required:
    `scripts/run-dealer.sh` refuses any other), `origins` (required: the site's origin, for example
    `["https://<your site>"]`), `admin_key` the `keeler-devnet-deploy` item, `state_file`,
-   `pause_file`, `price: "test"`, `price_refresh_secs` (45), `limits`. No `lend.key`: the devnet
-   keeper is the dealer key (the config's `key`). Check that `limits.min_*` are not below the
+   `pause_file`, `price: "test"`, `price_refresh_secs` (45), `limits`. Leave `lend.key` out: the devnet
+   keeper is then the dealer key (the config's `key`); `scripts/run-dealer.sh` accepts a `lend.key`
+   only when its address is one of the program's keepers. Check that `limits.min_*` are not below the
    vault's minimums in `LEND_VAULTS`. A standby needs no config of its own:
    `scripts/run-dealer.sh --standby` writes it (`target/devnet/standby-keeper.json`: this `lend`
    section with `role: "standby"`, the key `keeler-devnet-<name>-standby`, its own default state
