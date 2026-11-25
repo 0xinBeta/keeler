@@ -32,7 +32,8 @@
 //! `debt_of = ceil(shares × borrow_price / 1e12)`; a borrow adds
 //! `ceil(amount × 1e12 / borrow_price)` shares; a repay of at least the debt
 //! clears the shares and returns the change, a smaller one removes
-//! `floor(amount × 1e12 / borrow_price)` shares.
+//! `floor(amount × 1e12 / borrow_price)` shares and is refused
+//! (`ZeroShares`) when that is zero.
 //! A borrow is refused above idle liquidity or when it would take
 //! utilisation above `MAX_BORROW_UTIL_BPS` (9500), compared exactly:
 //! `total_debt × 1e4 > 9500 × total_supply` after it.
@@ -375,7 +376,8 @@ pub fn borrow(r: &Reserve, idle: u64, amount: u64, curve: &Curve) -> Result<(Res
     Ok((refresh_rate(&next, curve)?, added))
 }
 
-/// Repays `amount` on a position of `position_shares` debt shares.
+/// Repays `amount` on a position of `position_shares` debt shares. A partial
+/// repay that removes no share is `ZeroShares`, as the circuit refuses it.
 pub fn repay(
     r: &Reserve,
     position_shares: u64,
@@ -386,6 +388,9 @@ pub fn repay(
         return Err(InvalidInput);
     }
     let done = repay_shares(position_shares, amount, r.borrow_price)?;
+    if done.shares != 0 && done.shares == position_shares {
+        return Err(ZeroShares);
+    }
     let next = Reserve {
         debt_shares: r.debt_shares - (position_shares - done.shares),
         ..*r

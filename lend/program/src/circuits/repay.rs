@@ -1,6 +1,7 @@
-//! `repay`: a repay intent pays down the maker's position. No price, never
-//! refused for being small: a repay covering the whole debt clears the
-//! shares and the rest comes back as change.
+//! `repay`: a repay intent pays down the maker's position. No price. A repay
+//! covering the whole debt clears the shares and the rest comes back as
+//! change; a smaller one must remove at least one debt share, so a repay worth
+//! less than one share is refused rather than taken for nothing.
 use spr_program::{
     circuit::{
         CheckedTransaction, ConfidentialTransaction, DataUtxo, TokenUtxos, UniqueDataUtxo, Utxo,
@@ -111,6 +112,7 @@ impl Repay {
         intent.transfer(&mut change, &amount)?;
         let (left, back) = repay_shares(position.debt_shares, amount, reserve.borrow_price);
         let removed = sub(position.debt_shares, left);
+        require(left == 0 || removed != 0);
         reserve.debt_shares = sub(reserve.debt_shares, removed);
         position.debt_shares = left;
         let paid = sub(amount, back);
