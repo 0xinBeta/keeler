@@ -158,7 +158,10 @@ pub(crate) fn require_keeper(account: &AccountView) -> ProgramResult {
     if !account.is_signer() {
         return Err(LendError::MissingSignature.into());
     }
-    if !crate::KEEPERS.iter().any(|k| address_eq(account.address(), k)) {
+    if !crate::KEEPERS
+        .iter()
+        .any(|k| address_eq(account.address(), k))
+    {
         return Err(LendError::NotKeeper.into());
     }
     Ok(())

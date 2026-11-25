@@ -115,10 +115,7 @@ fn sol_liquidation_back_to_the_threshold() {
 fn sol_liquidation_above_the_max_limit() {
     // 1400 against 1500: 93.3%, the whole debt goes, the rest stays.
     let l = liquidate(1_400_000_000, PRICE_SCALE, 10_000_000_000, SOL_150, &V).unwrap();
-    assert_eq!(
-        (l.repay, l.debt_shares),
-        (1_400_000_000, 0)
-    );
+    assert_eq!((l.repay, l.debt_shares), (1_400_000_000, 0));
     assert_eq!(l.payout, 9_426_666_666);
     assert_eq!(l.collateral, 573_333_334);
     // 1600 against 1500: bad debt, all collateral that fits is sold.

@@ -50,7 +50,10 @@ pub const DEFAULTS: [(&str, &str); 8] = [
     // The localnet fixture's SPL mint.
     (DEBT_MINT, "2moKCsA6LcKd7e6v1zCNAMFkoYiExZVGfEagvAZD1rYh"),
     // Pyth's SOL/USD push account and feed.
-    (PRICE_ACCOUNT, "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"),
+    (
+        PRICE_ACCOUNT,
+        "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+    ),
     (
         FEED_ID,
         "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
@@ -89,7 +92,9 @@ pub struct Params {
 /// them; `mainnet` is the feature of the same name.
 pub fn read(var: impl Fn(&str) -> Option<String>, mainnet: bool) -> Result<Params, String> {
     if var(LEGACY_KEEPER).is_some() {
-        return Err(format!("{LEGACY_KEEPER} is replaced by {KEEPERS} (comma separated)"));
+        return Err(format!(
+            "{LEGACY_KEEPER} is replaced by {KEEPERS} (comma separated)"
+        ));
     }
     let get = |name: &str| -> Result<String, String> {
         match var(name) {
@@ -115,7 +120,10 @@ pub fn read(var: impl Fn(&str) -> Option<String>, mainnet: bool) -> Result<Param
         base58(KEEPERS, k)?;
     }
     if keepers.len() > MAX_KEEPERS {
-        return Err(format!("{KEEPERS} has {} keepers, at most {MAX_KEEPERS}", keepers.len()));
+        return Err(format!(
+            "{KEEPERS} has {} keepers, at most {MAX_KEEPERS}",
+            keepers.len()
+        ));
     }
     // Base58 of 32 bytes is canonical, so equal addresses are equal strings.
     if (1..keepers.len()).any(|i| keepers[..i].contains(&keepers[i])) {
@@ -137,7 +145,9 @@ pub fn read(var: impl Fn(&str) -> Option<String>, mainnet: bool) -> Result<Param
     if mainnet {
         let fixture = |name: &str, value: &str| -> Result<(), String> {
             if FIXTURE_KEYS.contains(&value) {
-                Err(format!("{name}={value} is a public test key, refused in a mainnet build"))
+                Err(format!(
+                    "{name}={value} is a public test key, refused in a mainnet build"
+                ))
             } else {
                 Ok(())
             }
@@ -148,14 +158,19 @@ pub fn read(var: impl Fn(&str) -> Option<String>, mainnet: bool) -> Result<Param
             fixture(KEEPERS, k)?;
         }
         if get_default(POOL_VIEWING) == hex_string(&params.pool_viewing) {
-            return Err(format!("{POOL_VIEWING} is the fixture pool key's, refused in a mainnet build"));
+            return Err(format!(
+                "{POOL_VIEWING} is the fixture pool key's, refused in a mainnet build"
+            ));
         }
     }
     Ok(params)
 }
 
 fn get_default(name: &str) -> &'static str {
-    DEFAULTS.iter().find(|(n, _)| *n == name).map_or("", |(_, d)| d)
+    DEFAULTS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or("", |(_, d)| d)
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -256,7 +271,10 @@ mod tests {
             for (name, value) in [
                 (ADMIN, key.to_string()),
                 (KEEPERS, key.to_string()),
-                (KEEPERS, format!("Keeper1PrimaryHost11111111111111111111111111,{key}")),
+                (
+                    KEEPERS,
+                    format!("Keeper1PrimaryHost11111111111111111111111111,{key}"),
+                ),
                 (PROGRAM_ID, key.to_string()),
             ] {
                 let mut env = mainnet();
@@ -276,7 +294,10 @@ mod tests {
         for (list, ok) in [
             (k.to_string(), true),
             (format!("{k},{k}"), false),
-            (format!("{k}, Keeper2StandbyHost1111111111111111111111111,{k}"), false),
+            (
+                format!("{k}, Keeper2StandbyHost1111111111111111111111111,{k}"),
+                false,
+            ),
             (String::new(), false),
             (format!("{k},"), false),
             (

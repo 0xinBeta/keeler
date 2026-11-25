@@ -6,7 +6,8 @@ use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
-    check_now, clock, cpi, mint_halves, parse, require_keeper, require_pool_viewing, require_pool_mint, verified, Pda,
+    check_now, clock, cpi, mint_halves, parse, require_keeper, require_pool_mint,
+    require_pool_viewing, verified, Pda,
 };
 use crate::{error::LendError, verifier::supply as v, POOL_SEED, USER_SEED};
 

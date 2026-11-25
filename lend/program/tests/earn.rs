@@ -6,9 +6,9 @@ mod mollusk;
 use keeler_lend::{
     error::LendError,
     instructions::{redeem::RedeemArgs, supply::SupplyArgs},
-    tag, KEEPERS, POOL_VIEWING, POOL_SEED, USER_SEED,
+    tag, KEEPERS, POOL_SEED, POOL_VIEWING, USER_SEED,
 };
-use mollusk::{expect_err_exact, mollusk_with_program};
+use mollusk::{expect_err_exact, mollusk_with_program, only_the_pool_viewing_key};
 use mollusk_svm::{result::ProgramResult, Mollusk};
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
@@ -179,7 +179,12 @@ fn supply_refuses_a_stale_now_and_an_expired_intent() {
     let mollusk = setup();
     let maker = Pubkey::new_unique();
     for now in [NOW - 121, NOW + 1] {
-        let (ix, accounts) = supply(pk(&KEEPERS[0]), true, &supply_args(&maker, now, NOW + 60), 2);
+        let (ix, accounts) = supply(
+            pk(&KEEPERS[0]),
+            true,
+            &supply_args(&maker, now, NOW + 60),
+            2,
+        );
         expect_err_exact(&mollusk, &ix, &accounts, code(LendError::StaleNow));
     }
     for expiry in [NOW - 1, NOW - 120] {
@@ -250,6 +255,23 @@ fn redeem_needs_the_keeper_and_the_owner_signing() {
     }
     let (ix, accounts) = redeem(pk(&KEEPERS[0]), owner, (true, true), &args, 2);
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidProof));
+}
+
+#[test]
+fn supply_and_redeem_take_every_keeper_and_only_the_pool_viewing_key() {
+    let mollusk = setup();
+    let user = Pubkey::new_unique();
+    for keeper in KEEPERS {
+        let (ix, accounts) = supply(pk(keeper), true, &supply_args(&user, NOW, NOW + 60), 2);
+        only_the_pool_viewing_key(&mollusk, &ix, &accounts, code(LendError::InvalidProof));
+        let (ix, accounts) = redeem(pk(keeper), user, (true, true), &redeem_args(&user, NOW), 2);
+        only_the_pool_viewing_key(&mollusk, &ix, &accounts, code(LendError::InvalidProof));
+    }
+    let outside = Pubkey::new_unique();
+    let (ix, accounts) = supply(outside, true, &supply_args(&user, NOW, NOW + 60), 2);
+    expect_err_exact(&mollusk, &ix, &accounts, code(LendError::NotKeeper));
+    let (ix, accounts) = redeem(outside, user, (true, true), &redeem_args(&user, NOW), 2);
+    expect_err_exact(&mollusk, &ix, &accounts, code(LendError::NotKeeper));
 }
 
 #[test]

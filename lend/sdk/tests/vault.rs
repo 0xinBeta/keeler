@@ -636,6 +636,61 @@ fn liquidate(
 }
 
 #[test]
+fn keepers_sharing_the_pool_key_read_and_spend_each_others_pool_notes() {
+    let keeper = |seed| {
+        keeler_lend_sdk::fixture_keeper_keypair(&Keypair::new_from_array([seed; 32])).unwrap()
+    };
+    let (a, b) = (keeper(1), keeper(2));
+    assert_eq!(
+        a.viewing_pubkey().as_bytes(),
+        &keeler_lend_sdk::POOL_VIEWING
+    );
+    assert_eq!(a.viewing_pubkey(), b.viewing_pubkey());
+    // Each keeps its own signing and nullifier keys: they derive from its key.
+    assert_eq!(a.signing_pubkey(), keypair(1).signing_pubkey());
+    assert_eq!(
+        a.nullifier_key.pubkey().unwrap(),
+        keypair(1).nullifier_key.pubkey().unwrap()
+    );
+    assert_ne!(a.owner_hash().unwrap(), b.owner_hash().unwrap());
+
+    // A reserve `a` writes: `b` reads it from the transaction, a keeper with
+    // its own viewing key cannot.
+    let p = builders::init_reserve(&a, ADMIN, debt(), NOW, 42, TREE).unwrap();
+    let slot = p
+        .outputs
+        .iter()
+        .position(|o| o.data_hash.is_some())
+        .unwrap();
+    let read = read_outputs(&b, &p.first_nullifier, &p.spp).unwrap();
+    assert_eq!(read[slot].as_ref().unwrap().amount, p.outputs[slot].amount);
+    assert!(read_outputs(&keypair(2), &p.first_nullifier, &p.spp).is_err());
+
+    // `b` spends it: a supply on top of `a`'s reserve.
+    let pool = pool_pda(&debt().asset).owner;
+    let r = pool.input(&p.outputs[slot], TREE, 1).unwrap();
+    let user = keypair(7);
+    let intent = intent_full(
+        &user,
+        debt(),
+        10 * USD,
+        purpose::SUPPLY,
+        keeler_lend::pool::TUSD,
+    );
+    let s = builders::supply(&b, &addr(&user), r, intent, NOW, SALT, TREE).unwrap();
+    // And `a` reads `b`'s outputs, the new reserve with the 10 tUSD among them.
+    let read = read_outputs(&a, &s.first_nullifier, &s.spp).unwrap();
+    for (out, plain) in s.outputs.iter().zip(&read) {
+        if let Some(plain) = plain {
+            assert_eq!(plain.amount, out.amount);
+        }
+    }
+    assert!(read
+        .iter()
+        .any(|o| o.as_ref().is_some_and(|o| o.amount == 10 * USD)));
+}
+
+#[test]
 fn liquidate_back_to_the_threshold() {
     let user = keypair(7);
     let (pos, r) = borrowed(&user, 120 * USD);
@@ -644,7 +699,8 @@ fn liquidate_back_to_the_threshold() {
     let (p, plan) = liquidate(&user, r.clone(), pos.clone(), bound).unwrap();
     assert!(plan.repay > 0 && plan.repay < 120 * USD);
     // The payout formula is unchanged: x plus the 1% penalty, at the bound.
-    let formula = ((plan.repay + plan.repay / 100) as u128 * 1_000_000_000_000 / bound as u128) as u64;
+    let formula =
+        ((plan.repay + plan.repay / 100) as u128 * 1_000_000_000_000 / bound as u128) as u64;
     assert_eq!(plan.payout, formula.min(SOL));
     let payout = &p.outputs[LIQUIDATE_PAYOUT_SLOT];
     assert_eq!(

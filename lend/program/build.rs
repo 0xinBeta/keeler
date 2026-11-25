@@ -16,7 +16,8 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed={}", build_params::LEGACY_KEEPER);
     let mainnet = env::var_os("CARGO_FEATURE_MAINNET").is_some();
-    let p = build_params::read(|name| env::var(name).ok(), mainnet).unwrap_or_else(|e| panic!("{e}"));
+    let p =
+        build_params::read(|name| env::var(name).ok(), mainnet).unwrap_or_else(|e| panic!("{e}"));
 
     let address = |name: &str, value: &str| {
         format!(

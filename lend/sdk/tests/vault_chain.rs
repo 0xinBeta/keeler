@@ -2,8 +2,10 @@
 //! borrower opens a tSOL position and adds to it (the keeper recovers the
 //! position from the chain with its writer key), borrows (the owner
 //! co-signs), interest accrues, repays part; the price drops and the keeper
-//! liquidates back to the threshold; a second drop takes it past the max
-//! limit and the keeper liquidates all of the debt; the borrower closes it.
+//! liquidates back to the threshold, paying in exactly the debt it repays; a
+//! second drop takes it past the max limit and the second keeper of the set
+//! (same pool key, its own funds) liquidates all of the debt from the
+//! reserve the first wrote; the borrower closes it.
 //! A second position borrows, repays all with change, and closes. Prints
 //! compute units and sizes. Draw, repay and liquidate proofs are first
 //! resent with one argument changed (bound, vault, owner, now, expiry, a
@@ -155,12 +157,24 @@ impl Env {
         p: Prepared,
         first: impl FnOnce(&Instruction) -> Result<()>,
     ) -> Result<Signature> {
+        self.sends_as(&self.keeper_key, &self.keeper, name, p, first)
+    }
+
+    /// [`Self::keeper_sends_after`] by any keeper of the set.
+    fn sends_as(
+        &self,
+        key: &Keypair,
+        keeper: &ShieldedKeypair,
+        name: &str,
+        p: Prepared,
+        first: impl FnOnce(&Instruction) -> Result<()>,
+    ) -> Result<Signature> {
         let (tree, _) = self.tree();
-        let ix = p.prove(self.localnet.client.indexer(), tree, &self.keeper)?;
+        let ix = p.prove(self.localnet.client.indexer(), tree, keeper)?;
         first(&ix)?;
-        let sig = send(self.localnet.client.rpc(), &[&self.keeper_key], ix.clone())?;
+        let sig = send(self.localnet.client.rpc(), &[key], ix.clone())?;
         self.confirm(sig)?;
-        self.report(name, &self.keeper_key.pubkey(), &ix, &sig)?;
+        self.report(name, &key.pubkey(), &ix, &sig)?;
         Ok(sig)
     }
 
@@ -389,6 +403,15 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
     fund(&lender_key, &lender, 0, 20 * USD)?;
     fund(&borrower_key, &borrower, 3 * SOL, 0)?;
     fund(&env.keeper_key, keeper, 0, 50 * USD)?;
+    // The second keeper of the set, under the same pool key: it liquidates
+    // in step 7, spending the reserve the first keeper wrote.
+    let second_key = fixture::payer();
+    ensure!(
+        KEEPERS[1] == second_key.pubkey(),
+        "build with the default keepers"
+    );
+    let second = keeler_lend_sdk::fixture_keeper_keypair(&second_key)?;
+    fund(&second_key, &second, 0, 50 * USD)?;
     let mut lender_wallet = TestWallet::scan(lender.clone(), assets.clone(), &env.localnet.client)?;
     let supply_intent = intent(
         &env,
@@ -604,15 +627,19 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
 
     // 6. The price drops to $6.10: past the threshold, under the max limit.
     let mut keeper_wallet = TestWallet::scan(keeper.clone(), assets.clone(), &env.localnet.client)?;
-    let liquidate = |keeper_wallet: &mut TestWallet,
+    let mut second_wallet = TestWallet::scan(second.clone(), assets.clone(), &env.localnet.client)?;
+    let liquidate = |key: &Keypair,
+                     keeper_wallet: &mut TestWallet,
                      reserve: WalletUtxo,
                      position: WalletUtxo,
                      bound: u64|
      -> Result<(WalletUtxo, WalletUtxo, core::Liquidation)> {
+        let keeper = &keeper_wallet.keypair.clone();
         keeper_wallet.rescan(&env.localnet.client)?;
         let funds = keeper_wallet
             .spendable_utxo(tusd, 10 * USD)
             .context("no keeper funds")?;
+        let (reserve_before, funds_amount) = (reserve.utxo.amount, funds.utxo.amount);
         let now = env.now()?;
         let (p, plan) = vault::liquidate(
             keeper,
@@ -634,12 +661,18 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
             p.outputs[LIQUIDATE_PAYOUT_SLOT].clone(),
         );
         ensure!(payout.amount == plan.payout, "payout");
-        env.keeper_sends_after("liquidate", p, |ix| {
+        // The liquidator pays exactly x: the reserve gains x, nothing more.
+        ensure!(
+            p.outputs[LIQUIDATE_RESERVE_SLOT].amount == reserve_before + plan.repay
+                && change.amount == funds_amount - plan.repay,
+            "funding of exactly x: {plan:?}"
+        );
+        env.sends_as(key, keeper, "liquidate", p, |ix| {
             refused_with(
                 "liquidate at a higher bound",
                 send(
                     rpc,
-                    &[&env.keeper_key],
+                    &[key],
                     tampered(ix, |a: &mut LiquidateArgs| a.bound += 1),
                 ),
                 INVALID_PROOF,
@@ -651,7 +684,13 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
     };
     let bound = 6 * DOLLAR + DOLLAR / 10;
     env.set_price(bound)?;
-    let (pos, res, plan) = liquidate(&mut keeper_wallet, reserve, position, bound + CONF)?;
+    let (pos, res, plan) = liquidate(
+        &env.keeper_key,
+        &mut keeper_wallet,
+        reserve,
+        position,
+        bound + CONF,
+    )?;
     (position, reserve) = (pos, res);
     let owed = debt(&position, &reserve)?;
     let value = core::collateral_value(position.utxo.amount, bound + CONF).map_err(err)?;
@@ -679,7 +718,13 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
         core::above_max_limit(owed, value, &core::TSOL_TUSD_VAULT),
         "above max"
     );
-    let (pos, res, plan) = liquidate(&mut keeper_wallet, reserve, position, bound + CONF)?;
+    let (pos, res, plan) = liquidate(
+        &second_key,
+        &mut second_wallet,
+        reserve,
+        position,
+        bound + CONF,
+    )?;
     (position, reserve) = (pos, res);
     ensure!(
         plan.repay == owed && decode::<PositionState>(&position)?.debt_shares == 0,

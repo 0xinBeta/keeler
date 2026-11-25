@@ -15,9 +15,9 @@ use keeler_lend::{
     },
     tag,
     vaults::{VaultError, PYTH_RECEIVER, TSOL_TUSD},
-    KEEPERS, POOL_VIEWING, POOL_SEED, USER_SEED,
+    KEEPERS, POOL_SEED, POOL_VIEWING, USER_SEED,
 };
-use mollusk::{expect_err_exact, mollusk_with_program};
+use mollusk::{expect_err_exact, mollusk_with_program, only_the_pool_viewing_key};
 use mollusk_svm::{program::keyed_account_for_system_program, result::ProgramResult, Mollusk};
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
@@ -438,6 +438,61 @@ fn draw_needs_the_keeper_and_the_owner() {
     expect_err_exact(&mollusk, &ix, &accounts, lend(LendError::StaleNow));
     let ix = draw(keeper, owner, true, feed, NOW as u64, LOW);
     expect_err_exact(&mollusk, &ix, &accounts, lend(LendError::InvalidProof));
+}
+
+#[test]
+fn vault_instructions_take_every_keeper_and_only_the_pool_viewing_key() {
+    let mollusk = setup();
+    let (owner, feed) = (Pubkey::new_unique(), pk(&TSOL_TUSD.price_account));
+    let now = NOW as u64;
+    let test = pk(&test_price_address(1).0);
+    let system = keyed_account_for_system_program();
+    for keeper in KEEPERS.iter().map(pk) {
+        let accounts = [(keeper, account()), (owner, account()), (feed, good_pyth())];
+        let proof_err = lend(LendError::InvalidProof);
+        let draw_ix = draw(keeper, owner, true, feed, now, LOW);
+        only_the_pool_viewing_key(&mollusk, &draw_ix, &accounts, proof_err.clone());
+        let repay_ix = repay(keeper, now, now + 60, 1);
+        only_the_pool_viewing_key(&mollusk, &repay_ix, &accounts, proof_err.clone());
+        let liquidate_ix = liquidate(keeper, feed, now, HIGH);
+        only_the_pool_viewing_key(&mollusk, &liquidate_ix, &accounts, proof_err.clone());
+        // No pool key in deposit; any keeper reaches its proof.
+        for ix_tag in [tag::DEPOSIT, tag::DEPOSIT_ADD] {
+            let ix = deposit(ix_tag, keeper, 1, now, now, 1);
+            expect_err_exact(&mollusk, &ix, &accounts, proof_err.clone());
+        }
+        let result = mollusk.process_instruction(
+            &set_test_price(keeper, test, LOW, 0, NOW),
+            &[
+                (keeper, account()),
+                (test, Account::default()),
+                system.clone(),
+            ],
+        );
+        assert_eq!(result.program_result, ProgramResult::Success);
+    }
+    let outside = Pubkey::new_unique();
+    let accounts = [
+        (outside, account()),
+        (owner, account()),
+        (feed, good_pyth()),
+    ];
+    let not_keeper = lend(LendError::NotKeeper);
+    for ix in [
+        draw(outside, owner, true, feed, now, LOW),
+        repay(outside, now, now + 60, 1),
+        liquidate(outside, feed, now, HIGH),
+        deposit(tag::DEPOSIT, outside, 1, now, now, 1),
+        deposit(tag::DEPOSIT_ADD, outside, 1, now, now, 1),
+    ] {
+        expect_err_exact(&mollusk, &ix, &accounts, not_keeper.clone());
+    }
+    expect_err_exact(
+        &mollusk,
+        &set_test_price(outside, test, LOW, 0, NOW),
+        &[(outside, account()), (test, Account::default()), system],
+        not_keeper,
+    );
 }
 
 #[test]

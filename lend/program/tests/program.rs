@@ -7,9 +7,9 @@ use keeler_lend::{
     instructions::{
         cancel_intent::CancelIntentArgs, init_reserve::InitReserveArgs, intent::IntentArgs,
     },
-    tag, ADMIN, KEEPERS, POOL_VIEWING, POOL_SEED, USER_SEED,
+    tag, ADMIN, KEEPERS, POOL_SEED, POOL_VIEWING, USER_SEED,
 };
-use mollusk::{expect_err_exact, mollusk_with_program};
+use mollusk::{expect_err_exact, mollusk_with_program, only_the_pool_viewing_key};
 use mollusk_svm::{result::ProgramResult, Mollusk};
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
@@ -240,6 +240,25 @@ fn init_reserve_refuses_a_mint_other_than_the_pools() {
     };
     ix.data = data(tag::INIT_RESERVE, wincode::serialize(&args).unwrap());
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::UnknownMint));
+}
+
+#[test]
+fn init_reserve_takes_every_keeper_and_only_the_pool_viewing_key() {
+    let (mollusk, _) = setup();
+    let admin = pk(&ADMIN);
+    assert!(
+        (2..=4).contains(&KEEPERS.len()),
+        "the test build has a keeper set"
+    );
+    for keeper in KEEPERS {
+        let (ix, accounts) = init_reserve(pk(keeper), admin, true, NOW as u64 - 60);
+        only_the_pool_viewing_key(&mollusk, &ix, &accounts, code(LendError::InvalidProof));
+    }
+    let (ix, accounts) = init_reserve(Pubkey::new_unique(), admin, true, NOW as u64 - 60);
+    expect_err_exact(&mollusk, &ix, &accounts, code(LendError::NotKeeper));
+    // A keeper is not the admin.
+    let (ix, accounts) = init_reserve(pk(&KEEPERS[1]), pk(&KEEPERS[0]), true, NOW as u64);
+    expect_err_exact(&mollusk, &ix, &accounts, code(LendError::NotAdmin));
 }
 
 #[test]
