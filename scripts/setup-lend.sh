@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Builds Keeler Lend in this checkout, everything under lend/target:
+# Builds Keeler Lend in this checkout, under lend/target:
 #   - the circuits and their test keys (zolana zk compile --test), checked
 #     against the committed lend/lend-keys.CHECKSUM;
 #   - the browser package (lend/target/wasm);
 #   - the SBF program (lend/target/deploy/keeler_lend.so);
 #   - lend/target/keeler-lend-env, which the lend tests and tools source.
 # It reads the tool paths from the main checkout's .tools/env (run
-# scripts/setup.sh there once) and changes nothing outside lend/target.
+# scripts/setup.sh there once). Outside lend/target it writes the browser
+# package to web/public/lend and, with --update-checksums, lend/lend-keys.CHECKSUM.
 #
 # Build parameters (environment): KEELER_LEND_PROGRAM_ID, KEELER_LEND_ADMIN,
 # KEELER_LEND_KEEPERS, KEELER_LEND_POOL_VIEWING and the KEELER_LEND_VAULT1_*
