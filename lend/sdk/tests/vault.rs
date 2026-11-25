@@ -951,7 +951,10 @@ fn repay_removes_at_least_one_debt_share() {
     let back =
         builders::cancel_intent(&user, dust.clone(), keeper().viewing_pubkey(), TREE).unwrap();
     let refund = &back.outputs[keeler_lend::circuits::CANCEL_REFUND_SLOT];
-    assert_eq!((refund.amount, refund.owner_address), (1, Some(addr(&user))));
+    assert_eq!(
+        (refund.amount, refund.owner_address),
+        (1, Some(addr(&user)))
+    );
 
     let two = intent_full(&user, debt(), 2, purpose::REPAY, 7);
     let p = repay(&user, r.clone(), pos.clone(), two).unwrap();
