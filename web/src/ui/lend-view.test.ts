@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
 import type { Balance, Pool, Vault } from "../keeler/index";
 import { canDraw, collateralValue } from "../keeler/lend-math";
-import { borrowLimits, drawPrice, earnLimits, grow, healthBps, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceFromWhole, priceText } from "./lend-view";
+import { borrowLimits, drawPrice, earnLimits, grow, healthBps, lendingShown, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceFromWhole, priceText } from "./lend-view";
 
 const tUSD = { mint: "u", symbol: "tUSD", decimals: 6 };
 const tSOL = { mint: "s", symbol: "tSOL", decimals: 9 };
@@ -79,4 +79,11 @@ test("borrow limits per action match the note and canDraw limits", () => {
   expect(l.borrow).toBe(maxBorrow(4n * SOL, 100n * USD, drawPrice(vault), 8000));
   expect(l.withdraw).toBe(maxWithdraw(4n * SOL, 100n * USD, drawPrice(vault), 8000));
   expect(borrowLimits(vault, 0n, 0n, null)).toEqual({ add: null, borrow: 0n, repay: null, withdraw: 0n });
+});
+
+test("lending is presented from the build until the config is read, then from the client", () => {
+  expect(lendingShown(false, false, true)).toBe(true);
+  expect(lendingShown(false, false, false)).toBe(false);
+  expect(lendingShown(true, false, true)).toBe(false);
+  expect(lendingShown(true, true, false)).toBe(true);
 });

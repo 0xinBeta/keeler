@@ -82,7 +82,7 @@ describe("a mainnet build", () => {
     expect(landing("mainnet", { market: { pools: [], vaults: [{ collateral: { symbol: "JitoSOL" }, debt: { symbol: "USDT" }, collateralFactorBps: 7500, liquidationThresholdBps: 8000 }] } as never })).toMatch(/Borrow against your JitoSOL\..*75% limit with no existing debt.*80% liquidation threshold/);
     const devnet = landing("devnet");
     for (const t of [
-      "Supply tUSD or borrow against tSOL on Solana. Your amounts stay hidden from the public chain.",
+      "Supply tUSD or borrow against tSOL on Solana. Your lending amounts stay hidden from the public chain.",
       "Put tUSD to work.",
       "Borrow against your tSOL.",
       "Know your liquidation price.",
@@ -90,7 +90,7 @@ describe("a mainnet build", () => {
       "Try it with free test tokens.",
       "Illustrative borrow capacity",
       "Illustrative position of 4 tSOL against 420 tUSD debt.",
-      "Running the keeper in an attested enclave, so that nobody can read amounts, is planned.",
+      "Running the keeper in an attested enclave, so that Keeler's operators cannot read amounts, is planned.",
       "85% loan-to-value for tSOL → tUSD",
       "Not yet.",
     ])

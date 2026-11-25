@@ -919,6 +919,7 @@ function orbit(canvas: HTMLCanvasElement, lending: boolean, report: (kind: Rende
   let raf = 0;
   let sampled = 0;
   let sampledFrames = 0;
+  let slowWindows = 0;
   let journey: number | null = null;
   let desk = emptyStory();
   let deskFrom = desk;
@@ -931,7 +932,6 @@ function orbit(canvas: HTMLCanvasElement, lending: boolean, report: (kind: Rende
   let deskInitialized = false;
   let targetPointer: V2 = [0, 0];
   let cameraPointer: V2 = [0, 0];
-  let drag: { id: number; x: number; y: number } | null = null;
   let onScreen = true;
   let degraded = false;
   let destroyed = false;
@@ -953,6 +953,7 @@ function orbit(canvas: HTMLCanvasElement, lending: boolean, report: (kind: Rende
     last = 0;
     sampled = 0;
     sampledFrames = 0;
+    slowWindows = 0;
   }
 
   function fallback() {
@@ -1030,7 +1031,8 @@ function orbit(canvas: HTMLCanvasElement, lending: boolean, report: (kind: Rende
         const slow = sampledFrames * 1000 / sampled < FRAME_BUDGET_FPS;
         sampled = 0;
         sampledFrames = 0;
-        if (slow) return downgrade();
+        slowWindows = slow ? slowWindows + 1 : 0;
+        if (slowWindows === 2) return downgrade();
       }
     }
     const delta = last ? clamp((now - last) / 1000, 0, .075) : 0;
@@ -1083,33 +1085,17 @@ function orbit(canvas: HTMLCanvasElement, lending: boolean, report: (kind: Rende
   }
 
   function resetPointer() {
-    if (!drag) targetPointer = [0, 0];
+    targetPointer = [0, 0];
   }
 
   function move(event: PointerEvent) {
-    if (media.matches || event.pointerType === "pen") return;
-    if (drag && event.pointerId === drag.id) {
-      targetPointer = [clamp((event.clientX - drag.x) / 105, -1.8, 1.8), clamp((drag.y - event.clientY) / 105, -1.2, 1.2)];
-    } else if (event.pointerType === "mouse") {
-      const box = canvas.getBoundingClientRect();
-      if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) {
-        resetPointer();
-      } else {
-        targetPointer = [(event.clientX - box.left) / box.width * 2 - 1, 1 - (event.clientY - box.top) / box.height * 2];
-      }
+    if (media.matches || event.pointerType !== "mouse") return;
+    const box = canvas.getBoundingClientRect();
+    if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) {
+      resetPointer();
+    } else {
+      targetPointer = [(event.clientX - box.left) / box.width * 2 - 1, 1 - (event.clientY - box.top) / box.height * 2];
     }
-  }
-
-  function startDrag(event: PointerEvent) {
-    const target = event.target instanceof Element ? event.target : null;
-    if (event.pointerType !== "touch" || media.matches || target?.closest("a, button, input, select, textarea, label, [role=button]")) return;
-    drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
-  }
-
-  function endDrag(event: PointerEvent) {
-    if (drag?.id !== event.pointerId) return;
-    drag = null;
-    resetPointer();
   }
 
   function initialize() {
@@ -1145,15 +1131,10 @@ function orbit(canvas: HTMLCanvasElement, lending: boolean, report: (kind: Rende
     draw();
     sync();
   });
-  const priorTouchAction = host.style.touchAction;
   if (!settle) {
     listen(window, "pointermove", move as EventListener, { passive: true });
-    listen(window, "pointerup", endDrag as EventListener, { passive: true });
-    listen(window, "pointercancel", endDrag as EventListener, { passive: true });
     listen(window, "blur", resetPointer);
     listen(host, "pointerleave", resetPointer, { passive: true });
-    listen(host, "pointerdown", startDrag as EventListener, { passive: true });
-    if (!priorTouchAction) host.style.touchAction = "pan-y pinch-zoom";
   }
   const observer = new ResizeObserver(() => {
     resize();
@@ -1174,7 +1155,6 @@ function orbit(canvas: HTMLCanvasElement, lending: boolean, report: (kind: Rende
     observer.disconnect();
     visibility.disconnect();
     for (const off of listeners) off();
-    if (!settle && !priorTouchAction && host.style.touchAction === "pan-y pinch-zoom") host.style.touchAction = priorTouchAction;
     renderer?.dispose();
     renderer = null;
     context.getExtension("WEBGL_lose_context")?.loseContext();

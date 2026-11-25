@@ -12,6 +12,9 @@ export function healthBps(collateral: bigint, debt: bigint, price: bigint): numb
 }
 
 /** Past the threshold: `isLiquidatable`, read from the rounded-up health (equivalent for whole basis points). */
+/** Whether the page presents lending: the client decides once the config is read; before that the build does, so the first paint does not change. */
+export const lendingShown = (configRead: boolean, lend: boolean, compiled: boolean) => (configRead ? lend : lend || compiled);
+
 export const liquidatable = (health: number, vault: Vault) => health > vault.liquidationThresholdBps;
 
 /** The highest price at which the position is liquidatable; null without debt or collateral. */

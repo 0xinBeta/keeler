@@ -231,7 +231,6 @@ export function Panel(p: Props) {
         </div>
       ) : (
         <>
-          {/* All stay mounted so an operation in progress survives a look at another tab. */}
           <div className="desk" hidden={shown !== "swap"}>
             <SwapTab {...p} toBalances={() => setTab("balances")} report={report} />
           </div>
@@ -879,8 +878,8 @@ function BalancesTab(p: Props) {
             </button>
             <p className="ticket-foot">
               {mode === "deposit"
-                ? "Moves tokens from your public wallet balance into your private balance."
-                : "Moves tokens from your private balance back to your public wallet balance."}
+                ? "Moves tokens from your public wallet balance into your private balance. The amount of this move is public."
+                : "Moves tokens from your private balance back to your public wallet balance. The amount of this move is public."}
             </p>
           </form>
           <p className="status" aria-live="polite">

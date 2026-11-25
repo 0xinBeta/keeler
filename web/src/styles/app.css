@@ -1,10 +1,7 @@
 :root {
   --void: #000000;
-  --raised: #121419;
   --ice: #f4ebd6;
   --dust: #8d93a1;
-  --mist: #c4bdae; /* body copy that sits near the ring: brighter than dust */
-  --gold-hi: #f2cb90;
   --ember: #ff6a3d;
   --ui: "Archivo Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
   color-scheme: dark;
@@ -87,7 +84,6 @@ input {
   color: var(--ember);
 }
 
-/* Stage: header, hero and the page over the hero ring. */
 .stage {
   position: relative;
 }

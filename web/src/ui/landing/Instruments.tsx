@@ -72,13 +72,13 @@ export function CollateralSlider({ pair, market }: { pair: Pair; market: Market 
       <div className="kl-control-row">
         <div className="kl-value">
           <label htmlFor="kl-collateral">{pair.collateral} collateral</label>
-          <output htmlFor="kl-collateral" className="kl-number" data-kl="collateral">
+          <output aria-live="off" htmlFor="kl-collateral" className="kl-number" data-kl="collateral">
             {collateral} <small>{pair.collateral}</small>
           </output>
         </div>
         <div className="kl-value kl-value-out">
           <span>Illustrative borrow capacity</span>
-          <output htmlFor="kl-collateral" className="kl-number" data-kl="capacity">
+          <output aria-live="off" htmlFor="kl-collateral" className="kl-number" data-kl="capacity">
             {capacity} <small>{pair.debt}</small>
           </output>
         </div>
@@ -136,7 +136,7 @@ export function PriceStress({ pair, market }: { pair: Pair; market: Market | nul
       <div className="kl-control-row kl-risk-header">
         <div className="kl-value">
           <span>Loan-to-value</span>
-          <output htmlFor="kl-stress" className="kl-number" data-kl="ltv">
+          <output aria-live="off" htmlFor="kl-stress" className="kl-number" data-kl="ltv">
             {shown}
           </output>
         </div>
@@ -163,7 +163,7 @@ export function PriceStress({ pair, market }: { pair: Pair; market: Market | nul
       </div>
       <div className="kl-stress-row">
         <label htmlFor="kl-stress">{pair.collateral} price drop</label>
-        <output htmlFor="kl-stress">{drop}%</output>
+        <output aria-live="off" htmlFor="kl-stress">{drop}%</output>
       </div>
       <div className="kl-slider">
         <input

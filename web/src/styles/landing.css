@@ -592,13 +592,20 @@
   }
   .kl-home {
     padding-top: 68px;
-    padding-bottom: 65px;
+    padding-bottom: 24px;
   }
   .kl-home .kl-copy h1 {
-    font-size: clamp(37px, 13vh, 82px);
+    font-size: clamp(34px, 11vh, 82px);
   }
   .kl-home .kl-lead {
     margin: 12px 0;
+  }
+  .kl-markets {
+    padding-top: 68px;
+    padding-bottom: 40px;
+  }
+  .kl-markets h2 {
+    font-size: clamp(30px, 11vh, 60px);
   }
 }
 
@@ -1062,7 +1069,9 @@
   .kl-chapter[data-active="true"] :is(.kl-thread, .kl-pool-seal) {
     animation: none;
   }
-  .kl-slider input::-webkit-slider-thumb,
+  .kl-slider input::-webkit-slider-thumb {
+    transition: none;
+  }
   .kl-slider input::-moz-range-thumb {
     transition: none;
   }

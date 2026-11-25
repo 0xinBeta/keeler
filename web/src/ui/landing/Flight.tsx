@@ -79,7 +79,7 @@ function chapters({ lend, open, network, pair, market }: Props, cue: ReactNode):
       body: (
         <>
           <p className="kl-lead">
-            Supply {d} or borrow against {c} on Solana. Your amounts stay hidden from the public chain.
+            Supply {d} or borrow against {c} on Solana. Your lending amounts stay hidden from the public chain.
           </p>
           <div className="kl-actions">
             {go("earn", `Supply ${d}`, true)}

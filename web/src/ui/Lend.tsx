@@ -48,7 +48,7 @@ const LANDED: Record<LendKind, string> = {
   repay: "Done. The repayment is applied.",
   close: "Done. The position is closed and the collateral is in your private balance.",
 };
-const STEP_SHORT:Record<LendStep, string> = { proving: "Proving", signing: "Signing", keeper: "Keeper", landed: "Landed" };
+const STEP_SHORT: Record<LendStep, string> = { proving: "Proving", signing: "Signing", keeper: "Keeper", landed: "Landed" };
 
 export function kindLabel(o: Pick<LendOperation, "kind" | "amounts">, collateral?: Asset): string {
   switch (o.kind) {
@@ -304,7 +304,6 @@ function KeeperCheck({ p }: { p: LendProps }) {
 
 const amountsText = (amounts: Running["amounts"]) => amounts.map((x) => amountText(x.amount, x.asset)).join(" and ");
 
-
 function earnForm(p: LendProps, pool: Pool, chosen: "in" | "out", text: string, shown: boolean, now: number | null) {
   const a = pool.asset;
   // Every receipt in this pool counts towards the deposit; one withdrawal spends one receipt, so the largest caps it.
@@ -344,7 +343,8 @@ export function EarnTab(p: DeskProps) {
   if (!op.run) submitted.current = { fraction: edit.fraction };
   const model = earnModel(input && { ...input, run: op.run, live: op.live, submitted: submitted.current });
   let label = "Your deposit";
-  let value = form ? amountText(form.value, form.a) : "—";
+  const unread = !p.account || p.account.needsSession;
+  let value = form && !(unread && form.value === 0n) ? amountText(form.value, form.a) : "—";
   if (form && op.run && model.phase === "review") [label, value] = [kindLabel(op.run), amountsText(op.run.amounts)];
   else if (form && !op.run && model.valid && form.f.parsed !== null) {
     const after = form.mode === "in" ? form.value + form.f.parsed : form.value > form.f.parsed ? form.value - form.f.parsed : 0n;
@@ -637,7 +637,8 @@ export function BorrowTab(p: DeskProps) {
   const model = borrowModel(input && { ...input, run: op.run, live: op.live, submitted: submitted.current });
   const ltvText = (h: number, debt: bigint) => (debt === 0n ? "No debt" : pct(h));
   let label = "Loan-to-value";
-  let value = form ? (form.position ? ltvText(form.h, form.d) : "No position") : "—";
+  const unread = !p.account || p.account.needsSession;
+  let value = form && (form.position || !unread) ? (form.position ? ltvText(form.h, form.d) : "No position") : "—";
   if (form && op.run && model.phase === "review") [label, value] = [kindLabel(op.run, vault?.collateral), amountsText(op.run.amounts)];
   else if (form && !op.run && model.valid) [label, value] = ["Loan-to-value after", ltvText(form.h2, form.d2)];
   useReport("borrow", { model, label, value }, p.report);

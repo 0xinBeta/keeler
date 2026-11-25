@@ -217,7 +217,7 @@ test("a running operation survives another desk, Activity and the landing", asyn
   await expect(p.getByRole("heading", { name: "Borrow privately" })).toBeVisible();
   await open(page, "Activity");
   await expect(activity(page).locator("li.order-pending")).toBeVisible();
-  await page.getByRole("link", { name: "Keeler, top of page" }).click();
+  await page.getByRole("link", { name: "Keeler, home" }).click();
   await expect(page.getByRole("heading", { name: "Lend in private." })).toBeVisible();
   await expect(p).toBeHidden();
 
@@ -354,4 +354,36 @@ test("without WebGL the desk shows the still frames", async ({ page }) => {
   const still = figure.locator(".aperture > div");
   await expect(still).toHaveCount(1);
   expect(await still.evaluate((el) => getComputedStyle(el).backgroundImage)).toMatch(/url\(/);
+});
+
+test("the desk ring shows the stills while its WebGL context is lost and draws again when it is restored", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/#earn");
+  const figure = page.locator(".observatory");
+  await expect(figure).toHaveAttribute("data-renderer", "webgl");
+  await figure.locator("canvas").evaluate((canvas: HTMLCanvasElement) => {
+    const lose = canvas.getContext("webgl2")!.getExtension("WEBGL_lose_context")!;
+    (window as unknown as { lose: WEBGL_lose_context }).lose = lose;
+    lose.loseContext();
+  });
+  await expect(figure).toHaveAttribute("data-renderer", "still");
+  await page.evaluate(() => (window as unknown as { lose: WEBGL_lose_context }).lose.restoreContext());
+  await expect(figure).toHaveAttribute("data-renderer", "webgl");
+  await expect(figure.locator(".aperture > div")).toHaveCount(0);
+});
+
+test("a swap in flight survives a visit to the landing", async ({ page }) => {
+  const problems = await setUp(page);
+  const p = panel(page);
+  await open(page, "Swap");
+  await p.locator("#sell-amt").fill("100");
+  await p.getByRole("button", { name: "Get quotes" }).click();
+  await p.getByRole("button", { name: "Swap privately" }).click();
+  await expect(p.locator(".step-now", { hasText: "Proving your order" })).toBeVisible({ timeout: 10_000 });
+  await page.getByRole("link", { name: "Keeler, home" }).click();
+  await expect(p).toBeHidden();
+  await page.goBack();
+  await expect(p.getByText(/^Settled\. You received [\d.,]+ tSOL privately\.$/)).toBeVisible({ timeout: 60_000 });
+  await expect(caption(page)).toHaveText(/^Received\s*[\d.,]+ tSOL$/);
+  expect(problems).toEqual([]);
 });

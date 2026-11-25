@@ -5,6 +5,7 @@ import { LendActivity } from "./Lend";
 import type { Market } from "./Lend";
 import { Orders } from "./Orders";
 import { short } from "./format";
+import { lendingShown } from "./lend-view";
 import { Panel } from "./Panel";
 import { errorText, Logo, NetworkPill } from "./shared";
 
@@ -187,7 +188,8 @@ export function App({ keeler }: { keeler: Keeler }) {
   if (route && route !== tab) setTab(route);
   const refundable =
     orders.filter((o) => o.status === "refundable").length + (account?.operations.filter((o) => o.status === "refundable").length ?? 0);
-  const nav = ROUTES.filter((r) => lend || (r !== "earn" && r !== "borrow"));
+  const lendShown = lendingShown(!!config, !!lend, !!import.meta.env.VITE_LEND_PROGRAM_ID);
+  const nav = ROUTES.filter((r) => lendShown || (r !== "earn" && r !== "borrow"));
 
   const shownView = useRef(view);
   useEffect(() => {
@@ -206,7 +208,7 @@ export function App({ keeler }: { keeler: Keeler }) {
     <>
       <div className="stage" hidden={view !== "landing"}>
         <main id="top">
-          {view === "landing" && <Landing config={config} market={market} lend={!!lend} open={go} />}
+          {view === "landing" && <Landing config={config} market={market} lend={lendShown} open={go} />}
         </main>
       </div>
       <div className="app" hidden={view !== "app"}>
@@ -222,7 +224,7 @@ export function App({ keeler }: { keeler: Keeler }) {
         </a>
         <header className="topbar">
           <div className="wrap topbar-inner">
-            <a className="brand" href="#top" aria-label="Keeler, top of page">
+            <a className="brand" href="#top" aria-label="Keeler, home">
               <Logo />
               Keeler
             </a>
