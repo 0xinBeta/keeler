@@ -13,6 +13,7 @@ permissions:
 
 env:
   AGAVE_VERSION: v4.1.2
+  AGAVE_SHA256: 5991d027a686eb419a709a479178b33eb83501e8a2bfbf599a81a286bfcbf770
   WASM_PACK_VERSION: v0.15.1
   WASM_PACK_SHA256: 410101009739b9d01c7d5affaaad6e9c9a24b4cba6791a4805db8e89b9bf7af2
   CARGO_TERM_COLOR: always
@@ -25,6 +26,8 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -38,12 +41,18 @@ jobs:
             ~/.config/zolana/cache
             ~/.cache/.wasm-pack
             .tools
-          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('scripts/setup.sh', 'patches/swap.patch') }}
+          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ env.AGAVE_SHA256 }}-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('scripts/setup.sh', 'patches/swap.patch') }}
       - name: Install Agave
         run: |
-          bin=$HOME/.local/share/solana/install/active_release/bin
-          [[ -x $bin/cargo-build-sbf ]] || sh -c "$(curl -sSfL https://release.anza.xyz/$AGAVE_VERSION/install)"
-          echo "$bin" >>"$GITHUB_PATH"
+          release=$HOME/.local/share/solana/install/active_release
+          if [[ ! -x $release/bin/cargo-build-sbf ]]; then
+            curl -sSfL -o /tmp/agave.tar.bz2 "https://github.com/anza-xyz/agave/releases/download/$AGAVE_VERSION/solana-release-x86_64-unknown-linux-gnu.tar.bz2"
+            echo "$AGAVE_SHA256  /tmp/agave.tar.bz2" | sha256sum -c -
+            mkdir -p "$release"
+            tar -xjf /tmp/agave.tar.bz2 -C "$release" --strip-components=1
+          fi
+          echo "$release/bin" >>"$GITHUB_PATH"
+          "$release/bin/cargo-build-sbf" --version
       - name: Install wasm-pack
         run: |
           mkdir -p /tmp/wasm-pack
@@ -66,8 +75,6 @@ jobs:
             lend -> target
           cache-workspace-crates: true
       - run: scripts/setup.sh
-      - name: Drop the browser package restored with lend/target, which zolana will not overwrite without its marker
-        run: rm -rf lend/target/wasm
       - run: scripts/setup-lend.sh
       - name: Mollusk program tests
         working-directory: lend

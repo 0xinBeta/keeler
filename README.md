@@ -197,10 +197,10 @@ scripts and the gating tests also run on Linux x86-64 (CI); the local-network an
 have been run on macOS only.
 
 Pinned in the repository: Rust 1.98.1 (`rust-toolchain.toml`, `lend/rust-toolchain.toml`);
-`helius-labs/privacy-ring-examples` at `9e5d69ade7e0c107a2929306d3b758a8969e1089` and SBF platform
-tools v1.54 (`scripts/setup.sh`, `scripts/setup-lend.sh`); `xark` 0.3.1, the `spr-*` crates 0.10.0
+`helius-labs/privacy-ring-examples` at `9e5d69ade7e0c107a2929306d3b758a8969e1089` (`scripts/setup.sh`)
+and SBF platform tools v1.54 (`scripts/setup.sh`, `scripts/setup-lend.sh`); `xark` 0.3.1, the `spr-*` crates 0.10.0
 (`spr-hasher` 0.8.0), built with the `zolana` CLI `cli-v0.10.0` (`lend/Cargo.toml`);
-`@heliuslabs/spr` 0.9.0-alpha (`web/package.json`); Node 25.4.0 (`.node-version`); pnpm 10.28.2
+`@heliuslabs/spr` 0.9.0-alpha (`web/package.json`); Node 26.13.1 LTS (`.node-version`); pnpm 10.28.2
 (`packageManager` in `web/package.json` and `worker/package.json`); Agave 4.1.2 and `wasm-pack`
 0.15.1, the versions CI installs (`AGAVE_VERSION`, `WASM_PACK_VERSION` in
 `.github/workflows/ci.yml`). Outside the checkout, `scripts/setup.sh` downloads the Zolana prover,
@@ -236,12 +236,12 @@ its mock client, with no network: `pnpm e2e:mock`. Local networks use a port off
 The scripts read the tool paths from the main checkout's `.tools/env`; each checkout builds its own
 `target/` (several GB).
 
-Continuous integration (`.github/workflows/ci.yml`, on every push and pull request) runs on Linux:
+Continuous integration (`.github/workflows/ci.yml`, on every push and on pull requests to `main`) runs on Linux:
 `cargo fmt --check`, `cargo clippy -D warnings`, `scripts/setup.sh` and `scripts/setup-lend.sh`
 (so the lend keys checksum is checked), the `keeler-core`, `keeler` (lib, fixtures, deploy refusals),
 circuit and lend SDK native tests, and the web and Worker type checks and unit tests. It does not
 run the Mollusk tests, the local-network tests, the two end-to-end tests or the mock browser suite:
-those are `.github/workflows/slow.yml`, run by hand, which gates nothing. Nothing in CI runs the page
+those are `.github/workflows/slow.yml`, run by hand, which gates nothing and has to be dispatched once after it reaches `main`. Nothing in CI runs the page
 against a real local keeper, reaches devnet or mainnet, or uses a secret.
 
 Devnet and mainnet deploys: `docs/lend-deploy.md` (`scripts/deploy-lend-devnet.sh`) and
