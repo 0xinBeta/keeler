@@ -41,7 +41,7 @@ import {
 import { BUILD_NETWORK, testWalletAllowed, walletChain } from "./network";
 import { fairBuyAmount, ttlOk, vsFairBps, withinBand, type Price } from "./price";
 import { verifyQuote } from "./quote-sig";
-import { nextRecord, refreshAll, refundRefusal, type ChainReads } from "./status";
+import { nextRecord, refreshAll, refundRefusal, rose, type ChainReads } from "./status";
 import { orderStore, type OrderRecord } from "./storage";
 import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
 import { createLend, type LendServerConfig } from "./lend";
@@ -884,12 +884,17 @@ export function createKeeler(): Keeler {
     async faucet() {
       const c = await config();
       if (!c.faucet) throw err("network", "This network has no faucet.");
+      const rpc = (await client()).solanaRpc;
+      const sol = async () => (await rpc.getBalance(owner()).send()).value;
+      const before = await as("network", "Reading your SOL balance", sol);
       const res = await getJson<{ ok?: boolean; error?: string }>("/api/faucet", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ wallet: owner() }),
       });
       if (!res.ok) throw err("rate-limited", `The faucet refused: ${res.error ?? "unknown reason"}. Try again tomorrow.`);
+      const arrived = await as("network", "Waiting for the test tokens", () => rose(sol, before));
+      if (!arrived) throw err("network", "The faucet took the request, but the tokens have not arrived yet. Check your balance in a minute.");
     },
 
     chainNow,

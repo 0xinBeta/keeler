@@ -65,3 +65,12 @@ export function refundRefusal(r: OrderRecord): string | undefined {
   if (r.status === "pending") return "The order has not been seen on chain yet. Try again in a minute.";
   return `The order is ${r.status}; there is nothing to refund.`;
 }
+
+/** Polls `read` until it exceeds `before`; false when it has not after `tries` reads spaced `waitMs` apart. */
+export async function rose(read: () => Promise<bigint>, before: bigint, tries = 30, waitMs = 2000): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    if ((await read()) > before) return true;
+    if (i + 1 < tries) await new Promise((r) => setTimeout(r, waitMs));
+  }
+  return false;
+}

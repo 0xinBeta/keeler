@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refreshAll, refundRefusal, type ChainReads, type SignatureState } from "../src/keeler/status";
+import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refreshAll, refundRefusal, rose, type ChainReads, type SignatureState } from "../src/keeler/status";
 import type { OrderRecord } from "../src/keeler/storage";
 import type { ChainStatus } from "../src/keeler/swap";
 
@@ -138,5 +138,19 @@ describe("refunds", () => {
   it("are refused for pending and final orders", () => {
     expect(refundRefusal(record())).toMatch(/not been seen on chain/);
     expect(refundRefusal(record({ status: "settled" }))).toMatch(/nothing to refund/);
+  });
+});
+
+describe("rose", () => {
+  it("is true as soon as a read exceeds the starting value", async () => {
+    const reads = [5n, 5n, 6n];
+    let n = 0;
+    expect(await rose(async () => reads[n++]!, 5n, 5, 0)).toBe(true);
+    expect(n).toBe(3);
+  });
+  it("is false when no read exceeds it within the tries", async () => {
+    let n = 0;
+    expect(await rose(async () => (n++, 5n), 5n, 3, 0)).toBe(false);
+    expect(n).toBe(3);
   });
 });
