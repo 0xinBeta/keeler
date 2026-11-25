@@ -25,6 +25,8 @@ export type OpRecord = LendOperation & {
   onChain?: boolean;
   /** An intent's opening, to find and refund it. */
   intent?: { hash: Uint8Array; output: RawOutput; purpose: number; target: bigint };
+  /** The intent's ticket as the keeper issued it, with the terms it was asked for; sent with account reads while open. */
+  ticket?: { id: string; expiry: number; signature: string; keeper: string; purpose: string; amount: string; pool?: string; vault?: number; position?: string };
   /** The note a keeper-built operation or close spends, and what it leaves for the owner once it lands. */
   spends?: Uint8Array;
   creates?: { receipt?: ReceiptRecord; position?: PositionRecord };
@@ -33,7 +35,8 @@ export type OpRecord = LendOperation & {
 /** The last price index this page saw per pool, 1e12-scaled, and the chain time it held at. */
 export type IndexRecord = { pool: string; supply?: { index: bigint; at: number }; borrow?: { index: bigint; at: number } };
 
-type Kinds = { op: OpRecord; receipt: ReceiptRecord; position: PositionRecord; index: IndexRecord };
+/** `emptied`: positions a full liquidation left with no collateral and no debt, by position id. */
+type Kinds = { op: OpRecord; receipt: ReceiptRecord; position: PositionRecord; emptied: PositionRecord; index: IndexRecord };
 export type LendStore = ReturnType<typeof lendStore>;
 
 const PREFIX = "keeler:lend:v1:";

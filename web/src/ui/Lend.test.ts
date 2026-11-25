@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { expect, test } from "vitest";
 import type { Vault } from "../keeler/index";
-import { HealthBar, OpSteps, healthState, kindLabel } from "./Lend";
+import { EmptiedNote, HealthBar, LiquidatedNote, OpSteps, healthState, kindLabel } from "./Lend";
 
 const tUSD = { mint: "u", symbol: "tUSD", decimals: 6 };
 const tSOL = { mint: "s", symbol: "tSOL", decimals: 9 };
@@ -27,6 +27,25 @@ test("the health bar is a labelled meter with its state and the preview", () => 
   expect(html).toContain("health-liquidatable");
   expect(html).toContain("70.0%");
   expect(html).toContain("85% liquidation");
+});
+
+test("the liquidation note says what the liquidation left, not what a later repayment did", () => {
+  const lastLiquidation = { at: 100, debtRepaid: 40_000000n, collateralSold: 1_000000000n, price: 120_000_000_000n, collateralLeft: 3_000000000n, debtLeft: 60_000000n };
+  // Repaid in full since: no debt now, but the liquidation did not repay the whole loan.
+  const later = renderToStaticMarkup(createElement(LiquidatedNote, { position: { vault: 1, id: "42", collateral: 3_000000000n, debt: 0n, lastLiquidation }, vault, now: 130 }));
+  expect(later).toContain("30 s ago");
+  expect(later).not.toContain("whole loan");
+  expect(later).toContain("back to 85% or less");
+  const full = renderToStaticMarkup(createElement(LiquidatedNote, { position: { vault: 1, id: "42", collateral: 1n, debt: 0n, lastLiquidation: { ...lastLiquidation, debtLeft: 0n } }, vault, now: 130 }));
+  expect(full).toContain("It repaid the whole loan");
+});
+
+test("a full liquidation that left nothing says so", () => {
+  const lastLiquidation = { at: 100, debtRepaid: 100_000000n, collateralSold: 4_000000000n, price: 120_000_000_000n, collateralLeft: 0n, debtLeft: 0n };
+  const html = renderToStaticMarkup(createElement(EmptiedNote, { position: { vault: 1, id: "42", collateral: 0n, debt: 0n, lastLiquidation }, vault, now: 100 }));
+  expect(html).toContain("Your position was liquidated in full");
+  expect(html).toContain("no collateral and no debt");
+  expect(html).toContain('role="status"');
 });
 
 test("a draw is named by what it moves", () => {

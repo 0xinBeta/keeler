@@ -54,8 +54,14 @@ const ORIGIN = "https://keeler.test";
 function req(path: string, init: RequestInit & { headers?: Record<string, string> } = {}) {
   return new Request(ORIGIN + path, init);
 }
-const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
-  req(path, { method: "POST", body: typeof body === "string" ? body : JSON.stringify(body), headers: { "content-type": "application/json", ...headers } });
+// A browser POST from the page carries its Origin.
+// A header set to undefined is left out.
+const post = (path: string, body: unknown, headers: Record<string, string | undefined> = {}) =>
+  req(path, {
+    method: "POST",
+    body: typeof body === "string" ? body : JSON.stringify(body),
+    headers: Object.fromEntries(Object.entries({ "content-type": "application/json", origin: ORIGIN, ...headers }).filter((e): e is [string, string] => e[1] !== undefined)),
+  });
 
 async function call(r: Request, e = env()) {
   const res = await worker.fetch(r, e);
@@ -514,21 +520,23 @@ describe("/api/lend/*", () => {
     id: 1, collateralMint: MINT_A, debtMint: MINT_B, cfBps: 8000, ltBps: 8500, lmlBps: 9000, penaltyBps: 100, minCollateral: "10000000", minDebt: "1000000",
   }];
   const LIMITS = ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT", "LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT", "LEND_BUILD_LIMIT"] as const;
+  // Two keepers in failover order; the replies name the one that made them.
+  const K1 = "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq";
+  const K2 = "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9";
+  const KEEPERS = [{ url: "https://k1.example", pubkey: K1 }, { url: "https://k2.example/", pubkey: K2 }];
   const lendEnv = (over: Partial<Env> = {}) => env({
-    LEND_PROGRAM_ID: PROGRAM, LEND_POOLS: JSON.stringify(POOLS), LEND_VAULTS: JSON.stringify(VAULTS),
+    LEND_PROGRAM_ID: PROGRAM, LEND_POOLS: JSON.stringify(POOLS), LEND_VAULTS: JSON.stringify(VAULTS), LEND_KEEPERS: JSON.stringify(KEEPERS),
     ASSETS: JSON.stringify([{ mint: MINT_A, symbol: "tSOL", decimals: 9 }, { mint: MINT_B, symbol: "tUSD", decimals: 6 }]),
     ...Object.fromEntries(LIMITS.map((n) => [n, allow])), ...over,
   });
   const [ACCOUNT_REQ, TICKET_REQ, BUILD_REQ] = fixture.requests as unknown as { method: string; path: string; fields: Record<string, string | number> }[];
-  // In the order the Worker forwards a query.
-  const SIGNED = Object.fromEntries(["wallet", "nonce", "timestamp", "sessionKey", "sessionExpiry", "sessionAuth", "signature"].map((k) => [k, ACCOUNT_REQ!.fields[k]!]));
-  const query = (o: Record<string, unknown>) => "?" + new URLSearchParams(Object.entries(o).map(([k, v]) => [k, String(v)]));
+  const ACCOUNT = ACCOUNT_REQ!.fields as Record<string, string | number> & { tickets: Record<string, unknown>[] };
   const TICKET = TICKET_REQ!.fields;
   const BUILD = BUILD_REQ!.fields;
   /** `body` signed by the fixture's session as the page signs it (docs/lend-api.md, "Request bytes"). */
   const sessionKey = crypto.subtle.importKey("pkcs8", Uint8Array.from([...hexBytes("302e020100300506032b657004220420"), ...hexBytes(fixture.session.seed_hex)]), { name: "Ed25519" }, false, ["sign"]);
   async function signed(path: string, body: Record<string, string | number>, nonce = "0e".repeat(16)) {
-    const f: Record<string, string | number> = { ...body, wallet: fixture.wallet.address, sessionKey: fixture.session.key, sessionExpiry: fixture.session.expiry, sessionAuth: fixture.session.auth_hex, nonce, timestamp: fixture.now };
+    const f: Record<string, string | number> = { ...body, wallet: fixture.wallet.address, origin: fixture.origin, sessionKey: fixture.session.key, sessionExpiry: fixture.session.expiry, sessionAuth: fixture.session.auth_hex, nonce, timestamp: fixture.now };
     const canonical = Object.keys(f).filter((k) => !["signature", "nonce", "timestamp"].includes(k)).sort().map((k) => `${k}=${f[k]}\n`).join("");
     const time = new Uint8Array(8);
     new DataView(time.buffer).setBigUint64(0, BigInt(fixture.now), true);
@@ -554,9 +562,11 @@ describe("/api/lend/*", () => {
     intents: [{ id: "ab".repeat(16), purpose: "deposit", amount: "10000000", expiry: 1_800_000_600, status: "waiting" }],
     index: { supply: "1000000000000", borrow: "1000000000000", at: 1_800_000_000 },
   };
+  const TICKET_REPLY = { id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG, keeper: K1 };
+  const BUILD_REPLY = { transaction: TX, outputs: [OUT, OUT], now: 1_800_000_000, bound: "150000000000000", index: "1000000000000", keeper: K1 };
   const routes = () => [
     req("/api/lend/pools"),
-    req("/api/lend/account" + query(SIGNED)),
+    post("/api/lend/account", ACCOUNT),
     post("/api/lend/ticket", TICKET),
     post("/api/lend/build", BUILD),
   ];
@@ -569,10 +579,20 @@ describe("/api/lend/*", () => {
   });
 
   it("puts lend in config, and refuses malformed settings", async () => {
-    expect((await call(req("/api/config"), lendEnv())).body.lend).toEqual({ programId: PROGRAM, pools: POOLS, vaults: VAULTS });
+    expect((await call(req("/api/config"), lendEnv())).body.lend).toEqual({ programId: PROGRAM, pools: POOLS, vaults: VAULTS, keepers: [K1, K2] });
+    // Without LEND_KEEPERS, today's single keeper: the first dealer's key.
+    expect((await call(req("/api/config"), lendEnv({ LEND_KEEPERS: undefined }))).body.lend.keepers).toEqual(["D1"]);
+    expect((await call(req("/api/config"), lendEnv({ LEND_KEEPERS: undefined, DEALERS: "[]" }))).body.lend.keepers).toEqual([]);
     const p = POOLS[0]!;
     const v = VAULTS[0]!;
     for (const bad of [
+      { LEND_KEEPERS: "[]" },
+      { LEND_KEEPERS: "[{" },
+      { LEND_KEEPERS: JSON.stringify([KEEPERS[0], KEEPERS[0]]) }, // a duplicate key
+      { LEND_KEEPERS: JSON.stringify([{ ...KEEPERS[0], pubkey: "D1" }]) },
+      { LEND_KEEPERS: JSON.stringify([{ ...KEEPERS[0], url: "k1.example" }]) },
+      { LEND_KEEPERS: JSON.stringify([{ ...KEEPERS[0], extra: 1 }]) },
+      { LEND_KEEPERS: JSON.stringify([...KEEPERS, { url: "https://k3.example", pubkey: TRADER }, { url: "https://k4.example", pubkey: MINT_A }, { url: "https://k5.example", pubkey: MINT_B }]) }, // more than 4
       { LEND_PROGRAM_ID: "nope" },
       { LEND_POOLS: undefined },
       { LEND_VAULTS: "[]" },
@@ -592,12 +612,12 @@ describe("/api/lend/*", () => {
     }
   });
 
-  it("forwards each route to the first dealer's keeper path with the key, and returns the checked reply", async () => {
+  it("forwards each route to the first keeper's path with the key, and returns the checked reply", async () => {
     const replies: Record<string, unknown> = {
       "/lend/pools": POOLS_REPLY,
       "/lend/account": ACCOUNT_REPLY,
-      "/lend/ticket": { id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG },
-      "/lend/build": { transaction: TX, outputs: [OUT, OUT], now: 1_800_000_000, bound: "150000000000000", index: "1000000000000" },
+      "/lend/ticket": TICKET_REPLY,
+      "/lend/build": BUILD_REPLY,
     };
     mockFetch((url) => Response.json(replies[new URL(url).pathname]));
     const timeouts = vi.spyOn(AbortSignal, "timeout");
@@ -607,13 +627,16 @@ describe("/api/lend/*", () => {
     expect(results.map((r) => r.body)).toEqual(Object.values(replies));
     expect(results[0]!.res.headers.get("content-security-policy")).toBe("default-src 'none'");
     expect(calls.map((c) => [c.init.method, c.url])).toEqual([
-      ["GET", "https://d1.example/lend/pools"],
-      ["GET", "https://d1.example/lend/account" + query(SIGNED)],
-      ["POST", "https://d1.example/lend/ticket"],
-      ["POST", "https://d1.example/lend/build"],
+      ["GET", "https://k1.example/lend/pools"],
+      ["POST", "https://k1.example/lend/account"],
+      ["POST", "https://k1.example/lend/ticket"],
+      ["POST", "https://k1.example/lend/build"],
     ]);
     for (const c of calls) expect((c.init.headers as Record<string, string>)["x-keeler-key"]).toBe(DKEY);
     expect(calls[0]!.init.body).toBeUndefined();
+    // The account read carries the signed fields and the open tickets, exactly as the page sent them.
+    expect(JSON.parse(calls[1]!.init.body as string)).toEqual(ACCOUNT);
+    expect(ACCOUNT.tickets).toEqual([fixture.ticket.held]);
     expect(JSON.parse(calls[2]!.init.body as string)).toEqual(TICKET);
     expect(JSON.parse(calls[3]!.init.body as string)).toEqual(BUILD);
     expect(timeouts.mock.calls.map(([ms]) => ms)).toEqual([10000, 10000, 10000, 30000]);
@@ -629,11 +652,16 @@ describe("/api/lend/*", () => {
     const e = lendEnv();
     const bad: Request[] = [
       req("/api/lend/pools?x=1"),
-      req("/api/lend/account"),
-      req("/api/lend/account" + query({ ...SIGNED, extra: 1 })),
-      req("/api/lend/account" + query({ ...SIGNED, timestamp: "soon" })),
-      req("/api/lend/account" + query({ ...SIGNED, wallet: "nope" })),
-      req("/api/lend/account" + query(SIGNED) + "&wallet=" + TRADER),
+      post("/api/lend/account", {}),
+      post("/api/lend/account", { ...ACCOUNT, extra: 1 }),
+      post("/api/lend/account", { ...ACCOUNT, timestamp: "soon" }),
+      post("/api/lend/account", { ...ACCOUNT, wallet: "nope" }),
+      post("/api/lend/account", { ...ACCOUNT, tickets: undefined }),
+      post("/api/lend/account", { ...ACCOUNT, tickets: [{ ...ACCOUNT.tickets[0], extra: 1 }] }),
+      post("/api/lend/account", { ...ACCOUNT, tickets: [{ ...ACCOUNT.tickets[0], keeper: "nope" }] }),
+      post("/api/lend/account", { ...ACCOUNT, tickets: Array(9).fill(ACCOUNT.tickets[0]) }),
+      post("/api/lend/account", { ...ACCOUNT, origin: "javascript:alert(1)" }),
+      post("/api/lend/ticket", { ...TICKET, origin: undefined }),
       post("/api/lend/ticket", { ...TICKET, extra: 1 }),
       post("/api/lend/ticket", { ...TICKET, amount: 5000000 }),
       post("/api/lend/ticket", { ...TICKET, amount: "18446744073709551616" }),
@@ -645,13 +673,13 @@ describe("/api/lend/*", () => {
       post("/api/lend/ticket", { ...TICKET, sessionKey: "nope" }),
       post("/api/lend/ticket", { ...TICKET, sessionExpiry: "1800086340" }),
       post("/api/lend/ticket", { ...TICKET, sessionAuth: "ab" }),
-      req("/api/lend/account" + query({ ...SIGNED, sessionExpiry: "later" })),
+      post("/api/lend/account", { ...ACCOUNT, sessionExpiry: "later" }),
       post("/api/lend/ticket", { ...TICKET, wallet: undefined }),
       post("/api/lend/ticket", "[]"),
       post("/api/lend/build", { ...BUILD, op: "liquidate" }),
       post("/api/lend/build", { ...BUILD, vault: 70000 }),
       post("/api/lend/build", { ...REDEEM, amount: "1000000", shares: "5000000" }),
-      post("/api/lend/build", { ...SIGNED, op: "redeem", pool: MINT_B }),
+      post("/api/lend/build", { ...ACCOUNT, tickets: undefined, op: "redeem", pool: MINT_B }),
       post("/api/lend/build", { ...REDEEM, shares: "5" + "0".repeat(20) }),
       post("/api/lend/build", { ...BUILD, shares: "5000000" }),
       post("/api/lend/build", { ...BUILD, receipt: OUT }), // a receipt names what a redeem spends
@@ -661,6 +689,7 @@ describe("/api/lend/*", () => {
     for (const r of bad) expect((await call(r, e)).res.status, r.url).toBe(400);
     expect((await call(post("/api/lend/build", { ...BUILD, pad: "x".repeat(16 * 1024) }), e)).res.status).toBe(413);
     expect((await call(req("/api/lend/ticket"), e)).res.status).toBe(405);
+    expect((await call(req("/api/lend/account"), e)).res.status).toBe(405);
     expect((await call(post("/api/lend/pools", {}), e)).res.status).toBe(405);
     expect((await call(req("/api/lend/other"), e)).res.status).toBe(404);
     expect((await call(req("/api/lend/constructor"), e)).res.status).toBe(404);
@@ -670,14 +699,17 @@ describe("/api/lend/*", () => {
   });
 
   it("refuses malformed and oversized keeper replies, and passes its refusals", async () => {
+    const b = { transaction: TX, outputs: [OUT], now: 1, keeper: K1 };
     const cases: [Response | (() => never), number][] = [
-      [Response.json({ transaction: "A".repeat(5468), outputs: [OUT], now: 1 }), 502], // over 4,096 bytes
-      [Response.json({ transaction: TX, outputs: [], now: 1 }), 502],
-      [Response.json({ transaction: TX, outputs: [OUT], now: 1, extra: 1 }), 502],
-      [Response.json({ transaction: "not base64!", outputs: [OUT], now: 1 }), 502],
+      [Response.json({ ...b, transaction: "A".repeat(5468) }), 502], // over 4,096 bytes
+      [Response.json({ ...b, outputs: [] }), 502],
+      [Response.json({ ...b, extra: 1 }), 502],
+      [Response.json({ ...b, transaction: "not base64!" }), 502],
+      [Response.json({ ...b, keeper: undefined }), 502],
+      [Response.json({ ...b, keeper: K2 }), 502], // the reply names a keeper other than the one asked
       [new Response("not json"), 502],
-      [new Response(JSON.stringify({ transaction: TX, outputs: [OUT], now: 1, bound: "1".padEnd(17 * 1024, " ") })), 502], // over 16 KiB
-      [Response.json({ transaction: TX, outputs: [OUT], now: 1, index: 5 }), 502],
+      [new Response(JSON.stringify({ ...b, bound: "1".padEnd(17 * 1024, " ") })), 502], // over 16 KiB
+      [Response.json({ ...b, index: 5 }), 502],
       [Response.json({ error: "x" }, { status: 500 }), 502],
       [() => { throw new Error(`refused ${DKEY}`); }, 502],
       [Response.json({ error: "The reserve is busy for 12 s." }, { status: 409 }), 409],
@@ -689,11 +721,11 @@ describe("/api/lend/*", () => {
       expect(body.error).toBeTypeOf("string");
     }
     mockFetch(() => Response.json({ ...ACCOUNT_REPLY, receipts: [{ ...ACCOUNT_REPLY.receipts[0], shares: 5 }] }));
-    expect((await call(req("/api/lend/account" + query(SIGNED)), lendEnv())).res.status).toBe(502);
+    expect((await call(post("/api/lend/account", ACCOUNT), lendEnv())).res.status).toBe(502);
   });
 
   it("charges the client limit first and the global limit only after validation and the signatures", async () => {
-    mockFetch(() => Response.json({ id: "ab".repeat(16), expiry: 1, signature: SIG }));
+    mockFetch(() => Response.json(TICKET_REPLY));
     const seen: string[] = [];
     const named = (name: string, ok = true) => ({ limit: async ({ key }: { key: string }) => (seen.push(`${name}:${key}`), { success: ok }) }) as RateLimit;
     const e = lendEnv(Object.fromEntries(LIMITS.map((n) => [n, named(n)])));
@@ -703,7 +735,7 @@ describe("/api/lend/*", () => {
     await call(post("/api/lend/ticket", TICKET, ip), e);
     await call(post("/api/lend/build", BUILD, ip), e);
     await call(req("/api/lend/pools", { headers: ip }), e);
-    await call(req("/api/lend/account", { headers: ip }), e);
+    await call(post("/api/lend/account", {}, ip), e);
     expect(seen).toEqual([
       "LEND_TICKET_LIMIT:2001:db8:a:b::/64",
       "LEND_TICKET_LIMIT:2001:db8:a:b::/64",
@@ -729,7 +761,7 @@ describe("/api/lend/*", () => {
   });
 
   it("checks the wallet's authorisation and the session's signature before anything global or the keeper", async () => {
-    mockFetch(() => Response.json({ id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG }));
+    mockFetch(() => Response.json(TICKET_REPLY));
     const seen: string[] = [];
     const named = (name: string) => ({ limit: async () => (seen.push(name), { success: true }) }) as RateLimit;
     const e = lendEnv(Object.fromEntries(LIMITS.map((n) => [n, named(n)])));
@@ -743,7 +775,7 @@ describe("/api/lend/*", () => {
       post("/api/lend/ticket", { ...TICKET, wallet: TRADER }), // someone else's wallet
       post("/api/lend/build", { ...BUILD, timestamp: Number(BUILD.timestamp) + 1 }),
       post("/api/lend/build", { ...BUILD, signature: TICKET.signature }), // another request's signature
-      req("/api/lend/account" + query({ ...SIGNED, signature: SIG })),
+      post("/api/lend/account", { ...ACCOUNT, signature: SIG }),
     ];
     for (const r of forged) expect((await call(r, e)).res.status, r.url).toBe(401);
     // Authorised for another program or network.
@@ -752,14 +784,14 @@ describe("/api/lend/*", () => {
     expect(calls).toHaveLength(0);
     expect(seen.every((n) => !n.includes("GLOBAL"))).toBe(true);
     // The page's own signed requests pass, byte for byte.
-    for (const r of [req("/api/lend/account" + query(SIGNED)), post("/api/lend/ticket", TICKET), post("/api/lend/build", BUILD)]) {
+    for (const r of [post("/api/lend/account", ACCOUNT), post("/api/lend/ticket", TICKET), post("/api/lend/build", BUILD)]) {
       expect((await call(r, lendEnv())).res.status).not.toBe(401);
     }
   });
 
   it("never holds a repayment ticket back on the global ticket limit", async () => {
-    mockFetch(() => Response.json({ id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG }));
-    const full = { limit: async () => ({ success: false }) } as RateLimit;
+    mockFetch(() => Response.json(TICKET_REPLY));
+    const full ={ limit: async () => ({ success: false }) } as RateLimit;
     const e = lendEnv({ LEND_TICKET_GLOBAL_LIMIT: full });
     const repay = await signed("/lend/ticket", { purpose: "repay", amount: "1000000", vault: 1, position: "7" });
     expect((await call(post("/api/lend/ticket", repay), e)).res.status).toBe(200);
@@ -769,11 +801,104 @@ describe("/api/lend/*", () => {
     expect((await call(post("/api/lend/ticket", repay), lendEnv({ LEND_TICKET_LIMIT: full }))).res.status).toBe(429);
   });
 
-  it("sends lending to LEND_KEEPER_URL when it is set", async () => {
+  it("without LEND_KEEPERS, sends lending to LEND_KEEPER_URL, else the first dealer", async () => {
     mockFetch(() => Response.json(POOLS_REPLY));
-    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPER_URL: "https://keeper.example/" }))).res.status).toBe(200);
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPERS: undefined, LEND_KEEPER_URL: "https://keeper.example/" }))).res.status).toBe(200);
     expect(calls[0]!.url).toBe("https://keeper.example/lend/pools");
-    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPER_URL: "keeper.example" }))).res.status).toBe(500);
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPERS: undefined }))).res.status).toBe(200);
+    expect(calls[1]!.url).toBe("https://d1.example/lend/pools");
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPERS: undefined, LEND_KEEPER_URL: "keeper.example" }))).res.status).toBe(500);
+    // LEND_KEEPERS wins over LEND_KEEPER_URL.
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPER_URL: "https://keeper.example/" }))).res.status).toBe(200);
+    expect(calls[2]!.url).toBe("https://k1.example/lend/pools");
+  });
+
+  it("asks the next keeper only when the first gave no reply or a reply that is not the keeper's", async () => {
+    const k2 = (url: string) => new URL(url).host === "k2.example";
+    const fine = (url: string) => Response.json({ ...TICKET_REPLY, keeper: k2(url) ? K2 : K1 });
+    const firstFails: [string, () => Response][] = [
+      ["no reply", () => { throw new TypeError("connection refused"); }],
+      ["not JSON", () => new Response("<html>bad gateway</html>", { status: 502 })],
+      ["an ok reply of the wrong shape", () => Response.json({ hello: 1 })],
+      ["a reply naming another keeper", () => Response.json({ ...TICKET_REPLY, keeper: K2 })],
+      ["an error without the keeper's JSON", () => Response.json({ message: "x" }, { status: 503 })],
+    ];
+    for (const [name, first] of firstFails) {
+      mockFetch((url) => (k2(url) ? fine(url) : first()));
+      const { res, body } = await call(post("/api/lend/ticket", TICKET), lendEnv());
+      expect(res.status, name).toBe(200);
+      expect(body.keeper, name).toBe(K2);
+      expect(calls.map((c) => new URL(c.url).host), name).toEqual(["k1.example", "k2.example"]);
+      expect(calls[1]!.init.body, name).toBe(calls[0]!.init.body);
+    }
+    // The keeper's own JSON answer stands, whatever its status: no second keeper.
+    for (const [reply, status] of [
+      [Response.json({ error: "Lending is paused for new deposits." }, { status: 403 }), 403],
+      [Response.json({ error: "The reserve is busy for 12 s." }, { status: 409 }), 409],
+      [Response.json({ error: "The keeper failed." }, { status: 500 }), 502],
+    ] as const) {
+      mockFetch((url) => (k2(url) ? fine(url) : reply.clone()));
+      expect((await call(post("/api/lend/ticket", TICKET), lendEnv())).res.status).toBe(status);
+      expect(calls).toHaveLength(1);
+    }
+    // Both fail: the last failure, and never a third try.
+    mockFetch(() => { throw new TypeError("down"); });
+    expect((await call(post("/api/lend/ticket", TICKET), lendEnv())).res.status).toBe(502);
+    expect(calls).toHaveLength(2);
+    // One keeper only: no retry.
+    mockFetch(() => { throw new TypeError("down"); });
+    expect((await call(post("/api/lend/ticket", TICKET), lendEnv({ LEND_KEEPERS: JSON.stringify([KEEPERS[0]]) }))).res.status).toBe(502);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("charges each limit once for a request that fails over", async () => {
+    mockFetch((url) => (new URL(url).host === "k2.example" ? Response.json({ ...TICKET_REPLY, keeper: K2 }) : (() => { throw new TypeError("down"); })()));
+    const seen: string[] = [];
+    const named = (name: string) => ({ limit: async () => (seen.push(name), { success: true }) }) as RateLimit;
+    const e = lendEnv(Object.fromEntries(LIMITS.map((n) => [n, named(n)])));
+    expect((await call(post("/api/lend/ticket", TICKET), e)).res.status).toBe(200);
+    expect(calls).toHaveLength(2);
+    expect(seen).toEqual(["LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT"]);
+  });
+
+  it("LEND_PAUSED refuses new tickets and builds, and lets reads, repayments and deposit additions through", async () => {
+    const replies: Record<string, unknown> = { "/lend/pools": POOLS_REPLY, "/lend/account": ACCOUNT_REPLY, "/lend/ticket": TICKET_REPLY };
+    mockFetch((url) => Response.json(replies[new URL(url).pathname]));
+    const e = lendEnv({ LEND_PAUSED: "1" });
+    const repay = await signed("/lend/ticket", { purpose: "repay", amount: "1000000", vault: 1, position: "7" });
+    const deposit = await signed("/lend/ticket", { purpose: "deposit", amount: "1000000", vault: 1, position: "7" });
+    for (const r of [post("/api/lend/ticket", TICKET), post("/api/lend/build", BUILD), post("/api/lend/build", REDEEM)]) {
+      const { res, body } = await call(r, e);
+      expect(res.status, r.url).toBe(503);
+      expect(body.error).toMatch(/paused/);
+    }
+    expect(calls).toHaveLength(0);
+    for (const r of [req("/api/lend/pools"), post("/api/lend/account", ACCOUNT), post("/api/lend/ticket", repay), post("/api/lend/ticket", deposit)]) {
+      expect((await call(r, e)).res.status, r.url).toBe(200);
+    }
+    // The keeper is told, so it refuses a deposit that would open a position.
+    expect(calls.map((c) => (c.init.headers as Record<string, string>)["x-keeler-paused"])).toEqual(["1", "1", "1", "1"]);
+    // Not paused: no header.
+    await call(req("/api/lend/pools"), lendEnv());
+    expect((calls[4]!.init.headers as Record<string, string>)["x-keeler-paused"]).toBeUndefined();
+  });
+
+  it("refuses a session authorised for another site", async () => {
+    mockFetch(() => Response.json(TICKET_REPLY));
+    // A session signed on another site, relayed with this site's Origin (the origin check runs before the signature's).
+    const relayed = await call(post("/api/lend/ticket", { ...TICKET, origin: "https://evil.example" }), lendEnv());
+    expect(relayed.res.status).toBe(401);
+    expect(relayed.body.error).toContain("another site");
+    // No Origin header at all, off a local build.
+    const bare = await call(post("/api/lend/account", ACCOUNT, { origin: undefined }), lendEnv());
+    expect(bare.res.status).toBe(401);
+    expect(bare.body.error).toContain("another site");
+    // A browser on another site never gets this far: the cross-origin guard answers first.
+    expect((await call(post("/api/lend/ticket", TICKET, { origin: "https://evil.example" }), lendEnv())).res.status).toBe(403);
+    expect(calls).toHaveLength(0);
+    // A local build behind the dev proxy sends no Origin header.
+    const local = await call(post("/api/lend/ticket", TICKET, { origin: undefined }), lendEnv({ NETWORK: "local" }));
+    expect(local.body.error ?? "").not.toContain("another site"); // it gets on to the signature (signed for devnet)
   });
 
   it("refuses lend settings whose mints are not in ASSETS", async () => {
@@ -792,8 +917,8 @@ describe("/api/lend/*", () => {
     const replies: Record<string, unknown> = {
       "/lend/pools": POOLS_REPLY,
       "/lend/account": ACCOUNT_REPLY,
-      "/lend/ticket": { id: "ab".repeat(16), expiry: 1_800_000_600, signature: SIG },
-      "/lend/build": { transaction: TX, outputs: [OUT], now: 1_800_000_000 },
+      "/lend/ticket": TICKET_REPLY,
+      "/lend/build": BUILD_REPLY,
     };
     mockFetch((url) => Response.json(replies[new URL(url).pathname]));
     const e = lendEnv({ PAUSED: "1" });

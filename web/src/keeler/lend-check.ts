@@ -104,7 +104,8 @@ export type ExpectedNote = {
 export type Expected = {
   op: "redeem" | "draw";
   programId: Address;
-  keeper: Address;
+  /** The keepers compiled into the site: the reply's `keeper` must be one of them. */
+  keepers: readonly Address[];
   /** The owner's wallet: must sign read-only and nowhere else. */
   owner: Address;
   chainNow: number;
@@ -131,8 +132,8 @@ export type Hashing = {
   openPayout(p: { data: Uint8Array; txViewingPk: Uint8Array; salt: Uint8Array; slotIndex: number }): Promise<{ mint: Uint8Array; amount: bigint; blinding: Uint8Array; plain: boolean } | undefined>;
 };
 
-/** The keeper's `/lend/build` reply, decoded. */
-export type BuildReply = { transaction: Uint8Array; outputs: Uint8Array[]; now: number; bound?: bigint };
+/** The keeper's `/lend/build` reply, decoded; `keeper` is the keeper that built and signed it. */
+export type BuildReply = { transaction: Uint8Array; outputs: Uint8Array[]; now: number; bound?: bigint; keeper: Address };
 
 export type Checked = { transaction: Transaction; now: bigint; bound?: bigint; outputs: Uint8Array[]; firstNullifier: Uint8Array };
 
@@ -159,6 +160,8 @@ export function lendInstructions(wire: Uint8Array, programId: Address): { tag: n
 
 /** Accepts the keeper's transaction only in the exact shape the page asked for; returns it ready to sign. */
 export async function checkKeeperTransaction(reply: BuildReply, e: Expected, h: Hashing): Promise<Checked> {
+  const keeper = reply.keeper;
+  if (!e.keepers.includes(keeper)) refuse("it comes from a keeper this site was not built with");
   let transaction: Transaction;
   let compiled: ReturnType<ReturnType<typeof getCompiledTransactionMessageDecoder>["decode"]>;
   try {
@@ -175,7 +178,7 @@ export async function checkKeeperTransaction(reply: BuildReply, e: Expected, h: 
     return refuse("its message does not decode");
   }
   if ("nonce" in message.lifetimeConstraint) refuse("it is a durable-nonce transaction");
-  if (message.feePayer.address !== e.keeper) refuse("the keeper is not its fee payer");
+  if (message.feePayer.address !== keeper) refuse("the keeper is not its fee payer");
   if (message.feePayer.address === e.owner) refuse("it makes your wallet pay its fees");
 
   const lend = message.instructions.filter((ix) => ix.programAddress === e.programId);
@@ -196,7 +199,7 @@ export async function checkKeeperTransaction(reply: BuildReply, e: Expected, h: 
   if (mine.length !== 1 || mine[0]!.i !== KEEPER_HEAD.owner || mine[0]!.role !== AccountRole.READONLY_SIGNER) {
     refuse("your wallet is not exactly one read-only signer in it");
   }
-  if (accounts[KEEPER_HEAD.keeper]?.address !== e.keeper) refuse("the keeper does not sign it");
+  if (accounts[KEEPER_HEAD.keeper]?.address !== keeper) refuse("the keeper does not sign it");
 
   const layout = e.op === "redeem" ? ARGS.redeem : ARGS.draw;
   if (data.length < 1 + layout.length) refuse("its instruction data is too short");

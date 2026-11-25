@@ -34,14 +34,15 @@ export const TICKET_DOMAIN = "keeler-lend-ticket-v1";
 /** The 32-byte Ed25519 seed of the session key: SHA-256(domain ‖ the wallet's 64-byte key-derivation signature). */
 export const sessionSeed = (derivationSignature: Uint8Array) => sha256(concat(utf8(SESSION_DOMAIN), derivationSignature));
 
-export type Session = { keys: CryptoKeyPair; key: Address; expiry: number; auth: string };
+/** `origin`: the page's `location.origin`, named in the authorisation text and sent with every request. */
+export type Session = { keys: CryptoKeyPair; key: Address; expiry: number; auth: string; origin: string };
 
 export async function sessionKey(seed: Uint8Array): Promise<{ keys: CryptoKeyPair; key: Address }> {
   const keys = await createKeyPairFromPrivateKeyBytes(seed);
   return { keys, key: await getAddressFromPublicKey(keys.publicKey) };
 }
 
-export type Authorisation = { network: string; programId: string; wallet: string; sessionKey: string; expiry: number };
+export type Authorisation = { network: string; origin: string; programId: string; wallet: string; sessionKey: string; expiry: number };
 
 /** What the wallet signs once per session: human-readable, LF line ends, UTF-8. */
 export function authorisationText(a: Authorisation): string {
@@ -51,6 +52,8 @@ export function authorisationText(a: Authorisation): string {
     "This lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.",
     "",
     `Network: ${a.network}`,
+    `Origin: ${a.origin}`,
+    "The keeper can see your lending amounts.",
     `Program: ${a.programId}`,
     `Wallet: ${a.wallet}`,
     `Session key: ${a.sessionKey}`,
@@ -63,8 +66,8 @@ export const authorisationMessage = (a: Authorisation) => utf8(authorisationText
 export const sessionExpiryFor = (now: number) => now + SESSION_MAX_SECS - 60;
 
 export type Fields = Record<string, string | number>;
-/** Fields covered by position in the signed bytes, not by the hash. */
-const POSITIONAL = new Set(["signature", "nonce", "timestamp"]);
+/** Fields covered by position in the signed bytes, not by the hash; `tickets` (account reads) carry the keeper's own signatures. */
+const POSITIONAL = new Set(["signature", "nonce", "timestamp", "tickets"]);
 
 /** `key=value\n` for every other field, keys sorted, values as their decimal or string form. */
 export function canonical(fields: Fields): string {
@@ -92,7 +95,7 @@ export async function requestMessage(method: "GET" | "POST", path: string, field
 
 /** The request's fields with the session fields, a fresh nonce, `timestamp` and the session key's signature. */
 export async function signRequest(s: Session, wallet: string, method: "GET" | "POST", path: string, body: Fields, timestamp: number, nonce = crypto.getRandomValues(new Uint8Array(16))): Promise<Fields> {
-  const fields: Fields = { ...body, wallet, sessionKey: s.key, sessionExpiry: s.expiry, sessionAuth: s.auth, nonce: hex(nonce), timestamp };
+  const fields: Fields = { ...body, wallet, origin: s.origin, sessionKey: s.key, sessionExpiry: s.expiry, sessionAuth: s.auth, nonce: hex(nonce), timestamp };
   const signature = await signBytes(s.keys.privateKey, await requestMessage(method, path, fields));
   return { ...fields, signature: hex(signature) };
 }
@@ -108,7 +111,7 @@ const verify = async (key: Address, signatureHex: unknown, message: Uint8Array) 
 
 /** The keeper's checks, minus freshness and replay (docs/lend-api.md): for tests and the shared fixture. */
 export async function verifyRequest(network: string, programId: string, method: "GET" | "POST", path: string, fields: Fields): Promise<boolean> {
-  const auth = authorisationMessage({ network, programId, wallet: String(fields.wallet), sessionKey: String(fields.sessionKey), expiry: Number(fields.sessionExpiry) });
+  const auth = authorisationMessage({ network, origin: String(fields.origin), programId, wallet: String(fields.wallet), sessionKey: String(fields.sessionKey), expiry: Number(fields.sessionExpiry) });
   return (
     (await verify(String(fields.wallet) as Address, fields.sessionAuth, auth)) &&
     (await verify(String(fields.sessionKey) as Address, fields.signature, await requestMessage(method, path, fields)))
