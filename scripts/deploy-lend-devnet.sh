@@ -1,29 +1,37 @@
 #!/usr/bin/env bash
 # Deploys Keeler Lend to devnet as deployment <name> (default lend). NOT TO
 # BE RUN until the owner approves the SOL it needs: run with --estimate
-# first, which sends nothing. Safe to rerun after any failure: the deploy
-# resumes from its buffer and a finished one sends nothing.
+# first, which sends nothing and creates no Keychain item. Safe to rerun
+# after any failure: the deploy resumes from its buffer and a finished one
+# sends nothing.
 #
 #   scripts/deploy-lend-devnet.sh [--estimate] [name]
 #
-# 1. Creates the Keychain items keeler-devnet-<name>-program and
-#    keeler-devnet-<name>-buffer if absent. The funded keeler-devnet-deploy
-#    (the admin) and keeler-devnet-dealer (the keeper) must exist, and the
-#    dealer must be the one in target/devnet/deploy-summary.json, whose tSOL
-#    and tUSD become vault 1's collateral and debt mints.
-# 2. Builds the program once with those addresses compiled in and the
+# Keychain items (Solana keypair JSON arrays):
+#   keeler-devnet-deploy          must exist, funded: pays, upgrade authority, admin
+#   keeler-devnet-dealer          must exist: the swap dealer, the first keeper
+#   keeler-devnet-<name>-standby  optional: a second keeper (a standby)
+#   keeler-devnet-<name>-pool     the pool key: the pool viewing key derives from
+#                                 it; must be no keeper's key
+#   keeler-devnet-<name>-program, keeler-devnet-<name>-buffer
+# A real run creates the pool, program and buffer items if absent.
+# --estimate never creates one: with any of them missing it builds with
+# stand-in values in target/devnet-<name>/estimate/, prints the cost and
+# records nothing.
+#
+# 1. Builds the program once with those addresses compiled in and the
 #    test-price feature (the keeper sets the price; Pyth's devnet feeds are
 #    not used), and keeps that .so: reruns deploy the same bytes.
-# 3. Runs the deploy tool (cli/examples/deploy.rs `program`), which refuses
+# 2. Runs the deploy tool (cli/examples/deploy.rs `program`), which refuses
 #    any cluster but devnet and stops before sending if the deploy wallet
 #    holds less than the deploy still needs.
+# 3. Prints the site build and Worker variables for this deployment.
 #
 # Writes only target/devnet-<name>/: plan.json, summary.json, program-id,
-# keeler_lend.so, build-params.json (the addresses compiled in), keys/ (the
-# proving keys the keeper reads), deploy.log, and the build directories
-# build/ and cargo/. --estimate writes all but
-# summary.json, so it also records build-params.json and keys/ for a
-# deployment made before they existed.
+# keeler_lend.so, build-params.json ({program_id, admin, keepers, pool_viewing,
+# collateral_mint, debt_mint, price_account, feed_id}, read by
+# scripts/run-dealer.sh), keys/ (the proving keys the keeper reads),
+# deploy.log, and the build directories build/ and cargo/.
 # Needs: security (macOS), python3, the main checkout's .tools/env, and the
 # Helius key in the Keychain item keeler-helius-api-key.
 set -euo pipefail
@@ -61,41 +69,90 @@ is_address() { [[ $1 =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]]; }
 swap=$root/target/devnet/deploy-summary.json
 [[ -f $swap ]] || { echo "no $swap: the swap deploy (scripts/deploy-devnet.sh) gives the dealer and the mints" >&2; exit 1; }
 summary_field() { python3 -c 'import json, sys; s = json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, {"s": s}))' "$swap" "$1"; }
-keeper=$(summary_field 's["dealer"]')
+dealer=$(summary_field 's["dealer"]')
 collateral=$(summary_field '{m: a for m, a, _ in s["mints"]}["tSOL"]')
 debt=$(summary_field '{m: a for m, a, _ in s["mints"]}["tUSD"]')
 for item in deploy dealer; do
     have "keeler-devnet-$item" || { echo "no Keychain item keeler-devnet-$item" >&2; exit 1; }
 done
 admin=$(address_of keeler-devnet-deploy)
-# The keeper compiled in must be the key the dealer runs with, or every
-# keeper instruction fails on chain.
-[[ $(address_of keeler-devnet-dealer) == "$keeper" ]] || { echo "keeler-devnet-dealer is not the dealer $keeper in $swap" >&2; exit 1; }
+# The first keeper must be the key the dealer runs with, or its keeper
+# instructions fail on chain.
+[[ $(address_of keeler-devnet-dealer) == "$dealer" ]] || { echo "keeler-devnet-dealer is not the dealer $dealer in $swap" >&2; exit 1; }
+keepers=$dealer
+if have "keeler-devnet-$name-standby"; then
+    standby=$(address_of "keeler-devnet-$name-standby")
+    [[ $standby != "$dealer" ]] || { echo "keeler-devnet-$name-standby is the dealer's key" >&2; exit 1; }
+    keepers=$dealer,$standby
+fi
 
 # shellcheck source=/dev/null
 . "$root/.tools/env"
 tool_target=$out/cargo
 tool=$tool_target/release/examples/deploy
+keeler=$tool_target/release/keeler
 # Its own target, so the live dealer's target/release is left alone.
-CARGO_TARGET_DIR=$tool_target cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --example deploy
+CARGO_TARGET_DIR=$tool_target cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler --example deploy
 
-for item in program buffer; do
-    if ! have "keeler-devnet-$name-$item"; then
-        json=$("$tool" keygen)
-        # An empty or broken item would block every rerun.
-        [[ $json =~ ^\[([0-9]{1,3},){63}[0-9]{1,3}\]$ ]] || { echo "keygen gave no keypair" >&2; exit 1; }
-        store "keeler-devnet-$name-$item" "$json"
-        echo "created Keychain item keeler-devnet-$name-$item" >&2
-    fi
+missing=()
+for item in pool program buffer; do
+    have "keeler-devnet-$name-$item" || missing+=("keeler-devnet-$name-$item")
+done
+if $estimate && ((${#missing[@]})); then
+    # The size, and so the cost, does not depend on the addresses compiled in.
+    echo "estimate only: ${missing[*]} absent (a real run creates them); building with stand-in addresses, recording nothing" >&2
+    est=$out/estimate
+    KEELER_LEND_ADMIN=$admin KEELER_LEND_KEEPERS=$keepers \
+        KEELER_LEND_VAULT1_COLLATERAL_MINT=$collateral KEELER_LEND_VAULT1_DEBT_MINT=$debt \
+        KEELER_LEND_OUT=$est/build "$root/scripts/setup-lend.sh"
+    python3 - "$est/plan.json" "$est/build/deploy/keeler_lend.so" <<'EOF'
+import json, sys
+plan = {
+    "name": "estimate",
+    "network": {
+        "rpc_url": "https://devnet.helius-rpc.com",
+        "indexer_url": "https://devnet.helius-rpc.com/v1/spr",
+        "prover": {"helius": {"keychain": "keeler-helius-api-key"}},
+    },
+    "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "deploy_key": {"keychain": "keeler-devnet-deploy"},
+    "program_key": {"keychain": "unused-by-estimate"},
+    "buffer_key": {"keychain": "unused-by-estimate"},
+    "program_so": sys.argv[2],
+}
+open(sys.argv[1], "w").write(json.dumps(plan, indent=2) + "\n")
+EOF
+    "$tool" estimate "$est/plan.json"
+    exit 0
+fi
+
+# bash 3.2 calls an empty "${missing[@]}" unbound under set -u.
+for item in ${missing[@]+"${missing[@]}"}; do
+    json=$("$tool" keygen)
+    # An empty or broken item would block every rerun.
+    [[ $json =~ ^\[([0-9]{1,3},){63}[0-9]{1,3}\]$ ]] || { echo "keygen gave no keypair" >&2; exit 1; }
+    store "$item" "$json"
+    echo "created Keychain item $item" >&2
 done
 program_id=$(address_of "keeler-devnet-$name-program")
-for a in "$program_id" "$admin" "$keeper" "$collateral" "$debt"; do
+pool=$(address_of "keeler-devnet-$name-pool")
+# Whoever holds the pool key reads every amount; it is a key of its own so
+# that a keeper can be removed without handing it the next pool key.
+[[ ,$keepers, != *",$pool,"* ]] || { echo "keeler-devnet-$name-pool is a keeper's key; it must be its own" >&2; exit 1; }
+[[ $pool != "$admin" ]] || { echo "keeler-devnet-$name-pool is the deploy key" >&2; exit 1; }
+pool_viewing=$("$keeler" deploy viewing-key "keeler-devnet-$name-pool")
+[[ $pool_viewing =~ ^04[0-9a-f]{64}$ ]] || { echo "no viewing key for keeler-devnet-$name-pool" >&2; exit 1; }
+for a in "$program_id" "$admin" "$collateral" "$debt" ${keepers//,/ }; do
     is_address "$a" || { echo "'$a' is not a base58 address" >&2; exit 1; }
 done
 if [[ -f $out/program-id && $(cat "$out/program-id") != "$program_id" ]]; then
     echo "$out was built for $(cat "$out/program-id"), the Keychain holds $program_id; use another deployment name" >&2
     exit 1
 fi
+# The Pyth price account and feed stay at their defaults, unused on devnet
+# (the test price account is passed), but recorded explicitly.
+price_account=7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE
+feed_id=ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d
 
 so=$out/keeler_lend.so
 if [[ ! -f $so ]]; then
@@ -104,10 +161,10 @@ if [[ ! -f $so ]]; then
     grep -q 'bpf-entrypoint,test-price' "$root/scripts/setup-lend.sh" ||
         { echo "scripts/setup-lend.sh no longer builds with test-price" >&2; exit 1; }
     before=$(git -C "$root" status --porcelain --untracked-files=no)
-    # The Pyth price account and feed stay at their defaults: unused when
-    # the test price account is passed.
-    KEELER_LEND_PROGRAM_ID=$program_id KEELER_LEND_ADMIN=$admin KEELER_LEND_KEEPER=$keeper \
+    KEELER_LEND_PROGRAM_ID=$program_id KEELER_LEND_ADMIN=$admin KEELER_LEND_KEEPERS=$keepers \
+        KEELER_LEND_POOL_VIEWING=$pool_viewing \
         KEELER_LEND_VAULT1_COLLATERAL_MINT=$collateral KEELER_LEND_VAULT1_DEBT_MINT=$debt \
+        KEELER_LEND_VAULT1_PRICE_ACCOUNT=$price_account KEELER_LEND_VAULT1_FEED_ID=$feed_id \
         KEELER_LEND_OUT=$out/build "$root/scripts/setup-lend.sh"
     [[ $(git -C "$root" status --porcelain --untracked-files=no) == "$before" ]] ||
         { echo "the build changed tracked files; nothing deployed" >&2; exit 1; }
@@ -120,11 +177,20 @@ fi
 # scripts/run-dealer.sh (a keeper built with other values fails every
 # instruction) and checked on each rerun: the Keychain or the swap deploy
 # may have changed since the .so was built.
-python3 - "$out/build-params.json" "$program_id" "$admin" "$keeper" "$collateral" "$debt" <<'EOF'
+python3 - "$out/build-params.json" "$program_id" "$admin" "$keepers" "$pool_viewing" \
+    "$collateral" "$debt" "$price_account" "$feed_id" <<'EOF'
 import json, os, sys
-path = sys.argv[1]
-names = ["program_id", "admin", "keeper", "collateral_mint", "debt_mint"]
-params = dict(zip(names, sys.argv[2:]))
+path, program_id, admin, keepers, pool_viewing, collateral, debt, price, feed = sys.argv[1:]
+params = {
+    "program_id": program_id,
+    "admin": admin,
+    "keepers": keepers.split(","),
+    "pool_viewing": pool_viewing,
+    "collateral_mint": collateral,
+    "debt_mint": debt,
+    "price_account": price,
+    "feed_id": feed,
+}
 if os.path.exists(path) and json.load(open(path)) != params:
     sys.exit(f"{path} records other build parameters than these; use another deployment name")
 open(path + ".tmp", "w").write(json.dumps(params, indent=2) + "\n")
@@ -166,11 +232,30 @@ plan = {
 open(sys.argv[1], "w").write(json.dumps(plan, indent=2) + "\n")
 EOF
 
-echo "$name: program $program_id, admin $admin, keeper $keeper, tSOL $collateral, tUSD $debt" >&2
+echo "$name: program $program_id, admin $admin, keepers $keepers, pool viewing $pool_viewing, tSOL $collateral, tUSD $debt" >&2
 if $estimate; then
     "$tool" estimate "$out/plan.json"
-    exit 0
+else
+    "$tool" program "$out/plan.json" >"$out/summary.json.tmp"
+    mv "$out/summary.json.tmp" "$out/summary.json"
+    echo "wrote $out/summary.json; next: docs/lend-deploy.md, after the deploy" >&2
 fi
-"$tool" program "$out/plan.json" >"$out/summary.json.tmp"
-mv "$out/summary.json.tmp" "$out/summary.json"
-echo "wrote $out/summary.json; next: docs/lend-deploy.md, after the deploy" >&2
+
+# What the site build and the Worker need (docs/lend-deploy.md, worker/README.md).
+python3 - "$out/build-params.json" <<'EOF' >&2
+import json, sys
+p = json.load(open(sys.argv[1]))
+keepers = json.dumps(p["keepers"], separators=(",", ":"))
+listed = json.dumps([{"url": f"<keeper {i + 1} URL>", "pubkey": k} for i, k in enumerate(p["keepers"])],
+                    separators=(",", ":"))
+print("site build (web/):")
+print(f"  VITE_NETWORK=devnet")
+print(f"  VITE_LEND_PROGRAM_ID={p['program_id']}")
+print(f"  VITE_LEND_KEEPERS='{keepers}'")
+print(f"  VITE_LEND_POOL_VIEWING={p['pool_viewing']}")
+print("Worker:")
+print(f"  NETWORK=devnet")
+print(f"  LEND_PROGRAM_ID={p['program_id']}")
+print(f"  LEND_KEEPERS='{listed}'   (each keeper's tunnel URL; scripts/run-dealer.sh publishes them)")
+print("  LEND_POOLS, LEND_VAULTS: as compiled into the program (worker/README.md)")
+EOF

@@ -80,6 +80,7 @@ fn run(args: &[String]) -> Result<()> {
                 lend_chain::set_test_price(&p.chain, want.vault, want.price, want.confidence)?;
             println!("test price set: {sig}");
         }
+        [cmd, rest @ ..] if cmd == "deploy" => keeler::deploy::cli(rest)?,
         [cmd, cfg] if cmd == "refund" => {
             let done = trader::refund(&TraderConfig::load(cfg)?.common)?;
             if done.found == 0 {

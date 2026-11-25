@@ -401,6 +401,11 @@ pub fn set_upgrade_authority(
         Some(a) => bail!("{program}'s upgrade authority is {a}, not this key"),
         None => bail!("{program} is immutable"),
     }
+    hand_over(rpc, current, program, new)
+}
+
+/// Sends the loader's `SetAuthority` and reads the authority back.
+fn hand_over(rpc: &SolanaRpc, current: &Keypair, program: &Address, new: &Address) -> Result<()> {
     let ix = loader_ix(
         4,
         &[],
@@ -416,6 +421,304 @@ pub fn set_upgrade_authority(
         got == Some(*new),
         "upgrade authority reads back as {got:?}, not {new}"
     );
+    Ok(())
+}
+
+/// Mainnet-beta's genesis hash.
+pub const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+/// Squads v4, checked against its published source (github.com/Squads-Protocol/v4,
+/// branch main, read 2026-11-25): `declare_id!` in
+/// programs/squads_multisig_program/src/lib.rs; the `Multisig` account in
+/// src/state/multisig.rs (Anchor: 8-byte discriminator, then create_key,
+/// config_authority, threshold u16, time_lock u32, transaction_index u64,
+/// stale_transaction_index u64, rent_collector Option<Pubkey>, bump u8,
+/// members Vec<{key, permissions mask u8}>; Vote = 1 << 1); the seeds in
+/// src/state/seeds.rs and instructions/vault_transaction_create.rs: multisig
+/// ["multisig", "multisig", create_key], vault ["multisig", multisig,
+/// "vault", vault_index u8]. The program is deployed at the same address on
+/// mainnet and devnet.
+pub const SQUADS_V4: &str = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf";
+const SQUADS_VOTE: u8 = 1 << 1;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Multisig {
+    /// The all-zero address for an autonomous multisig; otherwise one key
+    /// that can change members and threshold on its own.
+    pub config_authority: Address,
+    pub threshold: u16,
+    pub time_lock: u32,
+    /// (key, permission mask)
+    pub members: Vec<(Address, u8)>,
+}
+
+/// A Squads v4 `Multisig` account's data.
+pub fn parse_multisig(data: &[u8]) -> Result<Multisig> {
+    use sha2::{Digest, Sha256};
+    let disc = Sha256::digest(b"account:Multisig");
+    ensure!(
+        data.len() >= 8 && data[..8] == disc[..8],
+        "not a Squads v4 multisig account"
+    );
+    let at = |i: usize, n: usize| -> Result<&[u8]> {
+        data.get(i..i + n)
+            .ok_or_else(|| anyhow!("Squads multisig account is truncated"))
+    };
+    let key = |i| -> Result<Address> { Ok(Address::new_from_array(at(i, 32)?.try_into()?)) };
+    let config_authority = key(40)?;
+    let threshold = u16::from_le_bytes(at(72, 2)?.try_into()?);
+    let time_lock = u32::from_le_bytes(at(74, 4)?.try_into()?);
+    // 78: transaction_index, 86: stale_transaction_index, 94: rent_collector.
+    let mut i = match at(94, 1)?[0] {
+        0 => 95,
+        1 => 127,
+        t => bail!("Squads multisig: bad rent_collector tag {t}"),
+    } + 1; // bump
+    let n = u32::from_le_bytes(at(i, 4)?.try_into()?) as usize;
+    i += 4;
+    let mut members = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        members.push((key(i)?, at(i + 32, 1)?[0]));
+        i += 33;
+    }
+    Ok(Multisig {
+        config_authority,
+        threshold,
+        time_lock,
+        members,
+    })
+}
+
+/// Squads v4 vault `index` of `multisig`.
+pub fn squads_vault(multisig: &Address, index: u8) -> Address {
+    Address::find_program_address(
+        &[b"multisig", multisig.as_ref(), b"vault", &[index]],
+        &address(SQUADS_V4),
+    )
+    .0
+}
+
+/// Refuses unless `vault` is vault `index` of `multisig`, a Squads v4
+/// multisig read from chain with threshold at least 2, no config authority
+/// and enough voters to reach the threshold.
+pub fn check_squads_vault(
+    rpc: &SolanaRpc,
+    vault: &Address,
+    multisig: &Address,
+    index: u8,
+) -> Result<Multisig> {
+    let derived = squads_vault(multisig, index);
+    ensure!(
+        derived == *vault,
+        "{vault} is not vault {index} of Squads multisig {multisig} (that is {derived}); refusing"
+    );
+    let a = rpc
+        .get_account(*multisig)
+        .map_err(err)?
+        .ok_or_else(|| anyhow!("Squads multisig {multisig} does not exist; refusing"))?;
+    ensure!(
+        a.owner == address(SQUADS_V4),
+        "{multisig} is owned by {}, not Squads v4 {SQUADS_V4}; refusing",
+        a.owner
+    );
+    let m = parse_multisig(&a.data)?;
+    squads_policy(&m).map_err(|e| anyhow!("Squads multisig {multisig} {e}; refusing"))?;
+    Ok(m)
+}
+
+fn squads_policy(m: &Multisig) -> Result<()> {
+    ensure!(
+        m.threshold >= 2,
+        "has threshold {}; at least 2 required",
+        m.threshold
+    );
+    ensure!(
+        m.config_authority == Address::new_from_array([0; 32]),
+        "has config authority {}, which can change its members and threshold alone; \
+         use an autonomous multisig",
+        m.config_authority
+    );
+    let voters = m.members.iter().filter(|(_, p)| p & SQUADS_VOTE != 0).count();
+    ensure!(
+        voters >= m.threshold as usize,
+        "has {voters} voters for threshold {}",
+        m.threshold
+    );
+    Ok(())
+}
+
+/// The program bytes deployed at `program` (program data past its header).
+pub fn deployed_bytes(rpc: &SolanaRpc, program: &Address) -> Result<Vec<u8>> {
+    upgrade_authority(rpc, program)?;
+    let data = rpc
+        .get_account(program_data_address(program))
+        .map_err(err)?
+        .ok_or_else(|| anyhow!("{program} has no program data"))?
+        .data;
+    Ok(data[PROGRAM_DATA_HEADER..].to_vec())
+}
+
+/// The 33-byte viewing public key (hex) of the Solana key in `key`.
+pub fn viewing_pubkey_hex(key: &Keypair) -> Result<String> {
+    Ok(shielded(key)?
+        .viewing_pubkey()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// A mainnet deploy, written by `scripts/deploy-mainnet.sh`.
+#[derive(Deserialize)]
+pub struct MainnetPlan {
+    pub name: String,
+    pub network: Network,
+    pub genesis_hash: String,
+    pub deploy_key: KeySource,
+    pub program_key: KeySource,
+    pub buffer_key: KeySource,
+    pub program_so: PathBuf,
+    /// The deploy key's address, so a cost estimate needs no key.
+    pub payer: String,
+    pub program_id: String,
+    pub multisig: Option<String>,
+    #[serde(default)]
+    pub vault_index: u8,
+}
+
+/// Any plan's network and current upgrade authority.
+#[derive(Deserialize)]
+pub struct AuthorityPlan {
+    pub network: Network,
+    pub genesis_hash: String,
+    pub deploy_key: KeySource,
+}
+
+impl MainnetPlan {
+    fn program_plan(&self) -> ProgramPlan {
+        ProgramPlan {
+            name: self.name.clone(),
+            network: self.network.clone(),
+            genesis_hash: self.genesis_hash.clone(),
+            deploy_key: self.deploy_key.clone(),
+            program_key: self.program_key.clone(),
+            buffer_key: self.buffer_key.clone(),
+            program_so: self.program_so.clone(),
+        }
+    }
+
+    /// Every check that needs no secret but the RPC key, then the cost.
+    fn check(&self) -> Result<(SolanaRpc, Estimate)> {
+        if self.genesis_hash == MAINNET_GENESIS {
+            for k in [&self.deploy_key, &self.program_key, &self.buffer_key] {
+                ensure!(
+                    matches!(k, KeySource::Keychain(_)),
+                    "mainnet keys come from the Keychain, not a file; refusing"
+                );
+            }
+        }
+        let rpc = self.program_plan().rpc()?;
+        if let Some(m) = &self.multisig {
+            let m = address_arg(m)?;
+            let vault = squads_vault(&m, self.vault_index);
+            let ms = check_squads_vault(&rpc, &vault, &m, self.vault_index)?;
+            log!(
+                "squads: vault {vault} of multisig {m}: threshold {} of {} members, time lock {} s",
+                ms.threshold,
+                ms.members.len(),
+                ms.time_lock
+            );
+        }
+        let payer = address_arg(&self.payer)?;
+        let e = estimate(&rpc, &payer, self.program_plan().so()?.len())?;
+        log_estimate(&self.name, &payer, &e);
+        Ok((rpc, e))
+    }
+}
+
+fn address_arg(s: &str) -> Result<Address> {
+    Address::from_str(s).map_err(|_| anyhow!("{s:?} is not a base58 address"))
+}
+
+fn load<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    serde_json::from_str(&text).map_err(|e| anyhow!("plan {path}: {e}"))
+}
+
+pub const DEPLOY_USAGE: &str = "usage: keeler deploy viewing-key <keychain item>
+       keeler deploy check <mainnet plan>
+       keeler deploy program <mainnet plan> <write deployed bytes to>
+       keeler deploy hand-over <plan> <program> <squads multisig> <vault index>";
+
+/// `keeler deploy ...`, for `scripts/deploy-mainnet.sh`,
+/// `scripts/deploy-lend-devnet.sh` and `scripts/set-upgrade-authority.sh`.
+/// Prints results on stdout, never a secret.
+pub fn cli(args: &[String]) -> Result<()> {
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["viewing-key", item] => {
+            println!(
+                "{}",
+                viewing_pubkey_hex(&KeySource::Keychain(item.to_string()).keypair()?)?
+            );
+        }
+        ["check", path] => {
+            let (_, e) = load::<MainnetPlan>(path)?.check()?;
+            println!("{}", serde_json::to_string_pretty(&e)?);
+        }
+        ["program", path, out] => {
+            let plan: MainnetPlan = load(path)?;
+            let (rpc, _) = plan.check()?;
+            ensure!(
+                plan.multisig.is_some(),
+                "a deploy needs the Squads multisig that takes the upgrade authority"
+            );
+            let deployer = plan.deploy_key.keypair()?.pubkey();
+            ensure!(
+                deployer.to_string() == plan.payer,
+                "the deploy key is {deployer}, not the plan's payer {}",
+                plan.payer
+            );
+            let program = plan.program_key.keypair()?.pubkey();
+            ensure!(
+                program.to_string() == plan.program_id,
+                "the program key is {program}, not the plan's program {}",
+                plan.program_id
+            );
+            // deploy_one checks the balance before sending anything.
+            let summary = deploy_one(&plan.program_plan())?;
+            std::fs::write(out, deployed_bytes(&rpc, &program)?)
+                .with_context(|| format!("write {out}"))?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        ["hand-over", path, program, multisig, index] => {
+            let plan: AuthorityPlan = load(path)?;
+            let rpc = checked_rpc(&plan.network, &plan.genesis_hash)?;
+            let (program, multisig) = (address_arg(program)?, address_arg(multisig)?);
+            let index: u8 = index.parse().context("vault index")?;
+            let vault = squads_vault(&multisig, index);
+            let m = check_squads_vault(&rpc, &vault, &multisig, index)?;
+            let current = plan.deploy_key.keypair()?;
+            match upgrade_authority(&rpc, &program)? {
+                Some(a) if a == vault => log!("{program}'s upgrade authority is already {vault}"),
+                Some(a) if a == current.pubkey() => hand_over(&rpc, &current, &program, &vault)?,
+                Some(a) => bail!("{program}'s upgrade authority is {a}, not this key"),
+                None => bail!("{program} is immutable"),
+            }
+            println!(
+                "{}",
+                json!({
+                    "program_id": program.to_string(),
+                    "upgrade_authority": vault.to_string(),
+                    "multisig": multisig.to_string(),
+                    "vault_index": index,
+                    "threshold": m.threshold,
+                    "members": m.members.len(),
+                    "time_lock": m.time_lock,
+                })
+            );
+        }
+        _ => bail!("{DEPLOY_USAGE}"),
+    }
     Ok(())
 }
 
@@ -844,5 +1147,63 @@ mod tests {
         assert_eq!(plan.name, "lend");
         assert_eq!(sol(12_345_678_901), "12.345678901 SOL");
         assert_eq!(sol(5_000), "0.000005000 SOL");
+    }
+
+    /// A Squads v4 multisig account laid out as `Multisig::size` describes.
+    fn multisig_bytes(config: [u8; 32], threshold: u16, rent: bool, members: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut d = Sha256::digest(b"account:Multisig")[..8].to_vec();
+        d.extend([7; 32]); // create_key
+        d.extend(config);
+        d.extend(threshold.to_le_bytes());
+        d.extend(30u32.to_le_bytes());
+        d.extend([0; 16]);
+        if rent {
+            d.push(1);
+            d.extend([9; 32]);
+        } else {
+            d.push(0);
+        }
+        d.push(255); // bump
+        d.extend((members.len() as u32).to_le_bytes());
+        for (i, mask) in members.iter().enumerate() {
+            d.extend([i as u8 + 1; 32]);
+            d.push(*mask);
+        }
+        d
+    }
+
+    #[test]
+    fn squads_multisig_parses_and_the_policy_holds() {
+        let m = parse_multisig(&multisig_bytes([0; 32], 2, true, &[7, 2, 1])).unwrap();
+        assert_eq!(m.threshold, 2);
+        assert_eq!(m.time_lock, 30);
+        assert_eq!(m.members.len(), 3);
+        assert_eq!(m.members[2], (Address::new_from_array([3; 32]), 1));
+        squads_policy(&m).unwrap();
+        let none = parse_multisig(&multisig_bytes([0; 32], 2, false, &[7, 7])).unwrap();
+        assert_eq!(none.members[1].0, Address::new_from_array([2; 32]));
+        squads_policy(&none).unwrap();
+
+        let refused = |b: Vec<u8>| squads_policy(&parse_multisig(&b).unwrap()).unwrap_err().to_string();
+        assert!(refused(multisig_bytes([0; 32], 1, false, &[7, 7])).contains("threshold 1"));
+        assert!(refused(multisig_bytes([5; 32], 2, false, &[7, 7])).contains("config authority"));
+        // Only one member may vote.
+        assert!(refused(multisig_bytes([0; 32], 2, false, &[7, 5])).contains("1 voters"));
+
+        let mut wrong = multisig_bytes([0; 32], 2, false, &[7, 7]);
+        wrong[0] ^= 1;
+        assert!(parse_multisig(&wrong).is_err());
+        let full = multisig_bytes([0; 32], 2, false, &[7, 7]);
+        assert!(parse_multisig(&full[..full.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn the_fixture_pool_key_gives_the_compiled_fixture_viewing_key() {
+        let kp = Keypair::new_from_array(keeler_lend_sdk::FIXTURE_POOL_SEED);
+        assert_eq!(
+            viewing_pubkey_hex(&kp).unwrap(),
+            "04eff66782e8d5e74f22a134d513919285e4b1b1c1fcee15a7d31e3b4f926cf011"
+        );
     }
 }
