@@ -91,6 +91,15 @@ describe("the build's assets", () => {
     expect(() => parseConfig(served(), "mainnet", JSON.stringify([SOL]))).toThrow(/settings for USDC differ/);
     expect(() => parseConfig(served({ assets: [SOL] }), "mainnet", pins)).toThrow(/lending assets differ/);
   });
+  it("refuse a malformed vault value as differing, and without pins a lending mint the service does not list", () => {
+    for (const cfBps of ["x", 8000.5, null, {}]) {
+      expect(() => parseConfig(served({ lend: { ...lend, vaults: [{ ...vault, cfBps }] } }), "mainnet", pins)).toThrow(/vault parameters differ/);
+    }
+    const devnet = (assets: unknown[]) => parseConfig(served({ network: "devnet", assets }), "devnet", undefined);
+    expect(() => devnet([SOL])).toThrow(/lending assets differ/);
+    expect(() => devnet([USD])).toThrow(/lending assets differ/);
+    expect(devnet([SOL, USD]).assets).toEqual([SOL, USD]);
+  });
 });
 
 describe("a wallet prompt", () => {

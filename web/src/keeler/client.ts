@@ -118,8 +118,13 @@ export function pinnedAssets(raw: unknown, network: string): Asset[] | undefined
   return list.map(({ mint, symbol, decimals }) => ({ mint, symbol, decimals }));
 }
 
-const sameVault = (served: LendServerConfig["vaults"][number], v: typeof TSOL_TUSD_VAULT) =>
-  BigInt(served.cfBps) === v.cfBps && BigInt(served.ltBps) === v.ltBps && BigInt(served.lmlBps) === v.lmlBps && BigInt(served.penaltyBps) === v.penaltyBps;
+const sameVault = (served: LendServerConfig["vaults"][number], v: typeof TSOL_TUSD_VAULT) => {
+  try {
+    return BigInt(served.cfBps) === v.cfBps && BigInt(served.ltBps) === v.ltBps && BigInt(served.lmlBps) === v.lmlBps && BigInt(served.penaltyBps) === v.penaltyBps;
+  } catch {
+    return false;
+  }
+};
 
 /** Vault risk parameters compiled into the site, by vault id; the program carries the same. */
 const COMPILED_VAULTS: Record<number, typeof TSOL_TUSD_VAULT> = { 1: TSOL_TUSD_VAULT };
@@ -149,7 +154,7 @@ export function parseConfig(raw: Record<string, unknown>, built = BUILD_NETWORK,
     const vaultsOk = c.lend.vaults.every((v) => COMPILED_VAULTS[v.id] !== undefined && sameVault(v, COMPILED_VAULTS[v.id]!));
     if (!vaultsOk) throw differs("lending vault parameters");
     const mints = [...c.lend.pools.map((p) => p.mint), ...c.lend.vaults.flatMap((v) => [v.collateralMint, v.debtMint])];
-    if (pinned && !mints.every((m) => assets.some((a) => a.mint === m))) throw differs("lending assets");
+    if (!mints.every((m) => assets.some((a) => a.mint === m))) throw differs("lending assets");
   }
   return {
     ...c,
