@@ -41,7 +41,7 @@ import {
 import { BUILD_NETWORK, testWalletAllowed, walletChain } from "./network";
 import { fairBuyAmount, ttlOk, vsFairBps, withinBand, type Price } from "./price";
 import { verifyQuote } from "./quote-sig";
-import { nextRecord, refreshAll, refundRefusal, type ChainReads } from "./status";
+import { nextRecord, refreshAll, refundRefusal, rose, type ChainReads } from "./status";
 import { orderStore, type OrderRecord } from "./storage";
 import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
 import { createLend, type LendServerConfig } from "./lend";
@@ -215,7 +215,7 @@ async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
       .json()
       .then((b: { error?: unknown }) => (typeof b?.error === "string" ? b.error.slice(0, 200) : ""))
       .catch(() => "");
-    if (res.status === 429) throw err("rate-limited", `${said || "Too many requests."} Wait a minute and try again.`);
+    if (res.status === 429) throw err("rate-limited", /try again/i.test(said) ? said : `${said || "Too many requests."} Wait a minute and try again.`);
     throw err("network", `${path} answered HTTP ${res.status}${said ? `: ${said}` : ""}. Try again shortly.`);
   }
   return (await res.json()) as T;
@@ -884,12 +884,19 @@ export function createKeeler(): Keeler {
     async faucet() {
       const c = await config();
       if (!c.faucet) throw err("network", "This network has no faucet.");
-      const res = await getJson<{ ok?: boolean; error?: string }>("/api/faucet", {
+      const rpc = (await client()).solanaRpc;
+      const sol = async () => (await rpc.getBalance(owner()).send()).value;
+      const before = await as("network", "Reading your SOL balance", sol);
+      await getJson("/api/faucet", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ wallet: owner() }),
+      }).catch((e: unknown) => {
+        if (e instanceof KeelerError && /for today/.test(e.message)) throw err("rate-limited", "This wallet has had its test tokens for today. Try again tomorrow.");
+        throw e;
       });
-      if (!res.ok) throw err("rate-limited", `The faucet refused: ${res.error ?? "unknown reason"}. Try again tomorrow.`);
+      const arrived = await rose(() => sol().catch(() => before), before);
+      if (!arrived) throw err("network", "The faucet took the request, but the tokens have not arrived yet. Reload the page in a minute to see them.");
     },
 
     chainNow,
