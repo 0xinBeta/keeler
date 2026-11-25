@@ -149,8 +149,8 @@ compiled `KEEPERS`. Configs as in `docs/lend-keeper.md`, with these values on ma
 - [ ] Worker: `NETWORK=mainnet`, `LEND_PROGRAM_ID`, `LEND_KEEPERS` (`[{"url","pubkey"}]`, primary
       first), `LEND_POOLS` and `LEND_VAULTS` exactly as compiled, `PYTH_ACCOUNTS` for the page's
       prices, the rate limits (`worker/README.md`). Only after the upgrade authority is the vault.
-- [ ] Site: `VITE_NETWORK=mainnet`, `VITE_LEND_PROGRAM_ID`, `VITE_LEND_KEEPERS` (a JSON list, the
-      same keepers as the Worker's), `VITE_LEND_POOL_VIEWING`, `VITE_DEALERS`; the ceremony's
+- [ ] Site: `VITE_NETWORK=mainnet`, `VITE_LEND_PROGRAM_ID`, `VITE_LEND_KEEPERS` (a JSON list: the
+      program's whole keeper set; the Worker lists the ones it runs), `VITE_LEND_POOL_VIEWING`, `VITE_DEALERS`; the ceremony's
       browser keys. Lending stays hidden unless `/api/config` matches the compiled keepers.
 - [ ] The custom domain **[owner]**.
 - [ ] Seed the pool with a first supply, then a small deposit, borrow, repay and close from a

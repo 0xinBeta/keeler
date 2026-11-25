@@ -12,16 +12,18 @@ const POOL_VIEWING = "02" + "ab".repeat(32);
 const built = { programId: PROGRAM, keepers: JSON.stringify([K1, K2]), poolViewing: POOL_VIEWING };
 
 describe("the compiled lend settings", () => {
-  it("are used when the service runs the same program and lists the same keepers, in any order", () => {
+  it("are used when the service runs the same program and lists only compiled keepers, in any order", () => {
     const got = lendCompiled({ programId: PROGRAM, keepers: [K2, K1] }, built);
     expect(got?.keepers).toEqual([K1, K2]);
+    // A standby in the program's set that the service does not run: the page still accepts all compiled keepers.
+    expect(lendCompiled({ programId: PROGRAM, keepers: [K2] }, built)?.keepers).toEqual([K1, K2]);
     expect(got?.poolViewing).toEqual(Uint8Array.of(2, ...new Array(32).fill(0xab)));
   });
 
   it("hide lending when the keepers, the program or the pool key differ or are missing", () => {
     const served = { programId: PROGRAM, keepers: [K1, K2] };
     for (const [s, b] of [
-      [{ ...served, keepers: [K1] }, built],
+      [{ ...served, keepers: [] }, built],
       [{ ...served, keepers: [K1, K2, "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"] }, built],
       [{ programId: PROGRAM }, built],
       [{ ...served, keepers: [K1, "nope"] }, { ...built, keepers: JSON.stringify([K1, "nope"]) }],

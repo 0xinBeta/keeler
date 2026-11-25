@@ -20,7 +20,7 @@ the page's signer. Regenerate it with `UPDATE_FIXTURES=1 pnpm test tests/lend-au
 | Variable | What |
 | --- | --- |
 | `VITE_LEND_PROGRAM_ID` | The lend program. Lending is shown only when `/api/config` has `lend` and its `programId` equals this; otherwise Earn and Borrow stay hidden |
-| `VITE_LEND_KEEPERS` | The program's keeper set (`KEEPERS`). Each keeper signs its tickets and pays for the transactions it builds; the page checks both against the keeper the reply names, which must be in this set. Lending is hidden without it |
+| `VITE_LEND_KEEPERS` | The program's keeper set (`KEEPERS`). Each keeper signs its tickets and pays for the transactions it builds; the page checks both against the keeper the reply names, which must be in this set. Lending is hidden without it, or when the service (`/api/config.lend.keepers`, the keepers the Worker runs) lists a keeper that is not in it |
 | `VITE_LEND_POOL_VIEWING` | The pool viewing key (`POOL_VIEWING`), 66 hex: the key the page makes intents to |
 
 Records in `localStorage` are keyed `keeler:lend:v1:<network>:<program>:<wallet>:<kind>:<id>`.

@@ -11,7 +11,7 @@ const stack = existsSync(LEND_STACK) ? (JSON.parse(readFileSync(LEND_STACK, "utf
 // Without a stack the page builds without lend; the spec skips before it opens a page. Without poolViewing in the
 // stack (an older lend-web-stack.sh) the page hides lending too.
 const lendEnv = stack
-  ? `VITE_LEND_PROGRAM_ID=${stack.programId} VITE_LEND_KEEPERS='${JSON.stringify([stack.keeper])}' VITE_LEND_POOL_VIEWING=${stack.poolViewing ?? ""}`
+  ? `VITE_LEND_PROGRAM_ID=${stack.programId} VITE_LEND_KEEPERS='${JSON.stringify(stack.keepers ?? [stack.keeper])}' VITE_LEND_POOL_VIEWING=${stack.poolViewing ?? ""}`
   : "";
 
 export default defineConfig({

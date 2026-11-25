@@ -59,7 +59,10 @@ type ServerConfig = Config & { rpcPath: string; sprPath: string; lend?: LendServ
  */
 const LEND_BUILD = { programId: import.meta.env.VITE_LEND_PROGRAM_ID, keepers: import.meta.env.VITE_LEND_KEEPERS, poolViewing: import.meta.env.VITE_LEND_POOL_VIEWING } as Record<string, unknown>;
 
-/** The compiled lend settings, only when the service runs the same program with the same keepers; else undefined. */
+/**
+ * The compiled lend settings, only when the service runs the same program and every keeper it lists is one compiled in
+ * (the build carries the program's whole keeper set; the service lists the ones it runs); else undefined.
+ */
 export function lendCompiled(served: { programId: string; keepers?: unknown }, built: Record<string, unknown> = LEND_BUILD): { programId: Address; keepers: Address[]; poolViewing: Uint8Array } | undefined {
   let keepers: unknown;
   try {
@@ -69,8 +72,8 @@ export function lendCompiled(served: { programId: string; keepers?: unknown }, b
   }
   const isList = (v: unknown): v is string[] => Array.isArray(v) && v.length > 0 && v.every((k) => typeof k === "string" && isAddress(k));
   if (typeof built.programId !== "string" || built.programId !== served.programId || !isList(keepers) || !isList(served.keepers)) return undefined;
-  const same = keepers.length === served.keepers.length && [...keepers].sort().every((k, i) => k === [...(served.keepers as string[])].sort()[i]);
-  if (!same || typeof built.poolViewing !== "string" || !/^[0-9a-f]{66}$/.test(built.poolViewing)) return undefined;
+  const known = served.keepers.every((k) => (keepers as string[]).includes(k));
+  if (!known || typeof built.poolViewing !== "string" || !/^[0-9a-f]{66}$/.test(built.poolViewing)) return undefined;
   return { programId: address(built.programId), keepers: keepers.map((k) => address(k)), poolViewing: fromHex(built.poolViewing) };
 }
 type QuoteReply = { dealer: string; quote: { buy_amount: string; expiry: number; signature?: string } | null }[];
@@ -431,7 +434,7 @@ export function createKeeler(): Keeler {
     if (!c.lend) return undefined;
     const built = lendCompiled(c.lend);
     if (!built) {
-      console.warn("Lending is hidden: the service's lend program or keepers differ from the ones this site was built with, or the build has none.");
+      console.warn("Lending is hidden: the service's lend program differs from the one this site was built with, it lists a keeper the build does not know, or the build has none.");
       return undefined;
     }
     const { programId, keepers, poolViewing } = built;
