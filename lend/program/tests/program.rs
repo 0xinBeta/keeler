@@ -7,7 +7,7 @@ use keeler_lend::{
     instructions::{
         cancel_intent::CancelIntentArgs, init_reserve::InitReserveArgs, intent::IntentArgs,
     },
-    tag, ADMIN, KEEPER, POOL_SEED, USER_SEED,
+    tag, ADMIN, KEEPERS, POOL_VIEWING, POOL_SEED, USER_SEED,
 };
 use mollusk::{expect_err_exact, mollusk_with_program};
 use mollusk_svm::{result::ProgramResult, Mollusk};
@@ -94,7 +94,7 @@ fn init_reserve_args(now: u64) -> Vec<u8> {
     wincode::serialize(&InitReserveArgs {
         proof: proof(),
         mint: MINT,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: bump(POOL_SEED, &MINT),
         now,
     })
@@ -140,7 +140,7 @@ fn dispatch_refuses_empty_and_unknown_tags() {
 #[test]
 fn init_reserve_needs_the_keeper_and_the_admin() {
     let (mollusk, _) = setup();
-    let (keeper, admin, other) = (pk(&KEEPER), pk(&ADMIN), Pubkey::new_unique());
+    let (keeper, admin, other) = (pk(&KEEPERS[0]), pk(&ADMIN), Pubkey::new_unique());
     let now = NOW as u64;
     let (ix, accounts) = init_reserve(other, admin, true, now);
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::NotKeeper));
@@ -160,7 +160,7 @@ fn init_reserve_needs_the_keeper_and_the_admin() {
 #[test]
 fn init_reserve_refuses_a_stale_or_future_now_and_a_bad_proof() {
     let (mollusk, _) = setup();
-    let (keeper, admin) = (pk(&KEEPER), pk(&ADMIN));
+    let (keeper, admin) = (pk(&KEEPERS[0]), pk(&ADMIN));
     for now in [NOW - 121, NOW + 1] {
         let (ix, accounts) = init_reserve(keeper, admin, true, now as u64);
         expect_err_exact(&mollusk, &ix, &accounts, code(LendError::StaleNow));
@@ -172,7 +172,7 @@ fn init_reserve_refuses_a_stale_or_future_now_and_a_bad_proof() {
 #[test]
 fn init_reserve_refuses_truncated_data() {
     let (mollusk, _) = setup();
-    let (mut ix, accounts) = init_reserve(pk(&KEEPER), pk(&ADMIN), true, NOW as u64);
+    let (mut ix, accounts) = init_reserve(pk(&KEEPERS[0]), pk(&ADMIN), true, NOW as u64);
     ix.data = vec![tag::INIT_RESERVE, 1, 2, 3];
     expect_err_exact(
         &mollusk,
@@ -206,7 +206,7 @@ fn non_canonical(seed: &[u8], key: &[u8; 32]) -> u8 {
 #[test]
 fn init_reserve_refuses_any_bump_but_the_canonical_one() {
     let (mollusk, _) = setup();
-    let (mut ix, accounts) = init_reserve(pk(&KEEPER), pk(&ADMIN), true, NOW as u64);
+    let (mut ix, accounts) = init_reserve(pk(&KEEPERS[0]), pk(&ADMIN), true, NOW as u64);
     let id = pk(&keeler_lend::ID);
     let no_pda = (0..=u8::MAX)
         .rev()
@@ -217,7 +217,7 @@ fn init_reserve_refuses_any_bump_but_the_canonical_one() {
         let args = InitReserveArgs {
             proof: proof(),
             mint: MINT,
-            pool_viewing: [2; 33],
+            pool_viewing: POOL_VIEWING,
             pool_bump: bad,
             now: NOW as u64,
         };
@@ -229,12 +229,12 @@ fn init_reserve_refuses_any_bump_but_the_canonical_one() {
 #[test]
 fn init_reserve_refuses_a_mint_other_than_the_pools() {
     let (mollusk, _) = setup();
-    let (mut ix, accounts) = init_reserve(pk(&KEEPER), pk(&ADMIN), true, NOW as u64);
+    let (mut ix, accounts) = init_reserve(pk(&KEEPERS[0]), pk(&ADMIN), true, NOW as u64);
     let foreign = [9; 32];
     let args = InitReserveArgs {
         proof: proof(),
         mint: foreign,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: bump(POOL_SEED, &foreign),
         now: NOW as u64,
     };

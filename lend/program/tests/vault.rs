@@ -15,7 +15,7 @@ use keeler_lend::{
     },
     tag,
     vaults::{VaultError, PYTH_RECEIVER, TSOL_TUSD},
-    KEEPER, POOL_SEED, USER_SEED,
+    KEEPERS, POOL_VIEWING, POOL_SEED, USER_SEED,
 };
 use mollusk::{expect_err_exact, mollusk_with_program};
 use mollusk_svm::{program::keyed_account_for_system_program, result::ProgramResult, Mollusk};
@@ -148,7 +148,7 @@ fn deposit(
 #[test]
 fn deposit_refusals_before_the_proof() {
     let mollusk = setup();
-    let keeper = pk(&KEEPER);
+    let keeper = pk(&KEEPERS[0]);
     let other = Pubkey::new_unique();
     let now = NOW as u64;
     for ix_tag in [tag::DEPOSIT, tag::DEPOSIT_ADD] {
@@ -195,7 +195,7 @@ fn repay(keeper: Pubkey, now: u64, expiry: u64, inputs: usize) -> Instruction {
     let args = RepayArgs {
         proof: proof(),
         vault: 1,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: pool_bump(),
         owner,
         owner_viewing: [2; 33],
@@ -213,7 +213,7 @@ fn repay(keeper: Pubkey, now: u64, expiry: u64, inputs: usize) -> Instruction {
 #[test]
 fn repay_refusals_before_the_proof() {
     let mollusk = setup();
-    let keeper = pk(&KEEPER);
+    let keeper = pk(&KEEPERS[0]);
     let other = Pubkey::new_unique();
     let now = NOW as u64;
     let accounts = [(keeper, account()), (other, account())];
@@ -245,7 +245,7 @@ fn non_canonical(seed: &[u8], key: &[u8; 32]) -> u8 {
 #[test]
 fn vault_instructions_refuse_a_non_canonical_bump() {
     let mollusk = setup();
-    let keeper = pk(&KEEPER);
+    let keeper = pk(&KEEPERS[0]);
     let now = NOW as u64;
     let owner = [7; 32];
     let (bad_pool, bad_user) = (
@@ -278,7 +278,7 @@ fn vault_instructions_refuse_a_non_canonical_bump() {
     let repay = |pool_bump, user_bump| RepayArgs {
         proof: proof(),
         vault: 1,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump,
         owner,
         owner_viewing: [2; 33],
@@ -303,7 +303,7 @@ fn vault_instructions_refuse_a_non_canonical_bump() {
     let args = LiquidateArgs {
         proof: proof(),
         vault: 1,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: bad_pool,
         owner,
         owner_viewing: [2; 33],
@@ -358,7 +358,7 @@ fn draw(
     let args = DrawArgs {
         proof: proof(),
         vault: 1,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: pool_bump(),
         owner_viewing: [2; 33],
         user_bump: bump(USER_SEED, &owner.to_bytes()),
@@ -381,7 +381,7 @@ fn liquidate(keeper: Pubkey, price: Pubkey, now: u64, bound: u64) -> Instruction
     let args = LiquidateArgs {
         proof: proof(),
         vault: 1,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: pool_bump(),
         owner,
         owner_viewing: [2; 33],
@@ -402,7 +402,7 @@ fn liquidate(keeper: Pubkey, price: Pubkey, now: u64, bound: u64) -> Instruction
 /// Draw at `bound` with `price` as the vault's Pyth account.
 fn draw_with(mollusk: &Mollusk, price: Account, bound: u64) -> ProgramResult {
     let (keeper, owner, feed) = (
-        pk(&KEEPER),
+        pk(&KEEPERS[0]),
         Pubkey::new_unique(),
         pk(&TSOL_TUSD.price_account),
     );
@@ -421,7 +421,7 @@ fn fails(e: ProgramError) -> ProgramResult {
 fn draw_needs_the_keeper_and_the_owner() {
     let mollusk = setup();
     let (keeper, owner, feed) = (
-        pk(&KEEPER),
+        pk(&KEEPERS[0]),
         Pubkey::new_unique(),
         pk(&TSOL_TUSD.price_account),
     );
@@ -456,7 +456,7 @@ fn draw_bound_at_most_price_minus_confidence() {
 #[test]
 fn liquidate_bound_at_least_price_plus_confidence() {
     let mollusk = setup();
-    let (keeper, feed) = (pk(&KEEPER), pk(&TSOL_TUSD.price_account));
+    let (keeper, feed) = (pk(&KEEPERS[0]), pk(&TSOL_TUSD.price_account));
     let accounts = [(keeper, account()), (feed, good_pyth())];
     let other = Pubkey::new_unique();
     expect_err_exact(
@@ -548,7 +548,7 @@ fn pyth_account_refusals() {
         );
     }
     // Any other account, even with a good update in it.
-    let (keeper, owner, elsewhere) = (pk(&KEEPER), Pubkey::new_unique(), Pubkey::new_unique());
+    let (keeper, owner, elsewhere) = (pk(&KEEPERS[0]), Pubkey::new_unique(), Pubkey::new_unique());
     assert_eq!(
         run(
             &mollusk,
@@ -596,7 +596,7 @@ fn set_test_price(
 #[test]
 fn test_price_is_the_keepers_and_is_checked_like_pyth() {
     let mollusk = setup();
-    let keeper = pk(&KEEPER);
+    let keeper = pk(&KEEPERS[0]);
     let test = pk(&test_price_address(1).0);
     let system = keyed_account_for_system_program();
     let empty = Account::default();
@@ -659,7 +659,7 @@ fn test_price_is_the_keepers_and_is_checked_like_pyth() {
 #[test]
 fn test_price_account_is_created_when_the_address_already_holds_lamports() {
     let mollusk = setup();
-    let keeper = pk(&KEEPER);
+    let keeper = pk(&KEEPERS[0]);
     let test = pk(&test_price_address(1).0);
     let rent = mollusk.sysvars.rent.minimum_balance(24);
     // One lamport sent ahead (the keeper tops it up), and more than the rent.

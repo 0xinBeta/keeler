@@ -643,8 +643,8 @@ fn liquidate_back_to_the_threshold() {
     let bound = 140_000_000_000;
     let (p, plan) = liquidate(&user, r.clone(), pos.clone(), bound).unwrap();
     assert!(plan.repay > 0 && plan.repay < 120 * USD);
-    assert_eq!(plan.buffer, plan.repay / 100);
-    let formula = ((plan.repay + plan.buffer) as u128 * 1_000_000_000_000 / bound as u128) as u64;
+    // The payout formula is unchanged: x plus the 1% penalty, at the bound.
+    let formula = ((plan.repay + plan.repay / 100) as u128 * 1_000_000_000_000 / bound as u128) as u64;
     assert_eq!(plan.payout, formula.min(SOL));
     let payout = &p.outputs[LIQUIDATE_PAYOUT_SLOT];
     assert_eq!(
@@ -656,24 +656,39 @@ fn liquidate_back_to_the_threshold() {
         viewing_of(&p.outputs[LIQUIDATE_POSITION_SLOT]),
         *addr(&user).viewing_pubkey.as_bytes()
     );
+    // The liquidator pays exactly x; the reserve gets x and nothing more.
     assert_eq!(
         p.outputs[LIQUIDATE_RESERVE_SLOT].amount,
-        880 * USD + plan.repay + plan.buffer
+        880 * USD + plan.repay
     );
     let change = &p.outputs[LIQUIDATE_CHANGE_SLOT];
     assert_eq!(
         (change.amount, change.owner_address),
-        (
-            1_000 * USD - plan.repay - plan.buffer,
-            Some(addr(&keeper()))
-        )
+        (1_000 * USD - plan.repay, Some(addr(&keeper())))
     );
-    // The buffer stays in the reserve without shares.
     let after: ReserveState = decode(&reserve_out(&p, LIQUIDATE_RESERVE_SLOT)).unwrap();
     let left: PositionState =
         decode(&pda_input(&user, &p.outputs[LIQUIDATE_POSITION_SLOT], 6)).unwrap();
     assert_eq!(after.debt_shares, left.debt_shares);
     assert_eq!(after.supply_shares, 1_000 * USD);
+    // A note of exactly x leaves the change slot empty.
+    let exact = vault::liquidate_with(
+        &keeper(),
+        &addr(&user),
+        r.clone(),
+        pos.clone(),
+        note(&keeper(), debt(), plan.repay, 6),
+        plan.repay,
+        TSOL_TUSD.price_account,
+        V,
+        NOW,
+        bound,
+        SALT,
+        TREE,
+    )
+    .unwrap();
+    assert_eq!(exact.outputs[LIQUIDATE_CHANGE_SLOT].amount, 0);
+    assert_eq!(exact.outputs[LIQUIDATE_PAYOUT_SLOT].amount, plan.payout);
     // Less is fine; more takes the position below the threshold.
     assert!(liquidate_with(&user, r.clone(), pos.clone(), plan.repay / 2, bound).is_ok());
     refused(

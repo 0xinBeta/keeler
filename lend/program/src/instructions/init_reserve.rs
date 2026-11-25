@@ -6,7 +6,7 @@ use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
-    check_now, cpi, mint_halves, parse, require_admin, require_keeper, require_pool_mint, verified,
+    check_now, cpi, mint_halves, parse, require_admin, require_keeper, require_pool_viewing, require_pool_mint, verified,
     Pda,
 };
 use crate::{verifier::init_reserve as v, POOL_SEED};
@@ -28,6 +28,7 @@ pub fn process(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     require_keeper(iter.next_signer_mut("keeper")?)?;
     require_admin(iter.next_signer("admin")?)?;
     let (args, transact, bytes) = parse::<InitReserveArgs>(data)?;
+    require_pool_viewing(&args.pool_viewing)?;
     check_now(args.now)?;
     require_pool_mint(&args.mint)?;
     let pool = Pda::new(POOL_SEED, &args.mint, args.pool_bump)?;

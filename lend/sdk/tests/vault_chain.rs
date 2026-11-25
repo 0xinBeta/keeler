@@ -41,7 +41,7 @@ use keeler_lend_sdk::{
     builders::{self, recover_output, Prepared},
     decode, note_data_hash, pool_pda, purpose, user_pda,
     vault::{self, test_price_account},
-    NoteKind, PositionState, ReserveState, ADMIN, KEEPER,
+    NoteKind, PositionState, ReserveState, ADMIN, KEEPERS,
 };
 use solana_address::Address;
 use solana_instruction::Instruction;
@@ -328,11 +328,11 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
     let lender_key = fixture::actor(2);
     let admin_key = fixture::actor(3);
     ensure!(
-        keeper_key.pubkey() == KEEPER && admin_key.pubkey() == ADMIN,
+        keeper_key.pubkey() == KEEPERS[0] && admin_key.pubkey() == ADMIN,
         "build with the default keeper and admin"
     );
     let env = Env {
-        keeper: ShieldedKeypair::from_keypair(&keeper_key)?,
+        keeper: keeler_lend_sdk::fixture_keeper_keypair(&keeper_key)?,
         keeper_key,
         localnet,
         rpc_url,

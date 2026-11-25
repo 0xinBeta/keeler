@@ -28,7 +28,7 @@ use keeler_lend::{instructions::supply::SupplyArgs, POOL_SEED, USER_SEED};
 use keeler_lend_sdk::{
     builders::{self, recover_output},
     decode, note_data_hash, pool_pda, purpose, user_pda, NoteKind, ReceiptState, ReserveState,
-    ADMIN, KEEPER,
+    ADMIN, KEEPERS,
 };
 use solana_address::Address;
 use solana_instruction::Instruction;
@@ -270,10 +270,10 @@ fn supply_accrue_and_redeem() -> Result<()> {
     let b_key = fixture::actor(2);
     let admin_key = fixture::actor(3);
     ensure!(
-        keeper_key.pubkey() == KEEPER && admin_key.pubkey() == ADMIN,
+        keeper_key.pubkey() == KEEPERS[0] && admin_key.pubkey() == ADMIN,
         "build with the default keeper and admin"
     );
-    let keeper = ShieldedKeypair::from_keypair(&keeper_key)?;
+    let keeper = keeler_lend_sdk::fixture_keeper_keypair(&keeper_key)?;
     let a = ShieldedKeypair::from_keypair(&a_key)?;
     let b = ShieldedKeypair::from_keypair(&b_key)?;
     let indexer = localnet.client.indexer();

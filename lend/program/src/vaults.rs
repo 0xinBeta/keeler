@@ -21,6 +21,13 @@ compile_error!(
     "the test-price feature lets the keeper set the oracle price: never in a mainnet build"
 );
 
+/// Compiled in only with `test-price` and kept by the linker (`set_test_price`
+/// reads it), so a tool can tell from a `.so` whether it can take the test
+/// price: `grep -c KEELER_LEND_TEST_PRICE_BUILD keeler_lend.so`.
+#[cfg(feature = "test-price")]
+#[used]
+pub static TEST_PRICE_MARKER: [u8; 28] = *b"KEELER_LEND_TEST_PRICE_BUILD";
+
 /// A vault: one collateral mint, one debt mint (whose reserve it borrows
 /// from) and the oracle that prices the collateral in the debt token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

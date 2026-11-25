@@ -6,7 +6,7 @@ mod mollusk;
 use keeler_lend::{
     error::LendError,
     instructions::{redeem::RedeemArgs, supply::SupplyArgs},
-    tag, KEEPER, POOL_SEED, USER_SEED,
+    tag, KEEPERS, POOL_VIEWING, POOL_SEED, USER_SEED,
 };
 use mollusk::{expect_err_exact, mollusk_with_program};
 use mollusk_svm::{result::ProgramResult, Mollusk};
@@ -103,7 +103,7 @@ fn supply_args(maker: &Pubkey, now: i64, expiry: i64) -> SupplyArgs {
     SupplyArgs {
         proof: proof(),
         mint: MINT,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: bump(POOL_SEED, &MINT),
         maker: maker.to_bytes(),
         owner_viewing: [2; 33],
@@ -131,7 +131,7 @@ fn redeem_args(owner: &Pubkey, now: i64) -> RedeemArgs {
     RedeemArgs {
         proof: proof(),
         mint: MINT,
-        pool_viewing: [2; 33],
+        pool_viewing: POOL_VIEWING,
         pool_bump: bump(POOL_SEED, &MINT),
         owner_viewing: [2; 33],
         user_bump: bump(USER_SEED, &owner.to_bytes()),
@@ -164,13 +164,13 @@ fn supply_needs_the_keeper() {
     let args = supply_args(&maker, NOW, NOW + 60);
     let (ix, accounts) = supply(Pubkey::new_unique(), true, &args, 2);
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::NotKeeper));
-    let (ix, accounts) = supply(pk(&KEEPER), false, &args, 2);
+    let (ix, accounts) = supply(pk(&KEEPERS[0]), false, &args, 2);
     assert!(matches!(
         run(&mollusk, &ix, &accounts),
         ProgramResult::Failure(_)
     ));
     // With the keeper it reaches the proof.
-    let (ix, accounts) = supply(pk(&KEEPER), true, &args, 2);
+    let (ix, accounts) = supply(pk(&KEEPERS[0]), true, &args, 2);
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidProof));
 }
 
@@ -179,20 +179,20 @@ fn supply_refuses_a_stale_now_and_an_expired_intent() {
     let mollusk = setup();
     let maker = Pubkey::new_unique();
     for now in [NOW - 121, NOW + 1] {
-        let (ix, accounts) = supply(pk(&KEEPER), true, &supply_args(&maker, now, NOW + 60), 2);
+        let (ix, accounts) = supply(pk(&KEEPERS[0]), true, &supply_args(&maker, now, NOW + 60), 2);
         expect_err_exact(&mollusk, &ix, &accounts, code(LendError::StaleNow));
     }
     for expiry in [NOW - 1, NOW - 120] {
-        let (ix, accounts) = supply(pk(&KEEPER), true, &supply_args(&maker, NOW, expiry), 2);
+        let (ix, accounts) = supply(pk(&KEEPERS[0]), true, &supply_args(&maker, NOW, expiry), 2);
         expect_err_exact(&mollusk, &ix, &accounts, code(LendError::IntentExpired));
     }
     // Expiring this second is still in time; `now` may trail the clock.
     for (now, expiry) in [(NOW, NOW), (NOW - 120, NOW), (NOW, i64::MAX)] {
-        let (ix, accounts) = supply(pk(&KEEPER), true, &supply_args(&maker, now, expiry), 2);
+        let (ix, accounts) = supply(pk(&KEEPERS[0]), true, &supply_args(&maker, now, expiry), 2);
         expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidProof));
     }
     let (ix, accounts) = supply(
-        pk(&KEEPER),
+        pk(&KEEPERS[0]),
         true,
         &SupplyArgs {
             expiry: u64::MAX,
@@ -207,7 +207,7 @@ fn supply_refuses_a_stale_now_and_an_expired_intent() {
 fn supply_refuses_a_bad_bump_and_a_transact_without_inputs() {
     let mollusk = setup();
     let maker = Pubkey::new_unique();
-    let (ix, accounts) = supply(pk(&KEEPER), true, &supply_args(&maker, NOW, NOW), 0);
+    let (ix, accounts) = supply(pk(&KEEPERS[0]), true, &supply_args(&maker, NOW, NOW), 0);
     expect_err_exact(
         &mollusk,
         &ix,
@@ -225,7 +225,7 @@ fn supply_refuses_a_bad_bump_and_a_transact_without_inputs() {
         user_bump: bad,
         ..supply_args(&maker, NOW, NOW)
     };
-    let (ix, accounts) = supply(pk(&KEEPER), true, &args, 2);
+    let (ix, accounts) = supply(pk(&KEEPERS[0]), true, &args, 2);
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidSeeds));
 }
 
@@ -240,7 +240,7 @@ fn redeem_needs_the_keeper_and_the_owner_signing() {
     let (ix, accounts) = redeem(owner, owner, (true, true), &args, 2);
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::NotKeeper));
     for signed in [(false, true), (true, false)] {
-        let (ix, accounts) = redeem(pk(&KEEPER), owner, signed, &args, 2);
+        let (ix, accounts) = redeem(pk(&KEEPERS[0]), owner, signed, &args, 2);
         let result = run(&mollusk, &ix, &accounts);
         assert!(
             matches!(result, ProgramResult::Failure(_))
@@ -248,7 +248,7 @@ fn redeem_needs_the_keeper_and_the_owner_signing() {
             "{signed:?}: {result:?}"
         );
     }
-    let (ix, accounts) = redeem(pk(&KEEPER), owner, (true, true), &args, 2);
+    let (ix, accounts) = redeem(pk(&KEEPERS[0]), owner, (true, true), &args, 2);
     expect_err_exact(&mollusk, &ix, &accounts, code(LendError::InvalidProof));
 }
 
@@ -258,7 +258,7 @@ fn redeem_refuses_a_stale_now_and_a_transact_without_inputs() {
     let owner = Pubkey::new_unique();
     for now in [NOW - 121, NOW + 1] {
         let (ix, accounts) = redeem(
-            pk(&KEEPER),
+            pk(&KEEPERS[0]),
             owner,
             (true, true),
             &redeem_args(&owner, now),
@@ -267,7 +267,7 @@ fn redeem_refuses_a_stale_now_and_a_transact_without_inputs() {
         expect_err_exact(&mollusk, &ix, &accounts, code(LendError::StaleNow));
     }
     let (ix, accounts) = redeem(
-        pk(&KEEPER),
+        pk(&KEEPERS[0]),
         owner,
         (true, true),
         &redeem_args(&owner, NOW),
@@ -280,7 +280,7 @@ fn redeem_refuses_a_stale_now_and_a_transact_without_inputs() {
         code(LendError::InvalidInstructionData),
     );
     let (mut ix, accounts) = redeem(
-        pk(&KEEPER),
+        pk(&KEEPERS[0]),
         owner,
         (true, true),
         &redeem_args(&owner, NOW),
@@ -309,7 +309,7 @@ fn supply_and_redeem_refuse_a_non_canonical_bump_and_a_foreign_mint() {
     let mollusk = setup();
     let user = Pubkey::new_unique();
     let foreign = [9; 32];
-    let keeper = pk(&KEEPER);
+    let keeper = pk(&KEEPERS[0]);
     let supplies = [
         (
             SupplyArgs {
