@@ -12,15 +12,16 @@
 # section (docs/lend-keeper.md) also runs the keeper on the same port and
 # tunnel; it needs the lend deploy (target/devnet-<name>/: program-id,
 # build-params.json and keys/) and the pool key in the Keychain item
-# keeler-devnet-<name>-pool, named by lend.pool_key.
+# keeler-devnet-<name>-pool, named by lend.pool_key. The keeper key is
+# lend.key when set (it must be one of the deployed keepers), else the
+# dealer's; it is read here only to find its address.
 #
-# --standby also runs the second keeper of the set as a standby
-# (`keeler keeper`, key in the Keychain item keeler-devnet-<name>-standby) on
-# the next port behind its own tunnel, and writes LEND_KEEPERS (the dealer's
-# keeper first, then the standby) whenever either URL changes. Without it the
-# Worker's lending goes to the first DEALERS entry; a LEND_KEEPERS left by an
-# earlier --standby run overrides that, so delete it then
-# (`npx wrangler secret delete LEND_KEEPERS` in worker/).
+# With a lend section the script also writes LEND_KEEPERS (the dealer's
+# keeper) whenever its URL changes. --standby also runs the second keeper of
+# the set as a standby (`keeler keeper`, key in the Keychain item
+# keeler-devnet-<name>-standby) on the next port behind its own tunnel, and
+# adds it to LEND_KEEPERS, after the dealer's keeper, once its URL is known.
+# DEALERS is written as soon as the dealer's URL is known.
 #
 # Pause quoting without stopping settlement: touch the config's pause_file;
 # pause new lending (both keepers): touch lend.pause_file.
@@ -65,9 +66,33 @@ fi
 # its own cargo target, so the swap-only build in target/release is left alone.
 lend_program=$(field 'c.get("lend", {}).get("program_id", "")')
 standby_key=""
+keeper=$dealer
 if [[ -n $lend_program ]]; then
     [[ $lend_program =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || { echo "$cfg: lend.program_id '$lend_program' is not a base58 address" >&2; exit 1; }
-    [[ $(field 'c["lend"].get("key", "")') == "" ]] || { echo "$cfg: the devnet keeper is the dealer; drop lend.key" >&2; exit 1; }
+    if [[ $(field 'c["lend"].get("key", "")') != "" ]]; then
+        # The address of lend.key: the last 32 bytes of the keypair, in base58.
+        # Only the address leaves Python.
+        keeper=$(python3 - "$cfg" 2>/dev/null <<'EOF'
+import json, subprocess, sys
+src = json.load(open(sys.argv[1]))["lend"]["key"]
+if "keychain" in src:
+    text = subprocess.run(["security", "find-generic-password", "-s", src["keychain"], "-w"],
+                          check=True, capture_output=True, text=True).stdout
+else:
+    text = open(src["file"]).read()
+key = bytes(json.loads(text))
+if len(key) != 64:
+    sys.exit(1)
+pub = key[32:]
+n, out = int.from_bytes(pub, "big"), ""
+alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+while n:
+    n, r = divmod(n, 58)
+    out = alphabet[r] + out
+print("1" * (len(pub) - len(pub.lstrip(b"\0"))) + out)
+EOF
+        ) || { echo "$cfg: lend.key cannot be read as a keypair" >&2; exit 1; }
+    fi
     deployment=""
     for d in "$root"/target/devnet-*/; do
         if [[ -f $d/program-id && $(cat "$d/program-id") == "$lend_program" ]]; then deployment=${d%/}; fi
@@ -86,22 +111,32 @@ if [[ -n $lend_program ]]; then
     [[ $(param program_id) == "$lend_program" ]] || { echo "$params is for another program than $lend_program" >&2; exit 1; }
     keepers=$(param keepers) || { echo "$params has no keepers: rerun scripts/deploy-lend-devnet.sh --estimate" >&2; exit 1; }
     pool_viewing=$(param pool_viewing) || { echo "$params has no pool_viewing" >&2; exit 1; }
-    [[ ,$keepers, == *,"$dealer",* ]] || { echo "$params: the dealer $dealer is not one of the lend program's keepers ($keepers)" >&2; exit 1; }
+    [[ ,$keepers, == *,"$keeper",* ]] || { echo "$params: the keeper $keeper is not one of the lend program's keepers ($keepers)" >&2; exit 1; }
     if $standby; then
-        others=$(tr ',' '\n' <<<"$keepers" | grep -vx "$dealer" || true)
-        [[ -n $others && $others != *$'\n'* ]] || { echo "--standby needs exactly one keeper besides the dealer in $params ($keepers)" >&2; exit 1; }
+        others=$(/usr/bin/tr ',' '\n' <<<"$keepers" | grep -vx "$keeper" || true)
+        [[ -n $others && $others != *$'\n'* ]] || { echo "--standby needs exactly one keeper besides $keeper in $params ($keepers)" >&2; exit 1; }
         standby_key=$others
     fi
+    # Older records lack the oracle; the build default (Pyth's SOL/USD) then holds.
+    opt() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$params" "$1"; }
+    price_account=$(opt price_account)
+    feed_id=$(opt feed_id)
     [[ -d $deployment/keys ]] || { echo "no $deployment/keys: rerun scripts/deploy-lend-devnet.sh --estimate" >&2; exit 1; }
     # The keeper proves with the deployment's own copy of the keys, so a
     # rebuild of lend/target under a running keeper cannot change them.
     export KEELER_LEND_KEYS_DIR=$deployment/keys
-    KEELER_LEND_PROGRAM_ID=$lend_program KEELER_LEND_ADMIN=$(param admin) \
-        KEELER_LEND_KEEPERS=$keepers KEELER_LEND_POOL_VIEWING=$pool_viewing \
-        KEELER_LEND_VAULT1_COLLATERAL_MINT=$(param collateral_mint) \
-        KEELER_LEND_VAULT1_DEBT_MINT=$(param debt_mint) \
+    (
+        export KEELER_LEND_PROGRAM_ID=$lend_program KEELER_LEND_ADMIN
+        export KEELER_LEND_KEEPERS=$keepers KEELER_LEND_POOL_VIEWING=$pool_viewing
+        export KEELER_LEND_VAULT1_COLLATERAL_MINT KEELER_LEND_VAULT1_DEBT_MINT
+        KEELER_LEND_ADMIN=$(param admin)
+        KEELER_LEND_VAULT1_COLLATERAL_MINT=$(param collateral_mint)
+        KEELER_LEND_VAULT1_DEBT_MINT=$(param debt_mint)
+        if [[ -n $price_account ]]; then export KEELER_LEND_VAULT1_PRICE_ACCOUNT=$price_account; fi
+        if [[ -n $feed_id ]]; then export KEELER_LEND_VAULT1_FEED_ID=$feed_id; fi
         CARGO_TARGET_DIR=$deployment/dealer-cargo \
-        cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
+            cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
+    )
     bin=$deployment/dealer-cargo/release/keeler
 else
     $standby && { echo "--standby needs a config with a lend section" >&2; exit 1; }
@@ -120,7 +155,9 @@ c = json.load(open(sys.argv[1]))
 host, port = c["http"]["listen"].rsplit(":", 1)
 listen = f"{host}:{int(port) + 1}"
 lend = dict(c["lend"], role="standby")
+# Its own key and state; the pool key and the pause file are shared.
 lend.pop("state_file", None)
+lend.pop("key", None)
 out = {
     "network": c["network"],
     "key": {"keychain": sys.argv[3]},
@@ -190,30 +227,40 @@ url_in() { grep -oE 'https://[a-z0-9]+(-[a-z0-9]+)+\.trycloudflare\.com' "$1" | 
 # A quick tunnel's URL changes on every start, so the URLs go in as secrets,
 # which take effect without redeploying the Worker.
 secret() { (cd "$root/worker" && npx wrangler secret put "$1"); }
+# DEALERS: the dealer. LEND_KEEPERS: its keeper, then the standby once its
+# URL is known.
+dealers_json() { printf '[{"url":"%s","pubkey":"%s"}]' "$1" "$dealer"; }
+keepers_json() {
+    printf '[{"url":"%s","pubkey":"%s"}' "$1" "$keeper"
+    [[ -n $2 ]] && printf ',{"url":"%s","pubkey":"%s"}' "$2" "$standby_key"
+    printf ']'
+}
+# Writes secret $1 as $2 unless it was last written so; failures back off
+# to 5 min and leave the record old, so a later pass tries again.
+publish_delay=2 publish_at=0
 publish() {
-    printf '[{"url":"%s","pubkey":"%s"}]' "$1" "$dealer" | secret DEALERS || return 1
-    [[ -z $standby_key ]] && return
-    printf '[{"url":"%s","pubkey":"%s"},{"url":"%s","pubkey":"%s"}]' "$1" "$dealer" "$2" "$standby_key" |
-        secret LEND_KEEPERS
+    local was=written_$1
+    [[ ${!was:-} == "$2" ]] && return 0
+    ((SECONDS >= publish_at)) || return 0
+    if printf %s "$2" | secret "$1"; then
+        printf -v "$was" %s "$2"
+        publish_delay=2
+        echo "published $1: $2" >&2
+    else
+        publish_at=$((SECONDS + publish_delay))
+        echo "publishing $1 failed; retry in ${publish_delay}s" >&2
+        publish_delay=$((publish_delay * 2 > 300 ? 300 : publish_delay * 2))
+    fi
 }
 
 for n in $procs; do "start_$n"; done
-published="" publish_delay=2 publish_at=0
 while true; do
     for n in $procs; do check "$n"; done
     main=$(url_in "$logs/cloudflared.log") second=""
     [[ -n $standby_key ]] && second=$(url_in "$logs/cloudflared-standby.log")
-    if [[ -n $main && ( -z $standby_key || -n $second ) && "$main $second" != "$published" ]] &&
-        ((SECONDS >= publish_at)); then
-        if publish "$main" "$second"; then
-            published="$main $second" publish_delay=2
-            echo "dealer $dealer at $main${second:+; standby keeper $standby_key at $second}" >&2
-        else
-            # published stays old, so a later pass tries again, backing off to 5 min.
-            publish_at=$((SECONDS + publish_delay))
-            echo "publishing failed; retry in ${publish_delay}s" >&2
-            publish_delay=$((publish_delay * 2 > 300 ? 300 : publish_delay * 2))
-        fi
+    if [[ -n $main ]]; then
+        publish DEALERS "$(dealers_json "$main")"
+        [[ -n $lend_program ]] && publish LEND_KEEPERS "$(keepers_json "$main" "$second")"
     fi
     sleep 2
 done

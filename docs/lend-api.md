@@ -178,7 +178,8 @@ with exactly the ticket's purpose, target, amount and expiry.
 ## Intents
 
 An intent moves one private note's `amount` into a note the user PDA (`["user", wallet]`) owns
-under the keeper's registered viewing key, slot 1 (slot 0 is the change). It carries no message:
+under the pool viewing key the program and the keepers were compiled with (`POOL_VIEWING`, the
+page's `VITE_LEND_POOL_VIEWING`), slot 1 (slot 0 is the change). Any keeper of the set can open it. It carries no message:
 the keeper knows the wallet from the ticket and scans that wallet's PDA, as for intents the Rust SDK
 builds. The page sends it itself (the user pays) and then waits for the keeper to fill it. After
 `expiry` the user can cancel it (`cancel_intent`) and take the funds back.
@@ -194,8 +195,10 @@ position with no debt; the whole collateral comes back at slot 0.
 The Worker's `PAUSED` switch is the swap's and does not apply to `/api/lend/*`: repayments,
 withdrawals and refunds must keep working while liquidations run. Lending is paused at the keeper,
 which then refuses new supply, new positions and borrowing with a 403 (`paused` on the page, the
-keeper's sentence shown) and keeps serving everything else. It pauses for a request when its
-`pause_file` exists or the request carries `x-keeler-paused: 1` (the Worker's lend pause).
+keeper's sentence shown) and keeps serving everything else: repay tickets, deposit tickets into an
+open position, redeems and withdrawals. It pauses for a request when its `pause_file` exists, the
+request carries `x-keeler-paused: 1` (the Worker's lend pause, `LEND_PAUSED`), or its book does not
+add up (its notes' shares differ from the reserve's, logged as a warning) until it does.
 
 ## Errors
 
@@ -213,9 +216,14 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | 422 | `below-minimum` | Under a minimum, or over a cap (pool size, supply per wallet, collateral in all or per position, debt per position) |
 | 423 | `unhealthy` | The position would be unhealthy |
 | 429 | `rate-limited` | Too many requests: tickets or builds per wallet per hour, open tickets per wallet, open intents in all, or the 8 receipts or positions a wallet may hold (open tickets count) |
-| 502, 504 | `keeper-offline` | The keeper did not answer (Worker) |
-| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured (Worker); the keeper still starting or failing to start inside the dealer; a build that took over 25 s |
+| 502, 504 | `keeper-offline` | No keeper answered with its JSON (Worker): no answer, a reply that is not the keeper's, every keeper still starting, or a keeper's own 5xx `{"error": ...}` (such as a build that took over 25 s) |
+| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured, or lending paused (Worker) |
 | other | `network` | |
+
+A keeper that is starting, or failing to start, inside the dealer answers 503 with
+`{"starting": "<sentence>"}` and no `error` field. The Worker treats that as no answer and asks the
+next keeper of `LEND_KEEPERS`; when none answers, the page gets a 502. A live keeper's own 5xx with
+`{"error": ...}` is its answer: it is not retried and reaches the page as a 502.
 
 ## Layouts the page checks
 

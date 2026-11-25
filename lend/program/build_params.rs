@@ -16,7 +16,8 @@
 //! Without `mainnet`, an unset parameter takes its local default (the
 //! fixture keys below). With `mainnet`, every parameter must be set, even
 //! where the default is the real value (SOL, Pyth's SOL/USD account and
-//! feed), and no admin, keeper or pool key may be a fixture key.
+//! feed), and no admin, keeper or pool key may be a fixture key, nor the debt
+//! mint the localnet fixture's.
 
 pub const PROGRAM_ID: &str = "KEELER_LEND_PROGRAM_ID";
 pub const ADMIN: &str = "KEELER_LEND_ADMIN";
@@ -162,6 +163,12 @@ pub fn read(var: impl Fn(&str) -> Option<String>, mainnet: bool) -> Result<Param
                 "{POOL_VIEWING} is the fixture pool key's, refused in a mainnet build"
             ));
         }
+        // The localnet fixture's mint: its authority's secret is public.
+        if params.debt_mint == get_default(DEBT_MINT) {
+            return Err(format!(
+                "{DEBT_MINT} is the localnet fixture's mint, refused in a mainnet build"
+            ));
+        }
     }
     Ok(params)
 }
@@ -286,6 +293,10 @@ mod tests {
         let mut env = mainnet();
         env.insert(POOL_VIEWING, get_default(POOL_VIEWING).into());
         assert!(run(&env, true).unwrap_err().contains("fixture pool key"));
+        let mut env = mainnet();
+        env.insert(DEBT_MINT, get_default(DEBT_MINT).into());
+        assert!(run(&env, true).unwrap_err().contains("fixture's mint"));
+        run(&env, false).unwrap();
     }
 
     #[test]
