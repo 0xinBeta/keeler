@@ -53,6 +53,7 @@ const CONF: u64 = 10_000_000;
 const HTTP_PORT: u16 = 47_800;
 const KEY: &str = "lend-e2e-http-key-0123";
 const NET: &str = "localnet";
+const ORIGIN: &str = "http://127.0.0.1:5300";
 
 fn env_path(name: &str) -> PathBuf {
     std::env::var_os(name)
@@ -122,8 +123,8 @@ impl Ledger for Probe<'_> {
         }
         self.inner.send(tx)
     }
-    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
-        self.inner.history(after)
+    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+        self.inner.history(payer, after)
     }
 }
 
@@ -175,8 +176,10 @@ impl Page {
         f.insert("wallet".into(), self.addr().to_string());
         f.insert("sessionKey".into(), self.session.pubkey().to_string());
         f.insert("sessionExpiry".into(), self.expiry.to_string());
+        f.insert("origin".into(), ORIGIN.into());
         let text = authorisation_text(
             NET,
+            ORIGIN,
             &keeler_lend::ID,
             &self.addr(),
             &self.session.pubkey(),
@@ -247,9 +250,8 @@ impl Env {
     }
 
     fn account(&self, page: &Page) -> Value {
-        let f = page.signed("GET", "/lend/account", &[], self.now());
-        let q: Vec<String> = f.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        let (st, v) = self.get(&format!("/lend/account?{}", q.join("&")));
+        let f = page.signed("POST", "/lend/account", &[], self.now());
+        let (st, v) = self.post("/lend/account", &f);
         assert_eq!(st, 200, "{v}");
         v
     }
@@ -515,14 +517,26 @@ fn keeper_end_to_end() -> Result<()> {
     let keeper_key = fixture::actor(0);
     let admin = fixture::actor(3);
     ensure!(
-        keeper_key.pubkey() == keeler_lend::KEEPER && admin.pubkey() == keeler_lend::ADMIN,
-        "default keeper and admin"
+        keeler_lend::KEEPERS == [keeper_key.pubkey(), fixture::payer().pubkey()]
+            && admin.pubkey() == keeler_lend::ADMIN,
+        "default keepers and admin"
     );
     let network = Network::local(ports.rpc_url(), ports.photon_url());
-    let chain = LendChain::connect(&network, &keeper_key, keeper::LendPrice::Test)?;
+    let lend_chain = |key: &Keypair| {
+        LendChain::connect(
+            &network,
+            key,
+            keeler_lend_sdk::fixture_keeper_keypair(key)?,
+            keeper::LendPrice::Test,
+            0,
+        )
+    };
+    let chain = lend_chain(&keeper_key)?;
+    let second_key = fixture::payer();
+    let second_chain = lend_chain(&second_key)?;
     let env = Env {
         localnet,
-        network,
+        network: network.clone(),
         chain,
         keeper_key,
         tusd,
@@ -568,6 +582,7 @@ fn keeper_end_to_end() -> Result<()> {
     let cfg: Lend = serde_json::from_value(json!({
         "program_id": keeler_lend::ID.to_string(),
         "network": NET,
+        "origins": [ORIGIN],
         "pause_file": dir.join("pause"),
         "limits": { "tickets_per_wallet_hour": 100 }
     }))?;
@@ -859,6 +874,79 @@ fn keeper_end_to_end() -> Result<()> {
                 receipts.iter().all(|r| r.supply_shares > 0),
                 "live receipts only"
             );
+            Ok(())
+        })
+    })?;
+
+    // 9. Two keepers. The first issues a ticket and goes down; the page
+    // hands the ticket to the second, which fills it on the same reserve;
+    // the first, back, takes the second's notes from the chain and closes
+    // its ticket.
+    let probe2 = Probe {
+        inner: &second_chain,
+        drop_send: AtomicBool::new(false),
+        builds: Mutex::new(Vec::new()),
+    };
+    let (reply, held) = session(&probe, &cfg, &state, |_| {
+        let (st, t) = env.ticket(
+            &lender,
+            &[
+                ("purpose", "supply".into()),
+                ("pool", tusd.to_string()),
+                ("amount", (2 * USD).to_string()),
+            ],
+        );
+        ensure!(st == 200, "ticket: {st} {t}");
+        ensure!(t["keeper"] == json!(keeler_lend::KEEPERS[0].to_string()));
+        let expiry = t["expiry"].as_u64().context("expiry")?;
+        env.raw_intent(&lender, tusd, purpose::SUPPLY, 1, 2 * USD, expiry)?;
+        let held = json!({
+            "id": t["id"], "expiry": t["expiry"], "signature": t["signature"],
+            "keeper": t["keeper"], "purpose": "supply", "pool": tusd.to_string(),
+            "amount": (2 * USD).to_string(),
+        });
+        Ok((t, held))
+    })?;
+    let id = reply["id"].as_str().unwrap().to_owned();
+    let first = session(&probe, &cfg, &state, |k| k.snapshot())?;
+    let b_state = dir.join("second.json");
+    let filled_by_second = timed("second keeper: recover, take on, fill", || {
+        let k2 = Keeper::open(&cfg, &probe2, &second_key, b_state.clone())?;
+        let b = k2.snapshot()?;
+        ensure!(
+            b.reserve.as_ref().map(|r| &r.hash) == first.reserve.as_ref().map(|r| &r.hash),
+            "the second keeper found the first's reserve"
+        );
+        let mut body =
+            serde_json::to_value(lender.signed("POST", "/lend/account", &[], env.now()))?;
+        body["tickets"] = json!([held]);
+        let (st, v) = k2.http("POST", "/lend/account", &serde_json::to_vec(&body)?, false);
+        ensure!(st == 200, "account: {v}");
+        ensure!(
+            k2.snapshot()?.tickets.iter().any(|t| t.id == id),
+            "the second keeper took the ticket on"
+        );
+        settle(&k2, "fill by the second keeper", 180, filled(&id))?;
+        k2.snapshot()
+    })?;
+    ensure!(probe2.builds.lock().unwrap().as_slice() == [Op::Supply]);
+    timed("first keeper: back, follows the second", || {
+        session(&probe, &cfg, &state, |k| {
+            settle(k, "the first follows", 120, |b| {
+                b.reserve.as_ref().map(|r| &r.hash)
+                    == filled_by_second.reserve.as_ref().map(|r| &r.hash)
+                    && b.tickets
+                        .iter()
+                        .any(|t| t.id == id && t.status == TicketStatus::Filled)
+            })?;
+            let hashes = |v: &[Note]| {
+                let mut h: Vec<String> = v.iter().map(|n| n.hash.clone()).collect();
+                h.sort();
+                h
+            };
+            let mine = hashes(&k.snapshot()?.receipts);
+            let theirs = hashes(&filled_by_second.receipts);
+            ensure!(mine == theirs, "both keepers hold the same receipts");
             Ok(())
         })
     })?;
