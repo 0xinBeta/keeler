@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Balance, Config, Keeler, LendAccount, Order } from "../keeler/index";
-import { Audience, ChainSees, Closing, Dealers, Facts, Faq, Features, LendFeatures, LendLiquidation, LendNumbers, LendPrivacy, Steps, pairOf } from "./Landing";
+import { Landing } from "./Landing";
 import { LendActivity } from "./Lend";
 import type { Market } from "./Lend";
 import { Orders } from "./Orders";
@@ -216,11 +216,7 @@ export function App({ keeler }: { keeler: Keeler }) {
         Skip to the swap
       </a>
       <div className="stage">
-        {view === "landing" ? (
-          <RingCanvas key="landing" mode="hero" input={ringInput} anchor={heroSlot} hero={hero} />
-        ) : (
-          <RingCanvas key="app" mode="hero" input={ringInput} anchor={panel} hero={appHero} />
-        )}
+        {view === "app" && <RingCanvas key="app" mode="hero" input={ringInput} anchor={panel} hero={appHero} />}
         <header className="top">
           <a className="wordmark" href="#top" aria-label="Keeler, top of page">
             <Logo />
@@ -236,49 +232,7 @@ export function App({ keeler }: { keeler: Keeler }) {
           <NetworkPill config={config} />
         </header>
         <main id="top">
-          {view === "landing" && (
-            <>
-              <section className="hero" ref={hero} aria-labelledby="hero-title">
-                <div className="intro">
-                  <h1 id="hero-title">Swap without showing your hand.</h1>
-                  <p className="lede">
-                    Keeler gets you signed quotes from dealers, checks them against a reference price, and settles the best
-                    one privately on Solana. The chain sees that you traded. It never sees how much, or at what price.
-                  </p>
-                  <div className="pills">
-                    <button className="pill pill-gold" onClick={startSwap}>
-                      Start a swap
-                    </button>
-                    <a className="pill pill-outline" href="#how">
-                      See how it works
-                    </a>
-                  </div>
-                  <ul className="chips" aria-label="Foundations">
-                    <li>Built on Helius Privacy Rings</li>
-                    <li>Settles on Solana</li>
-                    <li>Order proved in your browser</li>
-                  </ul>
-                </div>
-                <div ref={heroSlot} aria-hidden="true" />
-              </section>
-              <Facts />
-              <Features />
-              <ChainSees pair={pairOf(market)} />
-              <Steps />
-              {lend && (
-                <>
-                  <LendFeatures market={market} onOpen={go} pair={pairOf(market)} />
-                  <LendPrivacy pair={pairOf(market)} />
-                  <LendLiquidation pair={pairOf(market)} />
-                  <LendNumbers />
-                </>
-              )}
-              <Audience />
-              <Dealers />
-              <Faq lend={!!lend} pair={pairOf(market)} />
-              <Closing onStart={startSwap} />
-            </>
-          )}
+          {view === "landing" && <Landing config={config} market={market} lend={!!lend} open={go} />}
           <div className="app-view" hidden={view !== "app"}>
             <div className="hero app-hero" ref={appHero}>
               <section className="panel" id="swap" ref={panel} tabIndex={-1} aria-label="Private swap">
