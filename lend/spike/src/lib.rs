@@ -9,6 +9,7 @@ pub mod circuits;
 pub mod instructions;
 #[cfg(all(not(feature = "build-circuits"), not(xark)))]
 #[rustfmt::skip]
+#[allow(clippy::useless_conversion)]
 pub mod verifier;
 
 pub mod tag {

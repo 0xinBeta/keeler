@@ -34,6 +34,7 @@ unset CARGO_TARGET_DIR
 cd "$lend"
 keys=$lend/target/zk/keeler-lend
 wasm=$lend/target/wasm
+[[ -f $wasm/.zolana-zk-package ]] || rm -rf "$wasm"
 # One proving thread in the browser keeps wallet popups working (no
 # cross-origin isolation), as for the swap.
 "$ZOLANA_CLI_BIN" zk compile --test --single-threaded --wasm-out "$wasm" --manifest-path program/Cargo.toml

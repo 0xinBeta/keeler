@@ -1,0 +1,157 @@
+name: CI
+
+# Gates pull requests to main; also runs on every push, so a branch is checked before its pull request.
+# A branch's push run and its pull request run share one concurrency group: the later one cancels the earlier.
+# Only main saves the cargo cache.
+# The slow suites are in slow.yml and gate nothing.
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  AGAVE_VERSION: v4.1.2
+  AGAVE_SHA256: 5991d027a686eb419a709a479178b33eb83501e8a2bfbf599a81a286bfcbf770
+  WASM_PACK_VERSION: v0.15.1
+  WASM_PACK_SHA256: 410101009739b9d01c7d5affaaad6e9c9a24b4cba6791a4805db8e89b9bf7af2
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, unit and circuit tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Cache Agave, wasm-pack and Zolana downloads, and the swap example's build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.cache/solana
+            ~/.config/zolana/cache
+            ~/.cache/.wasm-pack
+            .tools
+          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ env.AGAVE_SHA256 }}-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('scripts/setup.sh', 'patches/swap.patch') }}
+      - name: Install Agave
+        run: |
+          release=$HOME/.local/share/solana/install/active_release
+          if [[ ! -x $release/bin/cargo-build-sbf ]]; then
+            curl -sSfL -o /tmp/agave.tar.bz2 "https://github.com/anza-xyz/agave/releases/download/$AGAVE_VERSION/solana-release-x86_64-unknown-linux-gnu.tar.bz2"
+            echo "$AGAVE_SHA256  /tmp/agave.tar.bz2" | sha256sum -c -
+            mkdir -p "$release"
+            tar -xjf /tmp/agave.tar.bz2 -C "$release" --strip-components=1
+          fi
+          echo "$release/bin" >>"$GITHUB_PATH"
+          "$release/bin/cargo-build-sbf" --version
+      - name: Install wasm-pack
+        run: |
+          mkdir -p /tmp/wasm-pack
+          curl -sSfL -o /tmp/wasm-pack.tar.gz "https://github.com/wasm-bindgen/wasm-pack/releases/download/$WASM_PACK_VERSION/wasm-pack-$WASM_PACK_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$WASM_PACK_SHA256  /tmp/wasm-pack.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/wasm-pack.tar.gz -C /tmp/wasm-pack --strip-components=1
+          install -m 755 /tmp/wasm-pack/wasm-pack "$HOME/.cargo/bin/wasm-pack"
+          wasm-pack --version
+      - name: Install the pinned Rust toolchains
+        run: |
+          rustup toolchain install
+          (cd lend && rustup toolchain install)
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            lend -> target
+          cache-workspace-crates: true
+      - run: scripts/setup.sh
+      - run: scripts/setup-lend.sh
+      - name: cargo fmt --check
+        run: |
+          cargo fmt --all --check
+          (cd lend && cargo fmt --all --check)
+      - name: cargo clippy -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          (cd lend && cargo clippy --all-targets -- -D warnings)
+      - run: cargo test -p keeler-core
+      - run: cargo test -p keeler --lib --test fixtures --test deploy_mainnet_refusals
+      - name: Circuit tests
+        working-directory: lend
+        run: cargo test --release -p keeler-lend --features build-circuits --lib
+      - name: Lend SDK native tests
+        working-directory: lend
+        run: cargo test --release -p keeler-lend-sdk
+      - name: Keep the web package for the web job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-public
+          path: web/public
+          retention-days: 3
+
+  web:
+    name: Web (types, unit tests)
+    needs: rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-public
+          path: web/public
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm test
+
+  worker:
+    name: Worker (types, unit tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: worker/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: worker/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm test

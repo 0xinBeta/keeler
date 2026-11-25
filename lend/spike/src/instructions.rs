@@ -266,7 +266,11 @@ fn check_price(account: &AccountView, bound: u64) -> ProgramResult {
     if clock - published > PRICE_MAX_AGE {
         return Err(ProgramError::Custom(3));
     }
-    if price.checked_sub(confidence).ok_or(ProgramError::Custom(4))? < bound {
+    if price
+        .checked_sub(confidence)
+        .ok_or(ProgramError::Custom(4))?
+        < bound
+    {
         return Err(ProgramError::Custom(4));
     }
     Ok(())
