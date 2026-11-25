@@ -10,6 +10,9 @@
 #     lend also: --admin <a> --keepers <a,b> --pool-viewing <66 hex>
 #       --collateral-mint <a> --debt-mint <a> --price-account <a> --feed-id <64 hex>
 #       and, without --estimate, --keeper-config <file> --keys-dir <dir>
+#   scripts/deploy-mainnet.sh swap|lend --build-only <the build parameters> --manifest <file>
+#     the mainnet build and its marker checks, nothing on chain: the .so for
+#     an upgrade through the multisig (docs/mainnet-runbook.md)
 #   scripts/deploy-mainnet.sh swap|lend --check-so <file.so> --manifest <file>
 #     only the marker checks, on any .so (for example one from
 #     `solana program dump`); reads no chain
@@ -46,7 +49,7 @@ die() { echo "refusing: $*" >&2; exit 1; }
 program=${1:-}
 [[ $program == swap || $program == lend ]] || usage
 shift
-estimate=false check_so=
+estimate=false check_so="" build_only=false
 # macOS bash 3.2 has no associative arrays: --some-name sets $arg_some_name,
 # read back by name with opt.
 opt() { local v=arg_${1//-/_}; printf '%s' "${!v:-}"; }
@@ -57,6 +60,7 @@ arg_feed_id="" arg_keeper_config="" arg_keys_dir=""
 while (($#)); do
     case $1 in
     --estimate) estimate=true; shift ;;
+    --build-only) build_only=true; shift ;;
     --check-so) [[ $# -ge 2 ]] || usage; check_so=$2; shift 2 ;;
     --program-id | --payer | --multisig | --vault-index | --manifest | --rpc-url | --admin | \
         --keepers | --pool-viewing | --collateral-mint | --debt-mint | --price-account | \
@@ -134,8 +138,10 @@ fi
 # Every build parameter explicitly; nothing defaults on mainnet.
 need=(program-id payer)
 [[ $program == lend ]] && need+=(admin keepers pool-viewing collateral-mint debt-mint price-account feed-id)
-$estimate || need+=(multisig manifest)
-$estimate || [[ $program == swap ]] || need+=(keeper-config keys-dir)
+$estimate && $build_only && die "--estimate or --build-only, not both"
+$estimate || need+=(manifest)
+$estimate || $build_only || need+=(multisig)
+$estimate || $build_only || [[ $program == swap ]] || need+=(keeper-config keys-dir)
 missing=()
 for n in "${need[@]}"; do [[ -n $(opt "$n") ]] || missing+=("--$n"); done
 ((${#missing[@]} == 0)) || die "missing ${missing[*]}; every parameter is given explicitly"
@@ -195,6 +201,8 @@ if ! $estimate; then
         fi
     fi
     check_manifest "$arg_manifest"
+fi
+if ! $estimate && ! $build_only; then
     if [[ $program == lend ]]; then
         [[ -f $arg_keeper_config ]] || die "no keeper config $arg_keeper_config"
         # The keeper proves with the ceremony's proving keys.
@@ -269,6 +277,10 @@ if $estimate; then
     if LC_ALL=C grep -q -a KEELER_LEND_TEST_PRICE_BUILD "$so"; then die "$so has the test price"; fi
 else
     check_markers "$so" "${arg_manifest}"
+fi
+if $build_only; then
+    echo "build only: $so ($so_sha256) for an upgrade through the multisig; nothing sent" >&2
+    exit 0
 fi
 
 python3 - "$out/plan.json" "$program" "$rpc_url" "$so" "${arg_payer}" "${arg_program_id}" \
