@@ -1006,6 +1006,12 @@ fn compiled_draw_refusals() {
         "require_eq(position.owner(), *user)",
         "assert_position → require_eq",
     );
+    c.refuses(
+        under(&op.proof_inputs, "program.private.owner_address"),
+        "circuits/draw.rs",
+        "require_eq(*p.owner_address.owner(), owner)",
+        IN_EXECUTE_EQ,
+    );
     reserve_refusals(&c, &r, NOW);
 
     // Past the 95% utilisation cap (95 of 100 is at it).
@@ -1074,6 +1080,20 @@ fn compiled_repay_refusals() {
         ),
         "circuits/repay.rs",
         "require_eq(intent.expiry, public.expiry)",
+        IN_EXECUTE_EQ,
+    );
+    let (opos, or) = borrowed(&other, 100 * USD);
+    let op = repay(
+        &other,
+        or,
+        opos,
+        intent_full(&other, debt(), 10 * USD, purpose::REPAY, 7),
+    )
+    .unwrap();
+    c.refuses(
+        under(&op.proof_inputs, "program.private.maker_address"),
+        "circuits/repay.rs",
+        "require_eq(*p.maker_address.owner(), maker)",
         IN_EXECUTE_EQ,
     );
     reserve_refusals(&c, &r, NOW);
