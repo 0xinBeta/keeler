@@ -63,6 +63,8 @@ pub struct LendChain {
     key: Keypair,
     pub kp: ShieldedKeypair,
     rpc_url: String,
+    /// One client for `rpc_call`, so a history replay keeps its connection.
+    http: reqwest::blocking::Client,
     price: LendPrice,
     debt: Mint,
     /// Micro-lamports per compute unit on liquidations.
@@ -102,6 +104,7 @@ impl LendChain {
             kp,
             key: key.insecure_clone(),
             rpc_url: network.urls()?.0,
+            http: reqwest::blocking::Client::new(),
             chain,
             price,
             debt,
@@ -362,7 +365,8 @@ impl LendChain {
     /// JSON-RPC that `spr-client` does not wrap.
     fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let v: Value = reqwest::blocking::Client::new()
+        let v: Value = self
+            .http
             .post(&self.rpc_url)
             .timeout(Duration::from_secs(30))
             .json(&body)

@@ -1168,6 +1168,10 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         let mut next = marks.clone();
         for k in who {
             let key = k.to_string();
+            if !marks.contains_key(&key) {
+                // One request per transaction the key ever paid for.
+                log!("lend: reading the whole history of keeper {key}; a first start can take minutes");
+            }
             let (notes, newest) = self
                 .ledger
                 .history(k, marks.get(&key).map(String::as_str))
