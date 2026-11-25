@@ -102,7 +102,7 @@ own signed requests, is in the Worker's tests.
 
 | Route | Request | Reply |
 | --- | --- | --- |
-| `pools` | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
+| `pools` | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps, surplus, badDebt}]}`, at most 8 |
 | `account` | signed fields, `tickets`: up to 8 open tickets as the page holds them, `{id, expiry, signature, keeper, purpose, amount, pool?, vault?, position?}`; not covered by `signature` (each is signed by its keeper) | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}`, each at most 8; `message` is base64 up to 512 characters; `status` is `waiting`, `filled` or `refundable`; optional `index: {supply, borrow, at}` (decimal strings, chain time) |
 | `ticket` | signed fields, `purpose` (`supply`, `deposit`, `repay`), `amount`, optional `pool`, `vault`, `position` | `{id (32 hex), expiry, signature (128 hex), keeper}`; `keeper` must be the keeper asked |
 | `build` | signed fields, `op` (`redeem`, `draw`), optional `pool`, `vault`, `position`, `amount`, `shares`, `borrow`, `withdraw`, `receipt` (64 hex); a redeem has exactly one of `amount` and `shares`, and only a redeem takes `shares` or `receipt` | `{transaction (base64, at most 5,464 characters = 4,096 bytes), outputs: [64 hex] (1 to 8), now, bound?, index?, keeper}`; `keeper` must be the keeper asked, and is the transaction's fee payer; `index` is the pool's price index (1e12-scaled) the transaction used |

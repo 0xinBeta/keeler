@@ -461,7 +461,10 @@ export function checkPriceAccount(account: unknown, feedId: string, symbol: stri
 const rpcBase = (env: Env) => env.UPSTREAM_RPC ?? (env.NETWORK === "local" ? LOCAL.rpc : helius(env, "/"));
 
 const HELIUS_DOMAINS = ["helius-rpc.com", "helius.xyz", "helius.dev"];
-const isHeliusHost = (host: string) => HELIUS_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
+const isHeliusHost = (raw: string) => {
+  const host = raw.replace(/\.+$/, "");
+  return HELIUS_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
+};
 
 /**
  * The RPC the reference prices are read through: `PRICE_RPC_URL`, else the page's RPC. Required on mainnet, and there

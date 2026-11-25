@@ -14,7 +14,8 @@ scripts/setup-lend.sh
 ZOLANA_PORT_OFFSET=3600 LEND_CHAIN_TESTS="chain earn_chain vault_chain" lend/scripts/run-chain-test.sh
 ```
 
-The tests print one `PROOF` and one `TX` line per transaction they land (`lend/sdk/tests/measure.rs`):
+The tests print one `PROOF` and one `TX` line per measured transaction (`lend/sdk/tests/measure.rs`;
+only the intents of `earn_chain` are measured, and test-price sends are not):
 
 - **Lend proof**: the Groth16 proof of the lend circuit as the instruction carries it (the
   serialized `CompressedProof` in the instruction's arguments). The shielded pool's own proof is
@@ -23,8 +24,9 @@ The tests print one `PROOF` and one `TX` line per transaction they land (`lend/s
   (`keeler_lend_sdk::proof::prove`). It does not include the shielded pool proof, which the local
   zolana prover makes.
 - **CU**: `computeUnitsConsumed` of the confirmed transaction (`getTransaction`).
-- **Tx bytes**: the v1 transaction, signatures included, compiled with a compute budget
-  instruction (`spr_client::transaction_size`). The limit that applies to a v1 transaction is
+- **Tx bytes**: the v1 transaction, signatures included, compiled with its compute budget, which a
+  v1 message carries in its config header rather than as an instruction
+  (`spr_client::transaction_size`). The limit that applies to a v1 transaction is
   4,096 bytes (`solana_message::v1::MAX_TRANSACTION_SIZE`, solana-message 5.0.0). Every Lend
   transaction is v1.
 - **Accounts**: the account metas of the lend instruction, then the distinct addresses of the
@@ -47,7 +49,7 @@ The tests print one `PROOF` and one `TX` line per transaction they land (`lend/s
 | liquidate | 128 | 2.56, 3.35 | 278,637, 277,177 | 1,889 | 1,406 | 13 / 11 | vault_chain |
 | close | 128 | 0.84, 1.06 | 246,335, 246,339 | 977 | 627 | 8 / 7 | vault_chain |
 
-Where an instruction ran more than once, every run is listed. Not measured: a draw that only
+Where an instruction was measured more than once, every measured run is listed. Not measured: a draw that only
 withdraws collateral (the chain tests draw to borrow only); the SPP proving time alone.
 
 ## Constraints per circuit

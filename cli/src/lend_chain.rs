@@ -460,20 +460,33 @@ pub(crate) fn lend_instruction_of(tx: &Value, keeper: &Address) -> Result<Option
                 .as_u64()
                 .and_then(|k| keys.get(k as usize).copied())
         };
+        let parsed = |a: Option<[u8; 32]>| {
+            a.map(Address::new_from_array)
+                .with_context(|| format!("a keeper lend instruction {t} whose args do not parse"))
+                .map(Some)
+        };
         let wallet = match t {
             tag::INIT_RESERVE => Some(Address::default()),
-            tag::SUPPLY => wincode::deserialize_from::<SupplyArgs>(&mut rest)
-                .ok()
-                .map(|a| Address::new_from_array(a.maker)),
-            tag::DEPOSIT | tag::DEPOSIT_ADD => wincode::deserialize_from::<DepositArgs>(&mut rest)
-                .ok()
-                .map(|a| Address::new_from_array(a.owner)),
-            tag::REPAY => wincode::deserialize_from::<RepayArgs>(&mut rest)
-                .ok()
-                .map(|a| Address::new_from_array(a.owner)),
-            tag::LIQUIDATE => wincode::deserialize_from::<LiquidateArgs>(&mut rest)
-                .ok()
-                .map(|a| Address::new_from_array(a.owner)),
+            tag::SUPPLY => parsed(
+                wincode::deserialize_from::<SupplyArgs>(&mut rest)
+                    .ok()
+                    .map(|a| a.maker),
+            )?,
+            tag::DEPOSIT | tag::DEPOSIT_ADD => parsed(
+                wincode::deserialize_from::<DepositArgs>(&mut rest)
+                    .ok()
+                    .map(|a| a.owner),
+            )?,
+            tag::REPAY => parsed(
+                wincode::deserialize_from::<RepayArgs>(&mut rest)
+                    .ok()
+                    .map(|a| a.owner),
+            )?,
+            tag::LIQUIDATE => parsed(
+                wincode::deserialize_from::<LiquidateArgs>(&mut rest)
+                    .ok()
+                    .map(|a| a.owner),
+            )?,
             tag::REDEEM | tag::DRAW => account(1),
             _ => None,
         };
@@ -1402,6 +1415,10 @@ mod tests {
         let mut failed = redeem_tx(&keeper, &wallet);
         failed["meta"]["err"] = json!({ "InstructionError": [0, "Custom"] });
         assert_eq!(lend_instruction_of(&failed, &keeper).unwrap(), None);
+        let mut garbled = redeem_tx(&keeper, &wallet);
+        garbled["transaction"]["message"]["instructions"][0]["data"] =
+            json!(bs58::encode([tag::SUPPLY, 1, 2]).into_string());
+        assert!(lend_instruction_of(&garbled, &keeper).is_err());
     }
 
     #[test]

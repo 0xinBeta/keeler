@@ -2,8 +2,8 @@
 
 What we hit while writing eleven Xark circuits for a Privacy Rings program (Keeler Lend), and what
 we did about each. Versions throughout: `xark` 0.3.1, `spr-program` and the other `spr-*` crates
-0.10.0, the `zolana` CLI `cli-v0.10.0`, SBF platform tools v1.54 (`lend/Cargo.toml`,
-`scripts/setup-lend.sh`).
+0.10.0 (`spr-hasher` 0.8.0), the `zolana` CLI `cli-v0.10.0`, SBF platform tools v1.54
+(`lend/Cargo.toml`, `scripts/setup-lend.sh`).
 
 Each pitfall says what was observed, where this repository works around it, and whether it looks
 like a toolchain bug or a documented limit. "Documented" means we found it in Xark's
@@ -79,22 +79,13 @@ fails.
   failing a requirement.
 - **Workaround.** Require the range, then clamp, so the untaken arm always sees an in-range value:
   `sub` in `lend/program/src/circuits/math.rs` (`require(a >= b)`, then `if a >= b { a - b } else
-  { 0 }`), and `div_rem` (a zero divisor is replaced by 1 after `require(!zero)`). The crate
-  allows `clippy::implicit_saturating_sub` for this reason: the explicit branch is the form Xark
-  lowers.
+  { 0 }`), and `div_rem` (a zero divisor is replaced by 1 after `require(!zero)`). `math.rs`
+  allows `clippy::implicit_saturating_sub` with a module attribute for this reason: the explicit
+  branch is the form Xark lowers.
 - **Classification.** Documented: the subset page says `if` and `match` run both arms and select
   the results. The native panic is the part that surprised us.
 
-### 4. An input must not be read inside a witness branch
-
-- **Observed.** `xark::input::from_fields`, which `to_u64` uses for the field-to-`u64`
-  conversion, misbehaved when read inside an `if` on a witness value.
-- **Workaround.** Inputs are read outside any witness branch (`to_u64` in
-  `lend/program/src/circuits/math.rs`). Natively, `to_u64` checks the bound itself first so a
-  value that does not fit is a recorded requirement, not a panic in the reader.
-- **Classification.** Not documented that we found; we did not reduce it, so no reproduction.
-
-### 5. Every hint output must be pinned
+### 4. Every hint output must be pinned
 
 - **Observed.** A hint allocates unconstrained witnesses; a prover may put anything there.
 - **Workaround.** Every hint output is pinned by an equation and a range check (`div_rem`,
@@ -103,17 +94,7 @@ fails.
 - **Classification.** Documented: `hint_div_rem`'s doc comment says to pin both outputs, and
   `Field::inv` is documented as the pinned form of the raw `hint_inverse`.
 
-### 6. No `u128` division by a witness
-
-- **Observed.** In 0.3.1 we could not divide a `u128` by a witness (spike notes; the exact error was
-  not recorded).
-- **Workaround.** Wide products are taken in the BN254 field at bit widths noted at each call, and
-  every division is the pinned hint of pitfall 1 (`lend/program/src/circuits/math.rs`, module
-  doc).
-- **Classification.** Unclear. The subset page on `master` lists `/` and `%` by a witness for
-  native unsigned witnesses; it may describe a newer version than 0.3.1. Not re-checked.
-
-### 7. Sharing a generic helper's instantiations changes other circuits
+### 5. Sharing a generic helper's instantiations changes other circuits
 
 - **Observed.** Making `math`'s private `div_floor` public for the liquidation circuit changed the
   Earn circuits' witness programs, so their keys and the committed checksums
@@ -125,7 +106,7 @@ fails.
 - **Classification.** Probably expected behaviour of a whole-crate compile, but undocumented and
   easy to miss when the circuits are frozen per program id. Not reduced.
 
-### 8. The SPP shape depends on which optional inputs are real
+### 6. The SPP shape depends on which optional inputs are real
 
 - **Observed.** A dummy token input is dropped by the compact SPP layout: the spike's touch had 3
   inputs (shape 3_4) with a dummy top-up and 4 (shape 4_4) with a real one. Proving keys for
@@ -136,7 +117,7 @@ fails.
 - **Classification.** Behaviour, not a bug; worth knowing when sizing transactions, because the
   account count changes with the shape.
 
-### 9. A proof takes at most 11 public fields
+### 7. A proof takes at most 11 public fields
 
 - **Observed.** `draw` needs pool owner, user owner, owner identity, two mint halves for each of
   two mints, vault, `now`, price bound and first nullifier: eleven, the most a proof takes
@@ -144,9 +125,13 @@ fails.
   32-byte mint is two `u128` halves (`mint_halves` in `lend/program/src/instructions/mod.rs`).
 - **Workaround.** `DrawPublicInputs` in `lend/program/src/circuits/draw.rs` is exactly eleven
   fields; the program recomputes every one from accounts and arguments before verifying.
-- **Classification.** Limit of the program-proof interface in `spr-program` 0.10.0.
+- **Classification.** Limit of the program-proof interface in `spr-program` 0.10.0: the public
+  hash takes at most 12 Poseidon inputs and one is the transaction hash. A non-byte array is
+  accepted as a public field and hashed as one Poseidon input of 1 to 12 items
+  (`spr-program-0.10.0/src/build/metadata.rs`, `validate_kind`); this repository does not use that
+  form.
 
-### 10. Client-only crates must stay out of the circuit build
+### 8. Client-only crates must stay out of the circuit build
 
 - **Observed.** `spr-keypair` and `spr-transaction` cannot be linked into a circuit build
   (`cfg(xark)`).
@@ -154,7 +139,7 @@ fails.
   (`[target.'cfg(all(not(xark), not(xark_client)))'.dependencies]`).
 - **Classification.** Build configuration; not a bug.
 
-### 11. `#[used]` on a static breaks the SBF program load
+### 9. `#[used]` on a static breaks the SBF program load
 
 - **Observed.** Marking the test-price marker string `#[used]` marked the ELF's OS ABI as GNU, and
   the loader refused the program.
@@ -163,21 +148,23 @@ fails.
   commit `ac2d1d8`).
 - **Classification.** A Rust/SBF toolchain interaction, not Xark. Not reduced.
 
-### 12. Browser proving is single-threaded
+### 10. Browser proving is single-threaded
 
 - **Observed.** Multi-threaded WASM needs cross-origin isolation, which breaks wallet popups.
 - **Workaround.** `zolana zk compile --test --single-threaded --wasm-out ...`
   (`scripts/setup-lend.sh`); proofs run in a Web Worker (`web/src/keeler/prover.worker.ts`).
 - **Classification.** Platform constraint.
 
-### 13. The viewing key of a PDA's shielded address is free
+### 11. The viewing key of a PDA's shielded address is free
 
 - **Observed.** A PDA owner's identity does not commit to a viewing key: owner checks compare the
   owner, and the viewing key only says whom new notes are encrypted to. Any `pool_viewing` would
   pass a circuit's owner check.
-- **Workaround.** The program pins it: every instruction that takes `pool_viewing` refuses one
-  that is not the compiled `POOL_VIEWING` (`require_pool_viewing` in
-  `lend/program/src/instructions/mod.rs`).
+- **Workaround.** The program pins the argument: every instruction that takes `pool_viewing`
+  refuses one that is not the compiled `POOL_VIEWING` (`require_pool_viewing` in
+  `lend/program/src/instructions/mod.rs`). The key enters only the shielded address; nothing binds
+  an output's ciphertext to it, so this stops a misconfigured keeper, not one that writes a reserve
+  nobody can open.
 - **Classification.** By design in the Default Ring; a program that writes notes others must read
   has to pin the key itself.
 

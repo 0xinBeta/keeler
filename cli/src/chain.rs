@@ -188,6 +188,12 @@ impl Chain {
         }
     }
 
+    fn release_unlanded(&self, hash: &[u8; 32], e: &anyhow::Error) {
+        if crate::lend_chain::never_lands(&format!("{e:?}")) {
+            self.release(hash);
+        }
+    }
+
     fn claimed(&self, note: &WalletUtxo) -> bool {
         CLAIMED.lock().is_ok_and(|c| {
             c.iter().any(|(scope, h, at)| {
@@ -366,21 +372,26 @@ impl Chain {
             .min_by_key(|u| u.utxo.amount)
             .ok_or_else(|| anyhow!("no note of {mint} covers {amount}"))?;
         self.claim(&source);
+        let hash = source.utxo_hash;
         let payer = kp.pubkey();
-        let me = kp.shielded_address()?;
-        let mut tx = ConfidentialTransaction::new(vec![source], payer)?;
-        if mint == SOL_MINT {
-            tx.transfer_sol(&me, amount)?;
-        } else {
-            tx.transfer(&me, mint, amount)?;
-        }
-        let signed = SignedPrivateTransaction {
-            transaction: tx.encrypt(kp)?,
-            settlement_transfers: Vec::new(),
-        };
+        let signed = (|| -> Result<SignedPrivateTransaction> {
+            let me = kp.shielded_address()?;
+            let mut tx = ConfidentialTransaction::new(vec![source], payer)?;
+            if mint == SOL_MINT {
+                tx.transfer_sol(&me, amount)?;
+            } else {
+                tx.transfer(&me, mint, amount)?;
+            }
+            Ok(SignedPrivateTransaction {
+                transaction: tx.encrypt(kp)?,
+                settlement_transfers: Vec::new(),
+            })
+        })()
+        .inspect_err(|_| self.release(&hash))?;
         Submission::new(&signed, payer, kp)
             .send_sync(&self.client, &[kp])
-            .map_err(|e| anyhow!("self-transfer: {e:?}"))?;
+            .map_err(|e| anyhow!("self-transfer: {e:?}"))
+            .inspect_err(|e| self.release_unlanded(&hash, e))?;
         let note = self
             .notes(kp, mint)?
             .into_iter()
@@ -421,14 +432,15 @@ impl Chain {
         Ok(order)
     }
 
-    /// Takes `order` with `note`; a failure before the send gives the
-    /// note's claim back.
+    /// Takes `order` with `note`; a failure before the send, or a send that
+    /// can never land, gives the note's claim back.
     pub fn take(&self, kp: &ShieldedKeypair, order: &OrderUtxo, note: WalletUtxo) -> Result<()> {
         let hash = note.utxo_hash;
         let ix = self
             .take_instruction(kp, order, note)
             .inspect_err(|_| self.release(&hash))?;
         self.send(kp, ix)
+            .inspect_err(|e| self.release_unlanded(&hash, e))
     }
 
     fn take_instruction(
@@ -500,12 +512,16 @@ impl Chain {
 
     /// Sends one instruction as a v1 message and waits until it is indexed.
     fn send(&self, kp: &ShieldedKeypair, ix: Instruction) -> Result<()> {
-        let sig = self.client.rpc().create_and_send_transaction(
-            std::slice::from_ref(&ix),
-            kp.pubkey(),
-            &[kp],
-            budget(COMPUTE_UNIT_LIMIT, self.priority_fee)?,
-        )?;
+        let sig = self
+            .client
+            .rpc()
+            .create_and_send_transaction(
+                std::slice::from_ref(&ix),
+                kp.pubkey(),
+                &[kp],
+                budget(COMPUTE_UNIT_LIMIT, self.priority_fee)?,
+            )
+            .map_err(|e| anyhow!("{e:?}"))?;
         self.client
             .confirm_private_transaction_sync(sig)
             .map_err(|e| anyhow!("confirm {sig}: {e:?}"))?;

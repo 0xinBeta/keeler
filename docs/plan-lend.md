@@ -24,8 +24,9 @@ Read from the Privacy Rings specification and the `spr-*` 0.10.0 sources, and co
 toolkit spike (`docs/notes-for-xark-builders.md`):
 
 - In the Default Ring, the only live ring, owners are public signers on every spend, and output
-  owner tags and counts are public. Amounts and assets of transfers are hidden. Hidden-sender modes
-  are switched off on mainnet; custom rings were in audit until December 2026.
+  owner tags and counts are public. Amounts and assets of shielded transfers are hidden; a move
+  into or out of the pool through the interface shows its amount. Hidden-sender modes
+  are switched off on mainnet; custom rings are in audit until December 2026.
 - A program holds funds as notes owned by its PDA; whoever builds a spend needs the note's opening.
   No key reads every note in the Default Ring.
 - A note can carry a balance and private state and be spent and re-created (`DataUtxo::new_mut`);
@@ -157,16 +158,17 @@ apart.
 - **Shares**: supply shares minted rounded down and burned rounded up, debt shares the reverse. A
   supply that would mint zero shares is refused. A repay of at least the debt clears the shares
   and returns the change.
-- **Minimums and the cap**: at least 1 tUSD per supply, 0.01 tSOL of collateral in a position that
-  holds any, and 1 tUSD of debt left by a draw that leaves any. A borrow is refused above idle
+- **Minimums and the cap**: at least 1 tUSD per supply; at least 0.01 tSOL of collateral in a
+  position after a deposit, and after a draw that leaves any; and 1 tUSD of debt left by a draw
+  that leaves any. `liquidate` checks no minimum, so it can leave less. A borrow is refused above idle
   liquidity or when it would take utilisation above 95%, so one borrower cannot freeze
   withdrawals.
 - **Prices and the bound**: `draw` requires `debt <= CF × value(collateral, bound)` and the program
   requires `price − confidence >= bound`; `liquidate` requires `debt > LT × value(collateral,
   bound)` and the program requires `price + confidence <= bound`. The bound is the oracle price
   moved by a fixed margin against the actor (the keeper's `bound_margin_bps`, default 50), never
-  derived from the position, so it publishes nothing about the position's health. One age limit
-  for both, 90 s. The price account and feed id are build parameters per vault; the debt token is
+  derived from the position, so it publishes nothing about the position's health. Both require
+  the price to be published within 90 s of the cluster clock. The price account and feed id are build parameters per vault; the debt token is
   valued at exactly 1 USD. See "Prices" below.
 - **Liquidation**: the liquidator transfers exactly `x` into the reserve and receives
   `floor((x + floor(x × penalty / 1e4)) × 1e12 / bound)` of collateral, capped at the position's
@@ -180,7 +182,8 @@ apart.
 - **Bad debt**: debt left on a position with no collateral stays on the books and keeps accruing.
   The interest fee (10% of the borrow interest) is never paid out and is the only buffer; past it,
   the last suppliers to leave bear the loss. There is no write-off.
-- **Seeds**: an instruction that spends a position seeds its output blindings from the position;
+- **Seeds**: an instruction that spends a position seeds its output blindings from the position,
+  except `close`, which the owner builds;
   `redeem` from the receipt; `supply` and `deposit_open` from the intent, each as
   `Poseidon(domain, blinding)`. An owner can always recompute their own outputs.
 - **Openings for the owner**: a new receipt or position is encrypted to the owner's viewing key
@@ -189,7 +192,8 @@ apart.
 - **Scales**: token amounts u64; prices and the bound scaled by 1e12 (debt base units per
   collateral base unit); rates and factors in basis points; a year is 31,536,000 s. The reference
   maths is `core/src/lend.rs`, with shared vectors (`web/tests/fixtures/lend-vectors.json`) that
-  the Rust reference, the circuits and the page's TypeScript twin pass.
+  the Rust reference and the page's TypeScript twin pass; the circuits pass the vectors of the
+  functions they implement.
 
 Vault and curve parameters are constants selected by pool and vault id. tSOL/tUSD vault:
 collateral factor 80%, threshold 85%, max limit 90%, penalty 1%. tUSD pool: the USDC curve above,
@@ -228,8 +232,9 @@ configuration and operations are in `docs/lend-keeper.md`.
   the set and the key change only by a program upgrade.
 - All keepers work under one pool key. The pool viewing key derives from it; each keeper keeps its
   own signing and nullifier keys under that viewing key. So any keeper can open and spend what
-  another wrote, and no keeper can write a reserve its peers cannot open by using another key (the
-  program refuses any other `pool_viewing`).
+  another wrote. The program pins the `pool_viewing` argument, so an honest build encrypts the
+  reserve to the shared key and a misconfigured keeper fails. It does not check the ciphertext: a
+  keeper can still write a reserve nobody can open (trust).
 - A keeper refuses to start unless its viewing key equals the compiled `POOL_VIEWING`, and on
   mainnet unless the pool key is not itself a keeper key.
 - The page encrypts intents to the compiled pool viewing key and accepts tickets and builds from
@@ -284,7 +289,7 @@ configuration and operations are in `docs/lend-keeper.md`.
   bad debt (debt of positions whose collateral at `price − confidence` is worth less than it),
   publishes both coarsely, and refuses new borrowing while the bad debt exceeds the surplus.
 - The caps are per keeper: two keepers filling deposits at once during a failover can pass
-  `max_total_collateral` (audit K-2).
+  `max_total_collateral` (review K-2).
 
 ### Trust statement
 
@@ -327,7 +332,7 @@ instruction, another payout).
   locks the maker's own funds until then, since `cancel_intent` waits for it and a keeper fills
   only an intent matching one of its tickets. The page uses the ticket's expiry; an intent made by
   hand with another one is the maker's own risk.
-- **The Worker** sees account views in clear (audit W-3).
+- **The Worker** sees account views in clear (review W-3).
 
 ## Differences from Jupiter Lend
 
@@ -362,10 +367,9 @@ specified in `docs/lend-api.md`.
 - The Pyth push account is sponsored by a third party; if it stalls, draws and liquidations stop.
 - On devnet the proving keys are test keys (anyone can forge a proof) and a keeper sets the test
   price.
-- A repay worth less than one debt share is accepted and removes no debt (audit P-1).
 
-The full list, with what enforces each rule, is `docs/threat-model.md`; the internal audit and its
-decisions are `docs/audit-2026-11-25.md`.
+The full list, with what enforces each rule, is `docs/threat-model.md`; the internal security
+review and its decisions are `docs/audit-2026-11-25.md`.
 
 ## Not in this version
 

@@ -1,5 +1,5 @@
-// Earn and Borrow in the panel, and the lending activity list below the hero. Copy rules: docs/plan-landing.md and
-// the brief in docs/plan-lend.md; a sentence that says what a money-moving button does stays next to that button.
+// Earn and Borrow in the panel, and the lending activity list below the hero (docs/plan-lend.md); a sentence
+// that says what a money-moving button does stays next to that button.
 import { useState } from "react";
 import type { Asset, Balance, KeelerLend, LendAccount, LendKind, LendOperation, LendStep, Pool, Position, Vault } from "../keeler/index";
 import type { MockLendControls } from "../keeler/mock-lend";
