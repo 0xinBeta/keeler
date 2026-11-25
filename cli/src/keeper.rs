@@ -843,8 +843,14 @@ pub struct Keeper<'a, L> {
     priority_waiting: AtomicBool,
     /// Positions (by nullifier) whose liquidation failed, until a chain time.
     skip: Mutex<HashMap<String, u64>>,
-    /// Wallets whose reservation lapsed unused: no new one before a time.
-    cooldown: Mutex<HashMap<String, u64>>,
+    /// Per wallet, when each of its reservations of the last hour lapsed
+    /// with no build of it landed: each one doubles its wait for the next.
+    strikes: Mutex<HashMap<String, Vec<u64>>>,
+    /// A reservation lapsed unused since the last fill ran: every waiting
+    /// fill, supply included, goes before the next owner build.
+    lapsed_unused: AtomicBool,
+    /// The last pass found a fill to run.
+    fills_waiting: AtomicBool,
     /// Chain times of each wallet's builds in the last hour.
     builds: Mutex<HashMap<String, Vec<u64>>>,
     /// Per wallet: the intent scan's cursor and the unspent intents seen
@@ -887,6 +893,8 @@ impl Solvency {
 }
 
 type Refusal = (u16, String);
+
+const BORROWING_HALTED: &str = "borrowing is halted while the pool's bad debt exceeds its surplus";
 /// An intent scan's cursor and what it kept.
 type Scan = (Option<String>, Vec<Intent>);
 
@@ -934,6 +942,14 @@ pub fn coarse(x: u64) -> u64 {
     }
     let q = (u128::from(x) + u128::from(unit / 2)) / u128::from(unit);
     u64::try_from(q * u128::from(unit)).unwrap_or(x - x % unit)
+}
+
+/// How long a wallet waits after the last of `strikes` reservations it let
+/// lapse unused within an hour: `reservation_secs`, doubled for each earlier
+/// one, at most an hour.
+pub fn cooldown_secs(reservation_secs: u64, strikes: usize) -> u64 {
+    let doublings = u32::try_from(strikes.saturating_sub(1)).map_or(12, |d| d.min(12));
+    reservation_secs.saturating_mul(1 << doublings).min(HOUR)
 }
 
 /// The smallest number of two significant figures at or above `x`.
@@ -1097,7 +1113,9 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             figures: Mutex::new(None),
             priority_waiting: AtomicBool::new(false),
             skip: Mutex::default(),
-            cooldown: Mutex::default(),
+            strikes: Mutex::default(),
+            lapsed_unused: AtomicBool::new(false),
+            fills_waiting: AtomicBool::new(false),
             builds: Mutex::default(),
             seen: Mutex::default(),
             keepers,
@@ -1367,6 +1385,9 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         for (p, outs) in landed {
             if book.pending.contains(&p) {
                 apply(&mut book, &p, &outs);
+                if p.owner_signed {
+                    self.forgive(&p);
+                }
             }
         }
         for p in dead {
@@ -1458,6 +1479,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             self.merge_history(&self.keepers, false)?;
             return Ok(false);
         };
+        self.strike_lapsed(book.reservation.as_ref(), now);
         if book.in_flight() {
             return Ok(false);
         }
@@ -1481,6 +1503,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             Some(q) => self.liquidation(&book, &r, q, now)?,
             None => None,
         };
+        let mut liquidation_retries = false;
         if let Some(job) = job {
             let position = match &job {
                 Job::Liquidate { position, .. } => position.nullifier.clone(),
@@ -1489,6 +1512,10 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             self.priority_waiting.store(true, Ordering::Relaxed);
             match self.execute(job, None) {
                 Ok(ran) => return Ok(ran),
+                Err(e) if self.taken_elsewhere(&reserve, &position) => {
+                    log!("lend: liquidation lost its reserve or position to another transaction; retry next pass: {e:#}");
+                    liquidation_retries = true;
+                }
                 // That one waits; the rest of the queue goes on.
                 Err(e) => {
                     log!("lend: liquidation failed; retry in {LIQUIDATION_BACKOFF} s: {e:#}");
@@ -1501,8 +1528,13 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         }
         // 2. Fills, in order: repay, deposit, supply.
         let fills = self.fills(&book, now)?;
+        if fills.is_empty() {
+            self.lapsed_unused.store(false, Ordering::Relaxed);
+        }
+        self.fills_waiting
+            .store(!fills.is_empty(), Ordering::Relaxed);
         self.priority_waiting.store(
-            fills.iter().any(|(_, j)| !matches!(j, Job::Supply { .. })),
+            liquidation_retries || fills.iter().any(|(_, j)| !matches!(j, Job::Supply { .. })),
             Ordering::Relaxed,
         );
         if book.reserved(now) {
@@ -1511,7 +1543,12 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         for (ticket, job) in fills {
             let op = job.op();
             match self.execute(job, Some(ticket.clone())) {
-                Ok(ran) => return Ok(ran),
+                Ok(ran) => {
+                    if ran {
+                        self.lapsed_unused.store(false, Ordering::Relaxed);
+                    }
+                    return Ok(ran);
+                }
                 Err(e) => {
                     log!("lend: fill of ticket {ticket} failed: {e:#}");
                     let mut b = self.book()?;
@@ -1546,9 +1583,9 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         };
         match self.ledger.debt_held() {
             Ok(held) if held < largest => log!(
-                "lend: WARNING: the keeper holds {held} of the debt token at its lend address, \
-                 under the largest position's debt {largest}; it cannot liquidate that \
-                 position. Fund it with `keeler lend-fund`"
+                "lend: WARNING: the keeper's debt token at its lend address is under the \
+                 largest position's debt; it cannot liquidate that position. \
+                 `keeler lend-balance` shows both; fund it with `keeler lend-fund`"
             ),
             Ok(_) => {}
             Err(e) => log!("lend: the keeper's own balance: {e:#}"),
@@ -1607,6 +1644,15 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         self.solvency
             .lock()
             .is_ok_and(|s| s.is_some_and(|s| s.halts()))
+    }
+
+    /// Whether another transaction spent the reserve or the position a
+    /// liquidation was built on: the next pass tries again on the new notes.
+    fn taken_elsewhere(&self, reserve: &Note, position: &str) -> bool {
+        let (Ok(r), Ok(p)) = (reserve.nullifier(), hex32(position)) else {
+            return false;
+        };
+        self.ledger.spent(&[r, p]).is_ok_and(|s| s.contains(&true))
     }
 
     /// The first position past the liquidation threshold at `price +
@@ -2468,21 +2514,76 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         }))
     }
 
-    /// Whether `wallet`'s last reservation lapsed unused so recently that it
-    /// may not take the pool again yet.
-    fn cooling(&self, book: &Book, wallet: &str, now: u64) -> Result<bool, Refusal> {
-        let gap = self.cfg.limits.reservation_secs;
-        let lapsed = book
-            .reservation
-            .as_ref()
-            .is_some_and(|r| r.wallet == wallet && r.until <= now && now < r.until + gap);
-        let listed = self
-            .cooldown
+    /// Counts `r`, once it has lapsed, as a strike against its wallet; a
+    /// first count also lets every waiting fill go before the next owner
+    /// build.
+    fn strike_lapsed(&self, r: Option<&Reservation>, now: u64) {
+        let Some(r) = r.filter(|r| r.until <= now && r.until + HOUR > now) else {
+            return;
+        };
+        let Ok(mut strikes) = self.strikes.lock() else {
+            return;
+        };
+        strikes.retain(|_, at| {
+            at.retain(|t| t + HOUR > now);
+            !at.is_empty()
+        });
+        let at = strikes.entry(r.wallet.clone()).or_default();
+        if !at.contains(&r.until) {
+            at.push(r.until);
+            self.lapsed_unused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// After an unused lapse, any waiting fill goes before owner builds.
+    fn fills_go_first(&self) -> bool {
+        self.lapsed_unused.load(Ordering::Relaxed) && self.fills_waiting.load(Ordering::Relaxed)
+    }
+
+    /// An owner build of `p`'s wallet landed: the reservation it was built
+    /// under was used after all.
+    fn forgive(&self, p: &Pending) {
+        let held = self.cfg.limits.reservation_secs;
+        if let Ok(mut strikes) = self.strikes.lock() {
+            if let Some(at) = strikes.get_mut(&p.wallet) {
+                at.retain(|t| !(p.now < *t && *t <= p.now + held));
+            }
+        }
+    }
+
+    /// Whether `wallet` let reservations lapse unused so recently that it
+    /// may not take the pool again yet: [`cooldown_secs`] after the last.
+    fn cooling(&self, wallet: &str, now: u64) -> Result<bool, Refusal> {
+        let strikes = self
+            .strikes
             .lock()
-            .map_err(|_| (500, "poisoned".to_owned()))?
+            .map_err(|_| (500, "poisoned".to_owned()))?;
+        let recent: Vec<u64> = strikes
             .get(wallet)
-            .is_some_and(|until| *until > now);
-        Ok(lapsed || listed)
+            .map(|at| at.iter().copied().filter(|t| t + HOUR > now).collect())
+            .unwrap_or_default();
+        Ok(recent.iter().max().is_some_and(|last| {
+            now < last + cooldown_secs(self.cfg.limits.reservation_secs, recent.len())
+        }))
+    }
+
+    /// Refuses (429) a wallet that had `builds_per_wallet_hour` builds in
+    /// the hour before `asked`; with `charge`, counts this one.
+    fn hourly(&self, wallet: &str, asked: u64, charge: bool) -> Result<(), Refusal> {
+        let mut builds = self
+            .builds
+            .lock()
+            .map_err(|_| (500, "poisoned".to_owned()))?;
+        builds.retain(|_, t| t.last().is_some_and(|t| t + HOUR > asked));
+        let mine = builds.entry(wallet.to_owned()).or_default();
+        mine.retain(|t| t + HOUR > asked);
+        if mine.len() >= self.cfg.limits.builds_per_wallet_hour as usize {
+            return refuse(429, "too many requests from this wallet this hour");
+        }
+        if charge {
+            mine.push(asked);
+        }
+        Ok(())
     }
 
     fn build(&self, fields: BTreeMap<String, String>, header: bool) -> Result<Value, Refusal> {
@@ -2542,10 +2643,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             return refuse(403, "lending is paused: no new borrowing");
         }
         if borrow > 0 && self.halted() {
-            return refuse(
-                403,
-                "borrowing is halted while the pool's bad debt exceeds its surplus",
-            );
+            return refuse(403, BORROWING_HALTED);
         }
         let w = wallet.to_string();
         let is_named = |n: &Note| named.is_none_or(|h| n.hash().is_ok_and(|m| m == h));
@@ -2571,19 +2669,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 _ => {}
             }
         }
-        {
-            let mut builds = self
-                .builds
-                .lock()
-                .map_err(|_| (500, "poisoned".to_owned()))?;
-            builds.retain(|_, t| t.last().is_some_and(|t| t + HOUR > asked));
-            let mine = builds.entry(w.clone()).or_default();
-            mine.retain(|t| t + HOUR > asked);
-            if mine.len() >= l.builds_per_wallet_hour as usize {
-                return refuse(429, "too many requests from this wallet this hour");
-            }
-            mine.push(asked);
-        }
+        self.hourly(&w, asked, false)?;
         // Wait for the lane, briefly.
         let _lane = loop {
             match self.lane.try_lock() {
@@ -2594,13 +2680,16 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         };
         let now = self.ledger.now().map_err(internal)?;
         let book = self.snapshot().map_err(internal)?;
+        self.strike_lapsed(book.reservation.as_ref(), now);
         if book.in_flight()
             || book.reserved_for_other(&w, now)
             || self.priority_waiting.load(Ordering::Relaxed)
-            || self.cooling(&book, &w, now)?
+            || self.fills_go_first()
+            || self.cooling(&w, now)?
         {
             return refuse(409, "the pool is in use; try again shortly");
         }
+        self.hourly(&w, asked, true)?;
         let reserve = book
             .reserve
             .clone()
@@ -2709,6 +2798,13 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             if (now as i64).abs_diff(q.published) > PRICE_FRESH {
                 return refuse(412, "the oracle price is too old");
             }
+            if borrow > 0
+                && solvency(&book, reserve.amount, &r, q.low)
+                    .map_err(internal)?
+                    .halts()
+            {
+                return refuse(403, BORROWING_HALTED);
+            }
             let m = u128::from(l.bound_margin_bps);
             let bound = u64::try_from(u128::from(q.low) * (10_000 - m) / 10_000)
                 .map_err(|e| internal(e.into()))?;
@@ -2768,22 +2864,10 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         pending.owner_signed = true;
         let mut b = self.book().map_err(internal)?;
         b.pending.push(pending.clone());
-        // A live reservation of this wallet is not extended; one that
-        // another lets lapse unused keeps that wallet waiting a while.
         let until = match &b.reservation {
             Some(r) if r.wallet == w && r.until > now => r.until,
             _ => now + l.reservation_secs,
         };
-        if let Some(old) = b
-            .reservation
-            .as_ref()
-            .filter(|r| r.wallet != w && r.until <= now)
-        {
-            if let Ok(mut c) = self.cooldown.lock() {
-                c.retain(|_, t| *t > now);
-                c.insert(old.wallet.clone(), old.until + l.reservation_secs);
-            }
-        }
         let before = b.reservation.replace(Reservation { wallet: w, until });
         if let Err(e) = self.save(&b) {
             b.pending.pop();

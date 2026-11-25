@@ -282,7 +282,7 @@ impl LendChain {
             Funding::Merge(ix) => ix.iter().map(|i| notes[*i].clone()).collect(),
         };
         log!(
-            "lend: making a note of exactly {need} from {} keeper notes for a liquidation",
+            "lend: making a note of exactly the repay from {} keeper notes for a liquidation",
             inputs.len()
         );
         inputs.iter().for_each(|n| self.claim(n));
@@ -402,6 +402,28 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
 
 fn hex_array<const N: usize>(s: &str) -> Result<[u8; N]> {
     crate::lend_auth::hex_bytes(s).ok_or_else(|| anyhow!("bad hex"))
+}
+
+/// The notes a keeper transaction of lend instruction `t` always makes that
+/// are not among the `found` kinds: the slots `build` records for that op.
+/// Every one is opened, a redeem's or a liquidation's emptied receipt or
+/// position too.
+pub(crate) fn missing_kinds(t: u8, found: &[u8]) -> Vec<&'static str> {
+    let made: &[u8] = match t {
+        tag::INIT_RESERVE => &[KIND_RESERVE],
+        tag::SUPPLY | tag::REDEEM => &[KIND_RESERVE, KIND_RECEIPT],
+        tag::DEPOSIT | tag::DEPOSIT_ADD => &[KIND_POSITION],
+        tag::DRAW | tag::REPAY | tag::LIQUIDATE => &[KIND_RESERVE, KIND_POSITION],
+        _ => &[],
+    };
+    made.iter()
+        .filter(|k| !found.contains(k))
+        .map(|k| match *k {
+            KIND_RESERVE => "reserve",
+            KIND_RECEIPT => "receipt",
+            _ => "position",
+        })
+        .collect()
 }
 
 /// The lend instruction of a `getTransaction` reply, when the keeper paid
@@ -1060,6 +1082,8 @@ impl LendChain {
         // A node that does not know the mark ignores `until` and pages the
         // whole history: past the first page, stop below the mark's slot.
         let mut floor: Option<u64> = None;
+        let mut oldest: Option<String> = None;
+        let mut ended_short = false;
         'pages: loop {
             let mut opts = json!({ "limit": 1000, "commitment": "confirmed" });
             if let Some(b) = &before {
@@ -1077,6 +1101,7 @@ impl LendChain {
                 {
                     break 'pages;
                 }
+                oldest = s["signature"].as_str().map(str::to_owned);
                 if newest.is_none() && s["confirmationStatus"] == "finalized" {
                     newest = s["signature"].as_str().map(str::to_owned);
                 }
@@ -1088,7 +1113,10 @@ impl LendChain {
             }
             match page.last().and_then(|s| s["signature"].as_str()) {
                 Some(last) if page.len() == 1000 => before = Some(last.to_owned()),
-                _ => break,
+                _ => {
+                    ended_short = true;
+                    break;
+                }
             }
             if let (Some(a), None) = (after, floor) {
                 floor = self.rpc_call(
@@ -1097,6 +1125,9 @@ impl LendChain {
                 )?["value"][0]["slot"]
                     .as_u64();
             }
+        }
+        if ended_short {
+            self.check_history_reaches(payer, oldest.as_deref(), after)?;
         }
         let mut found = Vec::new();
         for sig in sigs {
@@ -1125,8 +1156,11 @@ impl LendChain {
             };
             let tx = &indexed.transactions[0].transaction;
             let (Some(first), Some(salt)) = (tx.nullifiers.first(), tx.salt) else {
-                continue;
+                bail!(
+                    "keeper transaction {sig} has no nullifier or salt; its notes cannot be opened"
+                );
             };
+            let mut kinds = Vec::new();
             for (index, hash, leaf, _, _, payload) in slots(tx) {
                 let plain = std::iter::once(index)
                     .chain(0..8)
@@ -1138,12 +1172,45 @@ impl LendChain {
                         .then(|| self.classify(&plain, Some(&wallet), &hash, leaf))
                         .flatten()
                 });
-                if let Some(n) = note.filter(|n| n.kind != KIND_INTENT) {
-                    found.push(n);
+                if let Some(n) = note {
+                    kinds.push(n.kind);
+                    if n.kind != KIND_INTENT {
+                        found.push(n);
+                    }
                 }
             }
+            let lost = missing_kinds(t, &kinds);
+            ensure!(
+                lost.is_empty(),
+                "keeper transaction {sig} has no readable {}; the scan does not move past it",
+                lost.join(" or ")
+            );
         }
         Ok((found, newest))
+    }
+
+    /// Refuses a signature list that stopped short: the one before `oldest`
+    /// (the newest, with none read) must be the mark `after`, or none
+    /// without a mark.
+    fn check_history_reaches(
+        &self,
+        payer: &Address,
+        oldest: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<()> {
+        let mut opts = json!({ "limit": 1, "commitment": "confirmed" });
+        if let Some(o) = oldest {
+            opts["before"] = json!(o);
+        }
+        let next = self.rpc_call("getSignaturesForAddress", json!([payer.to_string(), opts]))?;
+        let next = next.as_array().context("no signatures")?;
+        let next = next.first().and_then(|s| s["signature"].as_str());
+        ensure!(
+            next == after,
+            "the RPC's signature list of {payer} stops short of {}; it is read again next time",
+            after.unwrap_or("its first transaction")
+        );
+        Ok(())
     }
 }
 
@@ -1335,6 +1402,43 @@ mod tests {
         let mut failed = redeem_tx(&keeper, &wallet);
         failed["meta"]["err"] = json!({ "InstructionError": [0, "Custom"] });
         assert_eq!(lend_instruction_of(&failed, &keeper).unwrap(), None);
+    }
+
+    #[test]
+    fn a_keeper_transaction_must_show_every_note_it_made() {
+        let (r, c, p, i) = (KIND_RESERVE, KIND_RECEIPT, KIND_POSITION, KIND_INTENT);
+        assert!(missing_kinds(tag::INIT_RESERVE, &[r]).is_empty());
+        assert!(missing_kinds(tag::SUPPLY, &[c, r]).is_empty());
+        assert_eq!(missing_kinds(tag::REDEEM, &[r]), ["receipt"]);
+        assert!(missing_kinds(tag::DEPOSIT, &[p, i]).is_empty());
+        assert_eq!(missing_kinds(tag::DEPOSIT_ADD, &[i]), ["position"]);
+        assert_eq!(missing_kinds(tag::DRAW, &[]), ["reserve", "position"]);
+        assert_eq!(missing_kinds(tag::REPAY, &[p]), ["reserve"]);
+        assert!(missing_kinds(tag::LIQUIDATE, &[p, r]).is_empty());
+        assert!(missing_kinds(tag::CLOSE, &[]).is_empty());
+    }
+
+    /// The strict history scan over a real network, from no mark, for every
+    /// keeper of the compiled set, read-only: no state file, no lock, nothing
+    /// sent. `KEELER_KEEPER_CONFIG` names a keeper config; run with the
+    /// deployment's build parameters in the environment, e.g.
+    /// `KEELER_KEEPER_CONFIG=<config> cargo test -p keeler --lib -- --ignored strict_history`.
+    #[test]
+    #[ignore = "reads a real network's whole keeper history"]
+    fn strict_history_scan_reads_every_keeper() {
+        let path = std::env::var("KEELER_KEEPER_CONFIG").expect("KEELER_KEEPER_CONFIG");
+        let cfg = crate::keeper::KeeperConfig::load(&path).unwrap();
+        let p = crate::keeper::connect(&cfg.lend, &cfg.network, &cfg.key).unwrap();
+        for k in keeler_lend::KEEPERS {
+            let (notes, newest) = p.chain.history(k, None).unwrap();
+            let count = |kind| notes.iter().filter(|n| n.kind == kind).count();
+            println!(
+                "keeper {k}: {} reserves, {} receipts, {} positions read; mark {newest:?}",
+                count(KIND_RESERVE),
+                count(KIND_RECEIPT),
+                count(KIND_POSITION)
+            );
+        }
     }
 
     #[test]

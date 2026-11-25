@@ -41,6 +41,9 @@ struct World {
     fail: Vec<Op>,
     /// Sends are refused for good.
     reject: bool,
+    /// Lands just before the next send, which it beats to an input: that
+    /// send is refused.
+    race: Option<Pending>,
     /// The `after` of each history and intents read.
     history_after: Vec<Option<String>>,
     intents_after: Vec<Option<String>>,
@@ -387,6 +390,11 @@ impl Ledger for Fake {
             w.sent.push(p.op);
             (p, w.hold, w.state.clone())
         };
+        let race = self.w().race.take();
+        if let Some(winner) = race {
+            self.land(&winner);
+            return Err(anyhow::Error::new(Rejected("input spent".into())));
+        }
         if self.w().reject {
             return Err(anyhow::Error::new(Rejected("preflight".into())));
         }
@@ -1642,6 +1650,152 @@ fn builds_per_wallet_are_limited() {
     assert_eq!(redeem(&k, &b, USD).0, 404);
     s.fake.advance(HOUR);
     assert_eq!(redeem(&k, &lender, USD).0, 200);
+}
+
+#[test]
+fn each_unused_reservation_doubles_the_wait() {
+    let s = Setup::new("strikes", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let t = now_of(&k);
+    let at = |secs: u64| {
+        s.fake.w().now = t + secs;
+        redeem(&k, &lender, USD).0
+    };
+    assert_eq!(at(0), 200);
+    assert_eq!(at(20), 409, "lapsed unused once: 20 s");
+    assert_eq!(at(39), 409);
+    assert_eq!(at(40), 200);
+    assert_eq!(at(99), 409, "twice: 40 s");
+    assert_eq!(at(100), 200);
+    assert_eq!(at(199), 409, "three times: 80 s");
+    assert_eq!(at(200), 200);
+    assert_eq!(cooldown_secs(20, 1), 20);
+    assert_eq!(cooldown_secs(20, 8), 2_560);
+    assert_eq!(cooldown_secs(20, 9), HOUR, "at most an hour");
+    assert_eq!(cooldown_secs(120, 60), HOUR);
+}
+
+#[test]
+fn a_build_that_lands_late_is_no_strike() {
+    let s = Setup::new("forgiven", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.advance(20);
+    assert_eq!(redeem(&k, &lender, USD).0, 409, "lapsed, not landed yet");
+    s.fake.advance(1);
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    s.fake.advance(1);
+    assert_eq!(redeem(&k, &lender, USD).0, 200, "it was used after all");
+}
+
+#[test]
+fn rotating_wallets_hold_the_lane_little_of_an_hour() {
+    let s = Setup::new("rotate", r#","limits":{"builds_per_wallet_hour":100000}"#);
+    let k = s.keeper();
+    let wallets: Vec<User> = (0..3).map(|_| with_liquidity(&s, &k)).collect();
+    let mut held = HashSet::new();
+    let t = now_of(&k);
+    for second in 0..HOUR {
+        s.fake.w().now = t + second;
+        for u in &wallets {
+            let w = u.addr().to_string();
+            let mine = k
+                .snapshot()
+                .unwrap()
+                .reservation
+                .is_some_and(|r| r.wallet == w && r.until > t + second);
+            if !mine && redeem(&k, u, USD).0 == 200 {
+                held.insert(k.snapshot().unwrap().reservation.unwrap().until);
+            }
+        }
+    }
+    let lane_secs = held.len() as u64 * 20;
+    assert!(lane_secs <= 3 * 160, "held {lane_secs} s of the hour");
+    assert!(
+        lane_secs >= 3 * 140,
+        "honest retries still get in: {lane_secs} s"
+    );
+}
+
+#[test]
+fn after_an_unused_lapse_a_waiting_supply_goes_first() {
+    let s = Setup::new("lapse-fill", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let other = with_liquidity(&s, &k);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    let u = s.user();
+    fund_intent(&s, &k, &u, purpose::SUPPLY, 1, 2 * USD);
+    assert!(!k.step().unwrap(), "the supply waits for the reservation");
+    s.fake.advance(20);
+    assert_eq!(redeem(&k, &other, USD).0, 409, "the supply first");
+    assert_eq!(drain(&k), vec![Op::Supply]);
+    assert_eq!(redeem(&k, &other, USD).0, 200);
+}
+
+#[test]
+fn a_refused_build_does_not_count_toward_the_hour() {
+    let s = Setup::new("hour-409", r#","limits":{"builds_per_wallet_hour":2}"#);
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let other = with_liquidity(&s, &k);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    for _ in 0..3 {
+        assert_eq!(redeem(&k, &other, USD).0, 409);
+    }
+    s.fake.advance(20);
+    assert_eq!(redeem(&k, &other, USD).0, 200);
+    assert_eq!(redeem(&k, &other, USD).0, 200);
+    assert_eq!(redeem(&k, &other, USD).0, 429);
+}
+
+#[test]
+fn a_liquidation_beaten_to_the_reserve_by_an_owner_build_retries_at_once() {
+    let s = Setup::new("liq-race", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    let owner_build = k.snapshot().unwrap().pending[0].clone();
+    s.fake.w().quote = Some(Quote {
+        low: 8 * DOLLAR,
+        high: 8 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    s.fake.w().race = Some(owner_build);
+    assert!(k.step().is_ok());
+    assert_eq!(
+        s.fake.w().sent,
+        vec![Op::Supply, Op::DepositOpen, Op::Liquidate]
+    );
+    assert_eq!(
+        redeem(&k, &lender, USD).0,
+        409,
+        "the liquidation keeps its turn"
+    );
+    assert_eq!(drain(&k), vec![Op::Liquidate], "no 60 s wait");
+}
+
+#[test]
+fn a_price_drop_since_the_last_pass_halts_borrowing_at_once() {
+    let s = Setup::new("fresh-halt", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    let c = s.user();
+    fund_intent(&s, &k, &c, purpose::DEPOSIT, 3, 10 * SOL);
+    drain(&k);
+    s.fake.w().quote = Some(Quote {
+        low: 5 * DOLLAR,
+        high: 5 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    let (st, v) = draw(&k, &c, 3, USD);
+    assert_eq!(st, 403, "{v}");
 }
 
 #[test]
