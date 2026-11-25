@@ -47,6 +47,7 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `NETWORK` | var | `local`, `devnet` or `mainnet`; any other value makes every `/api/` route a 500 |
 | `DEALERS` | var | JSON `[{"url","pubkey"}]`. Each `url` is `https://`; `http://` only on `local` (`DEALER_KEY` goes with every request) |
 | `UPSTREAM_RPC` | var | RPC URL. Default: `https://<network>.helius-rpc.com/`, or `http://127.0.0.1:8899` on `local` |
+| `PRICE_RPC_URL` | secret (or var) | RPC URL used only to read the Pyth price accounts behind `/api/prices`. Required on `mainnet`, where it must be `https://` and not a Helius host (the dealer reads its prices through Helius; two providers keep one from showing both the same false price). Elsewhere optional (`http://` only on `local`); unset, the prices are read through the page's RPC. It may carry its provider's key in its path or query: that URL stays in the Worker, and an upstream reply that echoes a credential of it is refused (502). Set it as a secret when it holds a key |
 | `UPSTREAM_SPR` | var | Base URL for both indexer and prover paths. Default: `https://<network>.helius-rpc.com/v1/spr` |
 | `UPSTREAM_INDEXER` | var | Overrides `UPSTREAM_SPR` for the indexer paths. Default on `local`: `http://127.0.0.1:8784` |
 | `UPSTREAM_PROVER` | var | Overrides `UPSTREAM_SPR` for the prover paths. Default on `local`: `http://127.0.0.1:3001` |
