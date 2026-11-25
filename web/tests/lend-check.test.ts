@@ -309,6 +309,24 @@ describe("the signing check", () => {
     expect((await checkKeeperTransaction(await build({ op: "draw", data: (slot, h) => (slot === 3 ? null : h) }), expected("draw"), hashing)).bound).toBeDefined();
   });
 
+  it("refuses each hostile shape on both a redeem and a draw", async () => {
+    const payout = { redeem: SLOT.redeem.payout, draw: SLOT.draw.debtPayout };
+    const transfer: Instruction = { programAddress: TOKEN, accounts: [w(OTHER), w(TREE), r(KEEPER)], data: Uint8Array.of(3, ...u64Bytes(1_000n)) };
+    for (const op of ["redeem", "draw"] as const) {
+      const theirs = notes(op).map((n) => (n.slot === payout[op] ? { ...n, owner: new Uint8Array(64).fill(9) } : n));
+      expect(await refusal(checkKeeperTransaction(await build({ op, notes: theirs }), expected(op), hashing))).toMatch(new RegExp(`output ${payout[op]} is not the note`));
+      expect(await refusal(checkKeeperTransaction(await build({ op, extra: [transfer] }), expected(op), hashing))).toMatch(/another program/);
+      expect(await refusal(checkKeeperTransaction(await build({ op, feePayer: USER }), expected(op), hashing))).toMatch(/fee payer/);
+    }
+  });
+
+  it("refuses a draw whose stated bound differs from its instruction's, or is off the market on the high side", async () => {
+    const honest = await build({ op: "draw" });
+    expect(await refusal(checkKeeperTransaction({ ...honest, bound: honest.bound! + 1n }, expected("draw"), hashing))).toMatch(/price bound it states differs/);
+    const high = (REFERENCE * 103n) / 100n;
+    expect(await refusal(checkKeeperTransaction(await build({ op: "draw", bound: high }), expected("draw"), hashing))).toMatch(/off the market/);
+  });
+
   it("refuses a new receipt or position encrypted to another viewing key", async () => {
     const theirs = new Uint8Array(33).fill(8);
     expect(await refusal(checkKeeperTransaction(await build({ viewing: theirs }), expected("redeem"), hashing))).toMatch(/another key/);

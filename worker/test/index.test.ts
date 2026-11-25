@@ -278,6 +278,18 @@ describe("/v1/spr/*", () => {
     expect(c.res.status).toBe(502);
     expect(c.res.headers.get("location")).toBeNull();
   });
+
+  it("never passes on a body that holds a credential of PRICE_RPC_URL", async () => {
+    const PATH_TOKEN = "pathtoken0123456789";
+    const QUERY_TOKEN = "querytoken0123456789";
+    const e = env({ PRICE_RPC_URL: `https://prices.example/${PATH_TOKEN}/?token=${QUERY_TOKEN}` });
+    for (const token of [PATH_TOKEN, QUERY_TOKEN]) {
+      mockFetch(() => Response.json({ echo: token }));
+      expect((await call(req("/v1/spr/health"), e)).res.status).toBe(502);
+    }
+    mockFetch(() => Response.json({ ok: true }));
+    expect((await call(req("/v1/spr/health"), e)).res.status).toBe(200);
+  });
 });
 
 describe("origin and static", () => {
@@ -1026,6 +1038,21 @@ describe("/api/prices", () => {
     expect(a.body.error).toContain(MINT_A);
     const three = JSON.stringify([...JSON.parse(TWO), { mint: TRADER, symbol: "X", decimals: 6 }]);
     expect((await call(req("/api/prices"), pythEnv({ NETWORK: "mainnet", ASSETS: three }))).res.status).toBe(500);
+  });
+
+  it("reads mainnet prices only through PRICE_RPC_URL, which must be https and not a Helius host", async () => {
+    at(NOW);
+    const main = (over: Partial<Env> = {}) => pythEnv({ NETWORK: "mainnet", UPSTREAM_RPC: undefined, ...over });
+    const missing = await call(req("/api/prices"), main());
+    expect(missing.res.status).toBe(500);
+    expect(missing.body.error).toMatch(/PRICE_RPC_URL is required on mainnet/);
+    for (const url of ["https://mainnet.helius-rpc.com/", "https://beta.helius-rpc.com/", "https://x.helius.xyz/", "http://prices.example/", "not a url"]) {
+      expect((await call(req("/api/prices"), main({ PRICE_RPC_URL: url }))).res.status, url).toBe(500);
+    }
+    mockFetch(rpcReply(account(), goodB()));
+    const priceUrl = `https://prices${n}.example/secret0123456789`;
+    expect((await call(req("/api/prices"), main({ PRICE_RPC_URL: priceUrl }))).res.status).toBe(200);
+    expect(calls.map((c) => c.url)).toEqual([priceUrl]);
   });
 
   it("reads all accounts in one getMultipleAccounts call", async () => {
