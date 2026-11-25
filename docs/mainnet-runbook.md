@@ -29,8 +29,8 @@ The debt token is valued at exactly 1 USD, by the program and by the page (whate
 
 - [ ] Every circuit, the program, the keeper and the page are final. A circuit change after the
       ceremony means a new ceremony.
-- [ ] The liquidation penalty split and the bad-debt policy are decided (today the whole 1% goes to
-      the liquidator and there is no write-off: `docs/plan-lend.md`, "Rules"; both change a circuit) **[operator]**.
+- [x] The liquidation penalty and the bad-debt policy are decided: the whole 1% goes to the
+      liquidator and there is no write-off (`docs/plan-lend.md`, "Rules"). Changing either changes a circuit.
 - [ ] P-1 from `docs/audit-2026-11-25.md` is fixed before the freeze: a partial repay worth less
       than one debt share is refused by the repay circuit (regenerated repay keys and checksums),
       by the Rust and TypeScript math and by the keeper before it builds.
