@@ -938,7 +938,7 @@ h1 {
 }
 .app .band-ticks {
   position: relative;
-  height: 16px;
+  height: 32px;
   color: var(--dim);
   font-size: 11px;
 }
@@ -948,11 +948,16 @@ h1 {
   white-space: nowrap;
   transform: translateX(-50%);
 }
+.app .band-ticks span:nth-child(2) {
+  top: 16px;
+}
 .app .band-ticks span:first-child {
   left: calc((100% - var(--band-width)) / 2);
+  transform: translateX(-100%);
 }
 .app .band-ticks span:last-child {
   left: calc((100% + var(--band-width)) / 2);
+  transform: none;
 }
 .app .band-selected {
   color: var(--gold-light);
@@ -1625,6 +1630,11 @@ h1 {
   }
   .app .observatory {
     position: relative;
+  }
+}
+@media (max-width: 820px) {
+  .app .field-frame input {
+    scroll-margin-bottom: 240px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
