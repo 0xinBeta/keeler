@@ -347,9 +347,11 @@ fn unsettled_order_is_refunded_once() {
     let listener = TcpListener::bind(dealer_addr(6, 1)).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
+    let cluster = chain.cluster;
     let server = thread::spawn(move || {
         serve(listener, &flag, |rfq: Rfq| {
-            sign_quote(&fixture::actor(1), &rfq, buy_amount, expiry).map_err(|e| e.to_string())
+            sign_quote(&fixture::actor(1), cluster, &rfq, buy_amount, expiry)
+                .map_err(|e| e.to_string())
         })
     });
     let cfg = TraderConfig {
@@ -482,7 +484,12 @@ fn http_quote_settles() {
         "signature": reply["quote"]["signature"],
     }))
     .unwrap();
-    assert!(signed_by(&fixture::actor(1).pubkey(), &rfq, &signed));
+    assert!(signed_by(
+        &fixture::actor(1).pubkey(),
+        chain.cluster,
+        &rfq,
+        &signed
+    ));
     let health: serde_json::Value = web
         .get(format!("http://{http}/health"))
         .header("x-keeler-key", KEY)

@@ -62,7 +62,7 @@ see `SPIKE.md`); take tag 11 for the second one.
 
 - `liquidate` seeds its blindings from the position, so the liquidated owner
   can derive the blinding of the liquidator's change note. The keeper should
-  liquidate from a note of exactly `x + buffer` (empty change slot).
+  liquidate from a note of exactly `x` (empty change slot).
 - An intent's expiry is private and unbounded: a far-future expiry locks the
   maker's funds until then. The keeper's ticket fixes the expiry and the page
   uses it; nothing stops an intent made by hand.
@@ -80,8 +80,17 @@ scripts/run-chain-test.sh                 # local network, port offset 2100
 
 Features: exactly one of `insecure-test-setup` (the default) and `mainnet`.
 `test-price` is not a default: `scripts/setup-lend.sh` passes it for the
-local and devnet `.so`, and it cannot build with `mainnet`. A `mainnet`
-build refuses any default build parameter (`program/build.rs`).
+local and devnet `.so`, and it cannot build with `mainnet`; such a `.so`
+contains the string `KEELER_LEND_TEST_PRICE_BUILD`. A `mainnet` build needs
+every build parameter set and refuses public test keys
+(`program/build_params.rs`, with its unit tests).
+
+Keepers and the pool key: any of `KEEPERS` (`KEELER_LEND_KEEPERS`) may sign
+as the keeper; every `pool_viewing` argument must be `POOL_VIEWING`
+(`KEELER_LEND_POOL_VIEWING`). A keeper builds with
+`keeler_lend_sdk::keeper_keypair(keeper, pool_key)`: its own signing and
+nullifier keys under the pool viewing key. Local tests use the fixture
+keepers (actor 0 and the payer) and `fixture_keeper_keypair`.
 
 Local networks: a port offset in 2100-2700 (`ZOLANA_PORT_OFFSET`, prover on
 3001 + offset / 100), and stop what you start.

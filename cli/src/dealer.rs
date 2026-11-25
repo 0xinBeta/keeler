@@ -31,7 +31,7 @@ use spr_keypair::ShieldedKeypair;
 use swap_sdk::{index::TakerOrder, state::OrderUtxo};
 
 use crate::{
-    chain::{hex, shielded, Chain, Status},
+    chain::{hex, shielded, Chain, Cluster, Status},
     config::{parse_address, DealerConfig, Pricer, Prover, SellLimit},
     faucet::{Claims, Faucet, Limits},
     keeper::LendRoutes,
@@ -121,7 +121,7 @@ struct Loaded {
     faucet: Option<Claims>,
 }
 
-fn load_state(path: &Path, now: u64, dealer: &Address) -> Result<Loaded> {
+fn load_state(path: &Path, now: u64, dealer: &Address, network: Cluster) -> Result<Loaded> {
     let text = match std::fs::read(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -140,7 +140,7 @@ fn load_state(path: &Path, now: u64, dealer: &Address) -> Result<Loaded> {
     let rebinds: Vec<(String, u64)> = state
         .bound
         .iter()
-        .filter(|(r, q)| q.expiry > now && signed_by(dealer, r, q))
+        .filter(|(r, q)| q.expiry > now && signed_by(dealer, network, r, q))
         .map(|(r, _)| (r.sell_mint.clone(), r.sell_amount))
         .collect();
     let live: Vec<_> = state
@@ -153,7 +153,7 @@ fn load_state(path: &Path, now: u64, dealer: &Address) -> Result<Loaded> {
     // A quote it did not sign never binds an order.
     let quotes: Vec<_> = live
         .into_iter()
-        .filter(|(r, q)| signed_by(dealer, r, q))
+        .filter(|(r, q)| signed_by(dealer, network, r, q))
         .collect();
     if quotes.len() < count {
         log!(
@@ -266,6 +266,20 @@ fn fresh_last_look(
     ok
 }
 
+/// What a dealer on `cluster` refuses to start with: a lend section for
+/// another network, and on mainnet a faucet or a key read from a file.
+fn start_checks(cfg: &DealerConfig, cluster: Cluster) -> Result<()> {
+    if let Some(l) = &cfg.lend {
+        crate::keeper::check_cluster(l, cluster)?;
+    }
+    if cluster == Cluster::Mainnet {
+        ensure!(cfg.faucet.is_none(), "no faucet on mainnet");
+        let files = cfg.common.key.is_file() || cfg.http.as_ref().is_some_and(|h| h.key.is_file());
+        ensure!(!files, "on mainnet keys come from the Keychain, not a file");
+    }
+    Ok(())
+}
+
 /// Serves quotes and settles until `stop` is set, or fails when a server
 /// stops on its own.
 pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
@@ -288,10 +302,11 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
     }
     let pricer = c.pricer()?;
     let chain = Chain::connect(&c.network, &c.mints()?)?;
+    start_checks(cfg, chain.cluster)?;
     let kp = shielded(&signer)?;
     chain.register(&kp)?;
     let state = state_path(cfg, &signer.pubkey())?;
-    let loaded = load_state(&state, chain.now()?, &signer.pubkey())?;
+    let loaded = load_state(&state, chain.now()?, &signer.pubkey(), chain.cluster)?;
     let cache = Mutex::new(Cache {
         book: loaded.quotes,
         bound_sells: loaded.bound_sells,
@@ -515,6 +530,8 @@ struct Head {
     key: Option<String>,
     length: Option<usize>,
     chunked: bool,
+    /// `x-keeler-paused: 1`: the Worker paused lending for every keeper.
+    paused: bool,
 }
 
 /// The request line and headers, or `None` when they are malformed or
@@ -562,6 +579,7 @@ fn read_head(r: &mut impl BufRead) -> io::Result<Option<Head>> {
                 head.length = Some(value.parse().unwrap_or(usize::MAX));
             }
             "x-keeler-key" => head.key = Some(value.to_owned()),
+            "x-keeler-paused" => head.paused = value == "1",
             "transfer-encoding" => head.chunked = true,
             _ => {}
         }
@@ -639,7 +657,7 @@ fn one_request<'s>(
                     &mut body,
                     MAX_LEND_BODY,
                 ) {
-                    Ok(buf) => lend.lend(&h.method, &h.path, &buf),
+                    Ok(buf) => lend.lend(&h.method, &h.path, &buf, h.paused),
                     Err(e) => e,
                 };
                 reply(&stream, out);
@@ -823,7 +841,13 @@ fn quote(api: &DealerApi, rfq: Rfq) -> Result<Quote> {
     let now = api.chain.now()?;
     let mut cache = api.cache.lock().map_err(|_| anyhow!("cache poisoned"))?;
     admit(
-        api.cfg, &mut cache, api.state, api.signer, rfq, buy_amount, now,
+        api.cfg,
+        &mut cache,
+        api.state,
+        (api.signer, api.chain.cluster),
+        rfq,
+        buy_amount,
+        now,
     )
 }
 
@@ -833,7 +857,7 @@ fn admit(
     cfg: &DealerConfig,
     cache: &mut Cache,
     state: &Path,
-    signer: &Keypair,
+    (signer, network): (&Keypair, Cluster),
     rfq: Rfq,
     buy_amount: u64,
     now: u64,
@@ -861,6 +885,7 @@ fn admit(
     ensure!(cache.book.len() < MAX_BOOK, "quote book full");
     let q = sign_quote(
         signer,
+        network,
         &rfq,
         buy_amount,
         now.saturating_add(cfg.quote_ttl_secs),
@@ -1112,6 +1137,8 @@ fn settle(
 #[cfg(test)]
 mod tests {
     use solana_account::Account;
+
+    const L: Cluster = Cluster::Local;
     use spr_client::ClientError;
     use spr_keypair::ShieldedKeypair;
     use spr_transaction::Mint;
@@ -1345,11 +1372,11 @@ mod tests {
     struct Echo;
 
     impl LendRoutes for Echo {
-        fn lend(&self, _: &str, url: &str, body: &[u8]) -> (u16, Value) {
+        fn lend(&self, _: &str, url: &str, body: &[u8], paused: bool) -> (u16, Value) {
             if url == "/lend/slow" {
                 sleep(Duration::from_millis(1500));
             }
-            (200, json!({ "len": body.len() }))
+            (200, json!({ "len": body.len(), "paused": paused }))
         }
     }
 
@@ -1377,7 +1404,15 @@ mod tests {
                 )
             });
             let (r, _) = exchange(at, post("/lend/ticket", KEY, 16_384).as_bytes(), None);
-            assert!(r.ends_with(r#"{"len":16384}"#), "{r}");
+            assert!(r.ends_with(r#"{"len":16384,"paused":false}"#), "{r}");
+            // The Worker's pause reaches the keeper.
+            let paused = post("/lend/ticket", KEY, 1).replacen(
+                "\r\n\r\n",
+                "\r\nx-keeler-paused: 1\r\n\r\n",
+                1,
+            );
+            let (r, _) = exchange(at, paused.as_bytes(), None);
+            assert!(r.ends_with(r#"{"len":1,"paused":true}"#), "{r}");
             let (r, _) = exchange(at, post("/lend/ticket", KEY, 16_385).as_bytes(), None);
             assert!(r.starts_with("HTTP/1.1 413"), "{r}");
             let (r, _) = exchange(at, post("/lend/ticket", "nope", 10).as_bytes(), None);
@@ -1393,7 +1428,7 @@ mod tests {
             assert!(started.elapsed() < Duration::from_millis(1000));
             let (r, took) = slow.join().unwrap();
             assert!(
-                r.ends_with(r#"{"len":2}"#) && took >= Duration::from_millis(1500),
+                r.ends_with(r#"{"len":2,"paused":false}"#) && took >= Duration::from_millis(1500),
                 "{r}"
             );
             // Eight at once; a ninth is turned away, and swaps still answer.
@@ -1406,7 +1441,7 @@ mod tests {
             assert!(health(at).starts_with("HTTP/1.1 200"));
             for h in slow {
                 let (r, _) = h.join().unwrap();
-                assert!(r.ends_with(r#"{"len":2}"#), "{r}");
+                assert!(r.ends_with(r#"{"len":2,"paused":false}"#), "{r}");
             }
             stop.store(true, Ordering::Relaxed);
             server.join().unwrap().unwrap();
@@ -1507,7 +1542,7 @@ mod tests {
         let trader = addr(9);
         let d = dealer();
         let signed =
-            |rfq: &Rfq, buy, expiry| (rfq.clone(), sign_quote(&d, rfq, buy, expiry).unwrap());
+            |rfq: &Rfq, buy, expiry| (rfq.clone(), sign_quote(&d, L, rfq, buy, expiry).unwrap());
         let live = rfq_for(addr(1), 100, addr(2), trader);
         let bound = rfq_for(addr(1), 200, addr(2), trader);
         let mut cache = Cache::default();
@@ -1528,20 +1563,23 @@ mod tests {
 
         // A restart at chain time 600: the quote that expired at 500 and the
         // one whose signature fails are gone.
-        let loaded = load_state(&path, 600, &d.pubkey()).unwrap();
+        let loaded = load_state(&path, 600, &d.pubkey(), L).unwrap();
         assert_eq!(loaded.quotes.len(), 2);
         assert!(loaded.quotes.iter().all(|(_, q)| q.expiry == 1_000));
         let o = order(trader, addr(1), 200, addr(2), 90, 1_000);
         assert!(loaded.quotes.iter().any(|(r, q)| matches(r, q, &o)));
         // Another dealer's key verifies none of them.
-        assert!(load_state(&path, 600, &addr(3)).unwrap().quotes.is_empty());
+        assert!(load_state(&path, 600, &addr(3), L)
+            .unwrap()
+            .quotes
+            .is_empty());
         // The hourly window and the faucet's day survive; the live bound
         // quote's sell is left to be counted when its order binds again.
         assert_eq!(
             loaded.bound_sells,
             vec![(100, addr(1), 7), (590, addr(1), 8)]
         );
-        let later = load_state(&path, 3_700, &d.pubkey()).unwrap();
+        let later = load_state(&path, 3_700, &d.pubkey(), L).unwrap();
         assert_eq!(
             later.bound_sells,
             vec![(590, addr(1), 8), (595, addr(1), 200)]
@@ -1549,7 +1587,7 @@ mod tests {
         let mut again = Limits::new(1, 5);
         again.claims = loaded.faucet.unwrap();
         assert!(again.take(addr(4), 3).is_err());
-        assert!(load_state(&temp("missing.json"), 0, &d.pubkey())
+        assert!(load_state(&temp("missing.json"), 0, &d.pubkey(), L)
             .unwrap()
             .quotes
             .is_empty());
@@ -1588,13 +1626,16 @@ mod tests {
         let d = dealer();
         let rfq = rfq_for(addr(1), 100, addr(2), addr(9));
         let mut cache = ready_cache();
-        let q = admit(&c, &mut cache, &state, &d, rfq.clone(), 500, 10).unwrap();
+        let q = admit(&c, &mut cache, &state, (&d, L), rfq.clone(), 500, 10).unwrap();
         assert_eq!(q.expiry, 70);
-        assert!(signed_by(&d.pubkey(), &rfq, &q));
-        assert_eq!(load_state(&state, 10, &d.pubkey()).unwrap().quotes.len(), 1);
+        assert!(signed_by(&d.pubkey(), L, &rfq, &q));
+        assert_eq!(
+            load_state(&state, 10, &d.pubkey(), L).unwrap().quotes.len(),
+            1
+        );
 
         let refused = |cache: &mut Cache, rfq: Rfq, buy: u64| {
-            admit(&c, cache, &state, &d, rfq, buy, 10)
+            admit(&c, cache, &state, (&d, L), rfq, buy, 10)
                 .unwrap_err()
                 .to_string()
         };
@@ -1619,7 +1660,7 @@ mod tests {
         assert!(refused(&mut full, rfq.clone(), 5).contains("book full"));
         let before = cache.book.len();
         let unwritable = temp("no-such-dir").join("state.json");
-        let err = admit(&c, &mut cache, &unwritable, &d, rfq, 5, 10).unwrap_err();
+        let err = admit(&c, &mut cache, &unwritable, (&d, L), rfq, 5, 10).unwrap_err();
         assert!(
             format!("{err:#}").contains("save the dealer state"),
             "{err:#}"
@@ -1666,7 +1707,7 @@ mod tests {
         let mut cache = Cache::default();
         let quoted = |cache: &mut Cache, amount| {
             let r = rfq_for(addr(1), amount, addr(2), trader);
-            let q = sign_quote(&d, &r, 50, 10_000).unwrap();
+            let q = sign_quote(&d, L, &r, 50, 10_000).unwrap();
             cache.book.push((r, q));
         };
         let o = |amount| order(trader, addr(1), amount, addr(2), 50, 10_000);

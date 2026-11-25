@@ -31,7 +31,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use keeler_lend_sdk::{builders, purpose, KEEPER};
+use keeler_lend_sdk::{builders, purpose, KEEPERS};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use solana_address::Address;
@@ -54,6 +54,8 @@ const WALLET_SEED: [u8; 32] = *b"keeler lend web test wallet seed";
 const LENDER_SESSION: [u8; 32] = *b"keeler lend web lender session k";
 /// The session text's network name: the Worker's NETWORK, the keeper's `lend.network`.
 const NETWORK: &str = "local";
+/// The page's origin (the test's Vite server), one of the keeper's `lend.origins`.
+const ORIGIN: &str = "http://127.0.0.1:5300";
 const SOL: u64 = 1_000_000_000;
 const USD: u64 = 1_000_000;
 
@@ -195,10 +197,8 @@ impl Stack {
 
         let started = Instant::now();
         loop {
-            let f = session.sign("GET", "/lend/account", &[], self.now()?);
-            let q: Vec<String> = f.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            let path = format!("/lend/account?{}", q.join("&"));
-            let (status, v) = http(url, "GET", &path, key, None)?;
+            let f = session.sign("POST", "/lend/account", &[], self.now()?);
+            let (status, v) = http(url, "POST", "/lend/account", key, Some(&json!(f)))?;
             ensure!(status == 200, "account: {status} {v}");
             if v["receipts"].as_array().is_some_and(|r| !r.is_empty()) {
                 return Ok(json!({"receipts": v["receipts"], "intent": sig.to_string()}));
@@ -254,8 +254,9 @@ impl<'a> Session<'a> {
         f.insert("wallet".to_owned(), self.wallet.pubkey().to_string());
         f.insert("sessionKey".to_owned(), self.key.pubkey().to_string());
         f.insert("sessionExpiry".to_owned(), self.expiry.to_string());
+        f.insert("origin".to_owned(), ORIGIN.to_owned());
         let text = format!(
-            "Keeler Lend: allow this browser session\n\nThis lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.\n\nNetwork: {NETWORK}\nProgram: {}\nWallet: {}\nSession key: {}\nExpires: {} ({})",
+            "Keeler Lend: allow this browser session\n\nThis lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.\n\nNetwork: {NETWORK}\nOrigin: {ORIGIN}\nThe keeper can see your lending amounts.\nProgram: {}\nWallet: {}\nSession key: {}\nExpires: {} ({})",
             keeler_lend_sdk::ID,
             self.wallet.pubkey(),
             self.key.pubkey(),
@@ -425,13 +426,18 @@ fn main() -> Result<()> {
     let keeper_key = fixture::actor(0);
     let admin_key = fixture::actor(3);
     ensure!(
-        keeper_key.pubkey() == KEEPER && admin_key.pubkey() == keeler_lend::ADMIN,
+        keeper_key.pubkey() == KEEPERS[0] && admin_key.pubkey() == keeler_lend::ADMIN,
         "build the program with the default keeper and admin"
     );
-    let keeper = ShieldedKeypair::from_keypair(&keeper_key)?;
+    let keeper = keeler_lend_sdk::fixture_keeper_keypair(&keeper_key)?;
     user_registry::ensure_registered(net.client.rpc(), &keeper_key, &keeper).map_err(err)?;
     write_key(&dir.join("keeper-key.json"), &keeper_key)?;
     write_key(&dir.join("admin-key.json"), &admin_key)?;
+    // The keeper's `lend.pool_key`: the pool viewing key derives from it.
+    write_key(
+        &dir.join("pool-key.json"),
+        &Keypair::new_from_array(keeler_lend_sdk::FIXTURE_POOL_SEED),
+    )?;
     let user_key = Keypair::new_from_array(WALLET_SEED);
     let user = ShieldedKeypair::from_keypair(&user_key)?;
     let tusd = fixture::spl_mint();
@@ -453,7 +459,9 @@ fn main() -> Result<()> {
         "indexerUrl": ports.photon_url(),
         "proverUrl": prover,
         "programId": keeler_lend_sdk::ID.to_string(),
-        "keeper": KEEPER.to_string(),
+        "keeper": KEEPERS[0].to_string(),
+        "keepers": KEEPERS.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+        "poolViewing": hex(&keeler_lend::POOL_VIEWING),
         "helperUrl": format!("http://127.0.0.1:{port}"),
         "tusd": tusd.to_string(),
         "walletSeed": hex(&WALLET_SEED),

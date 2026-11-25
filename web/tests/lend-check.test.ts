@@ -27,6 +27,9 @@ import { ARGS, SLOT, TAG, u64At, u64Bytes } from "../src/keeler/lend-layout";
 
 const PROGRAM = address("A7qaBKJ1gJRcKwMWyyRdr9YhmbBmnMaemM9Sijah3EbC");
 const KEEPER = address("GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq");
+// A second keeper of the compiled set, and one outside it.
+const KEEPER2 = address("F25s3DdjXdCxYBhh2z8FBusVEMT4b9bGNFVKJi3wFoF4");
+const STRANGER = address("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
 const USER = address("AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9");
 const OTHER = address("8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR");
 const TREE = address("SysvarC1ock11111111111111111111111111111111");
@@ -84,7 +87,7 @@ function notes(op: Op): ExpectedNote[] {
 const expected = (op: Op, over: Partial<Expected> = {}): Expected => ({
   op,
   programId: PROGRAM,
-  keeper: KEEPER,
+  keepers: [KEEPER, KEEPER2],
   owner: USER,
   chainNow: NOW,
   spends: RECEIPT_NULLIFIER,
@@ -114,10 +117,15 @@ type Build = {
   /** Replaces what slot `slot` publishes (its ciphertext); null publishes none. */
   data?: (slot: number, honest: Uint8Array) => Uint8Array | null;
   ownerTag?: Uint8Array;
+  /** The keeper that builds, pays and signs (default KEEPER); `named`, the one the reply names (default the same). */
+  keeper?: Address;
+  named?: Address;
+  budget?: Instruction[];
 };
 
 async function build(o: Build = {}) {
   const op = o.op ?? "redeem";
+  const K = o.keeper ?? KEEPER;
   const now = o.now ?? NOW;
   const bound = o.bound ?? (REFERENCE * 99n) / 100n;
   // Every slot holds some hash; the owner's slots hold the honest (or given) notes.
@@ -157,22 +165,22 @@ async function build(o: Build = {}) {
   const data = Uint8Array.of(o.tag ?? (op === "redeem" ? TAG.redeem : TAG.draw), ...args, ...transact);
   const lend: Instruction = {
     programAddress: PROGRAM,
-    accounts: [ws(KEEPER), { address: USER, role: o.ownerRole ?? AccountRole.READONLY_SIGNER }, ...(op === "draw" ? [r(PRICE)] : []), ws(KEEPER), w(TREE), r(SPP), r(SYSTEM), w(TREE), r(OTHER)],
+    accounts: [ws(K), { address: USER, role: o.ownerRole ?? AccountRole.READONLY_SIGNER }, ...(op === "draw" ? [r(PRICE)] : []), ws(K), w(TREE), r(SPP), r(SYSTEM), w(TREE), r(OTHER)],
     data,
   };
-  const budget: Instruction = { programAddress: COMPUTE_BUDGET_PROGRAM, data: Uint8Array.of(2, 0x80, 0x5c, 0x15, 0) };
+  const budget: Instruction[] = o.budget ?? [{ programAddress: COMPUTE_BUDGET_PROGRAM, data: Uint8Array.of(2, 0x80, 0x5c, 0x15, 0) }];
   let message = pipe(
     createTransactionMessage({ version: 0 }),
-    (m) => setTransactionMessageFeePayer(o.feePayer ?? KEEPER, m),
+    (m) => setTransactionMessageFeePayer(o.feePayer ?? K, m),
     (m) =>
       o.nonce
-        ? setTransactionMessageLifetimeUsingDurableNonce({ nonce: "11111111111111111111111111111111" as Nonce, nonceAccountAddress: TREE, nonceAuthorityAddress: KEEPER }, m)
+        ? setTransactionMessageLifetimeUsingDurableNonce({ nonce: "11111111111111111111111111111111" as Nonce, nonceAccountAddress: TREE, nonceAuthorityAddress: K }, m)
         : setTransactionMessageLifetimeUsingBlockhash({ blockhash: "11111111111111111111111111111111" as Blockhash, lastValidBlockHeight: 0n }, m),
-    (m) => appendTransactionMessageInstructions([budget, lend, ...(o.extra ?? [])], m),
+    (m) => appendTransactionMessageInstructions([...budget, lend, ...(o.extra ?? [])], m),
   );
   if (o.lut) message = compressTransactionMessageUsingAddressLookupTables(message, { [SPP]: [OTHER] }) as never;
   const wire = new Uint8Array(getTransactionEncoder().encode(compileTransaction(message as never)));
-  return { transaction: wire, outputs, now, ...(op === "draw" ? { bound } : {}) };
+  return { transaction: wire, outputs, now, keeper: o.named ?? K, ...(op === "draw" ? { bound } : {}) };
 }
 
 const refusal = async (p: Promise<unknown>) => {
@@ -188,6 +196,22 @@ describe("the signing check", () => {
     expect(redeem.firstNullifier).toEqual(RECEIPT_NULLIFIER);
     const draw = await checkKeeperTransaction(await build({ op: "draw" }), expected("draw"), hashing);
     expect(draw.bound).toBe((REFERENCE * 99n) / 100n);
+  });
+
+  it("accepts a build from any compiled keeper, paid and signed by the keeper the reply names", async () => {
+    expect((await checkKeeperTransaction(await build({ keeper: KEEPER2 }), expected("redeem"), hashing)).now).toBe(BigInt(NOW));
+    expect(await refusal(checkKeeperTransaction(await build({ keeper: STRANGER }), expected("redeem"), hashing))).toMatch(/not built with/);
+    // Built by one keeper, named as another: the fee payer must be the keeper the reply names.
+    expect(await refusal(checkKeeperTransaction(await build({ keeper: KEEPER2, named: KEEPER }), expected("redeem"), hashing))).toMatch(/fee payer/);
+    expect(await refusal(checkKeeperTransaction(await build({ keeper: KEEPER2, feePayer: KEEPER }), expected("redeem"), hashing))).toMatch(/fee payer/);
+  });
+
+  it("passes compute-budget instructions that set a unit price and limit", async () => {
+    const price: Instruction = { programAddress: COMPUTE_BUDGET_PROGRAM, data: Uint8Array.of(3, ...u64Bytes(50_000n)) };
+    const units: Instruction = { programAddress: COMPUTE_BUDGET_PROGRAM, data: Uint8Array.of(2, 0x80, 0x5c, 0x15, 0) };
+    expect((await checkKeeperTransaction(await build({ budget: [units, price] }), expected("redeem"), hashing)).now).toBe(BigInt(NOW));
+    const named: Instruction = { ...price, accounts: [w(OTHER)] };
+    expect(await refusal(checkKeeperTransaction(await build({ budget: [named] }), expected("redeem"), hashing))).toMatch(/names accounts/);
   });
 
   it("refuses an added token transfer", async () => {
@@ -293,7 +317,7 @@ describe("the signing check", () => {
 
   it("decodes what the SDK encodes and refuses trailing bytes", async () => {
     const { transaction } = await build();
-    expect(await refusal(checkKeeperTransaction({ transaction: transaction.slice(0, 40), outputs: [], now: NOW }, expected("redeem"), hashing))).toMatch(/decode/);
+    expect(await refusal(checkKeeperTransaction({ transaction: transaction.slice(0, 40), outputs: [], now: NOW, keeper: KEEPER }, expected("redeem"), hashing))).toMatch(/decode/);
     const appended = await build();
     // A lend instruction whose transfer has a byte after it.
     const noisy = pipe(

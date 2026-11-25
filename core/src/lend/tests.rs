@@ -104,7 +104,6 @@ fn sol_liquidation_back_to_the_threshold() {
     let l = liquidate(1_300_000_000, PRICE_SCALE, 10_000_000_000, SOL_150, &V).unwrap();
     // (1300 × 1e4 − 8500 × 1500) × 1e4 / (1e8 − 8500 × 10100) = 176.678... tUSD
     assert_eq!(l.repay, 176_678_442);
-    assert_eq!(l.buffer, 1_766_784);
     let left = collateral_value(l.collateral, SOL_150).unwrap();
     let debt = debt_of(l.debt_shares, PRICE_SCALE).unwrap();
     assert_eq!(debt, 1_300_000_000 - l.repay);
@@ -116,10 +115,7 @@ fn sol_liquidation_back_to_the_threshold() {
 fn sol_liquidation_above_the_max_limit() {
     // 1400 against 1500: 93.3%, the whole debt goes, the rest stays.
     let l = liquidate(1_400_000_000, PRICE_SCALE, 10_000_000_000, SOL_150, &V).unwrap();
-    assert_eq!(
-        (l.repay, l.buffer, l.debt_shares),
-        (1_400_000_000, 14_000_000, 0)
-    );
+    assert_eq!((l.repay, l.debt_shares), (1_400_000_000, 0));
     assert_eq!(l.payout, 9_426_666_666);
     assert_eq!(l.collateral, 573_333_334);
     // 1600 against 1500: bad debt, all collateral that fits is sold.
@@ -279,7 +275,6 @@ fn run(f: &str, i: &Value) -> Value {
         .map(|l| {
             json!({
                 "repay": s(l.repay),
-                "buffer": s(l.buffer),
                 "payout": s(l.payout),
                 "debt_shares": s(l.debt_shares),
                 "collateral": s(l.collateral),
@@ -1146,7 +1141,6 @@ fn liquidation_size_matches_brute_force() {
                     }
                     let l = got.unwrap_or_else(|e| panic!("{e} {v:?} {price} c {c} d {d}"));
                     assert_eq!(l.repay, want, "{v:?} {price} c {c} d {d}");
-                    assert_eq!(l.buffer, want * v.penalty_bps as u64 / BPS);
                     assert_eq!(l.payout + l.collateral, c);
                     assert_eq!(l.debt_shares, d - want);
                 }

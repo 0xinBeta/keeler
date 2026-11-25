@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context, Result};
 use keeler_lend::{instructions::cancel_intent::CancelIntentArgs, USER_SEED};
 use keeler_lend_sdk::{
-    builders, decode, pool_pda, purpose, user_pda, IntentState, ReserveState, ADMIN, KEEPER,
+    builders, decode, pool_pda, purpose, user_pda, IntentState, ReserveState, ADMIN, KEEPERS,
 };
 use solana_address::Address;
 use solana_signer::Signer;
@@ -95,10 +95,10 @@ fn reserve_intent_and_cancel() -> Result<()> {
     let user_key = fixture::actor(1);
     let admin_key = fixture::actor(3);
     ensure!(
-        keeper_key.pubkey() == KEEPER && admin_key.pubkey() == ADMIN,
+        keeper_key.pubkey() == KEEPERS[0] && admin_key.pubkey() == ADMIN,
         "build with the default keeper and admin"
     );
-    let keeper = ShieldedKeypair::from_keypair(&keeper_key)?;
+    let keeper = keeler_lend_sdk::fixture_keeper_keypair(&keeper_key)?;
     let user = ShieldedKeypair::from_keypair(&user_key)?;
     let indexer = localnet.client.indexer();
     let rpc = localnet.client.rpc();

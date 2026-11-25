@@ -111,7 +111,7 @@ export type Vault = {
   liquidationThresholdBps: number;
   /** Above this loan-to-value a liquidation repays the whole debt. */
   liquidationMaxLimitBps: number;
-  /** Extra collateral sold on a liquidation, as a share of the debt repaid; it stays in the pool's buffer. */
+  /** Extra collateral sold on a liquidation, as a share of the debt repaid; it goes to the keeper that liquidates. */
   penaltyBps: number;
   /** Base units of `collateral`. */
   minCollateral: bigint;
@@ -140,6 +140,9 @@ export type Liquidation = {
   collateralSold: bigint;
   /** The price bound it was sold at, 1e12-scaled. */
   price: bigint;
+  /** What the liquidation itself left, before anything the owner did after it. */
+  collateralLeft: bigint;
+  debtLeft: bigint;
 };
 
 /** A borrowing position. Health and liquidation price are not here: the page computes them from the vault's price. */
@@ -186,6 +189,8 @@ export type LendOperation = {
 export type LendAccount = {
   receipts: Receipt[];
   positions: Position[];
+  /** Positions a full liquidation left with no collateral and no debt, so they are gone; each with its `lastLiquidation`. */
+  emptied: Position[];
   /** Newest first. */
   operations: LendOperation[];
   /** Chain time the values above were computed at. */

@@ -42,6 +42,7 @@ fn devnet_pool_interface_takes_any_authority() {
         prover: Prover::Helius {
             keychain: "keeler-helius-api-key".into(),
         },
+        priority_fee: 0,
     };
     let (url, _) = net.urls().unwrap();
     let rpc = SolanaRpc::new(url.clone());

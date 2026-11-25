@@ -31,7 +31,7 @@ pub const VERIFYINGKEY: Groth16Verifyingkey = Groth16Verifyingkey {
 /// SHA-256 of the proving key file this verifying key was generated with.
 #[allow(dead_code)]
 #[rustfmt::skip]
-pub const VERIFYINGKEY_PROVING_KEY_SHA256: [u8; 32] = [60u8, 4u8, 14u8, 103u8, 128u8, 146u8, 12u8, 54u8, 115u8, 250u8, 42u8, 240u8, 192u8, 159u8, 28u8, 2u8, 41u8, 91u8, 250u8, 34u8, 182u8, 134u8, 27u8, 213u8, 245u8, 236u8, 69u8, 20u8, 3u8, 73u8, 229u8, 48u8];
+pub const VERIFYINGKEY_PROVING_KEY_SHA256: [u8; 32] = [160u8, 167u8, 235u8, 41u8, 221u8, 65u8, 0u8, 246u8, 178u8, 73u8, 162u8, 200u8, 169u8, 32u8, 37u8, 78u8, 173u8, 108u8, 134u8, 123u8, 220u8, 71u8, 11u8, 21u8, 101u8, 64u8, 244u8, 35u8, 207u8, 95u8, 144u8, 92u8];
 
 /// `true` for a test setup whose secret randomness is public or untrusted:
 /// whoever knows it can make this key accept a proof for any public
@@ -43,11 +43,11 @@ pub const VERIFYINGKEY_INSECURE_TEST_SETUP: bool = true;
 /// The two consts above as a delimited string, exported so it stays in
 /// the program binary; read it back with
 /// `groth16_solana::vk::setup::find_setup_txts`.
-#[unsafe(export_name = "groth16_solana_vk_setup_033058c40d8c89b6")]
+#[unsafe(export_name = "groth16_solana_vk_setup_7b795a60451883d5")]
 #[rustfmt::skip]
-pub static VERIFYINGKEY_SETUP_TXT: &str = "=======BEGIN GROTH16 VK SETUP V1=======\x00name\x00VERIFYINGKEY\x00insecure_test_setup\x00true\x00proving_key_sha256\x003c040e6780920c3673fa2af0c09f1c02295bfa22b6861bd5f5ec45140349e530\x00=======END GROTH16 VK SETUP V1=======\x00";
+pub static VERIFYINGKEY_SETUP_TXT: &str = "=======BEGIN GROTH16 VK SETUP V1=======\x00name\x00VERIFYINGKEY\x00insecure_test_setup\x00true\x00proving_key_sha256\x00a0a7eb29dd4100f6b249a2c8a920254ead6c867bdc470b156540f423cf5f905c\x00=======END GROTH16 VK SETUP V1=======\x00";
 
 #[cfg(not(feature = "insecure-test-setup"))]
 compile_error!("VERIFYINGKEY comes from an insecure test setup: whoever knows its setup randomness can make it accept a proof for any public inputs. Enable the `insecure-test-setup` feature only in test builds, not for a devnet or mainnet deployment.");
 pub const ZOLANA_VK_SHA256: &str = "5c233be2e5736ea8a8b480870c1177cdb693a3f9800b19b03ec4874ef4a57367";
-pub const ZOLANA_CIRCUIT_DIGEST: &str = "a2b815ce54f0d7f88ef247e3a5ec34c0";
+pub const ZOLANA_CIRCUIT_DIGEST: &str = "1e303114212805f071818ddc0167ab75";

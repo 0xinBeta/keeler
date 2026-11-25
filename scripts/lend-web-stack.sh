@@ -11,6 +11,7 @@
 #
 #   scripts/lend-web-stack.sh start|stop|keeper-stop|keeper-start
 # keeper-stop and keeper-start stop and restart only the keeper (the test's keeper-offline case).
+# The keeper is the first fixture keeper under the fixture pool key (web_stack writes both).
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 main=$(git -C "$root" worktree list --porcelain | awk '/^worktree /{print $2; exit}')
@@ -122,6 +123,9 @@ console.log(JSON.stringify({
   lend: {
     program_id: s.programId,
     network: "local",
+    // The test's Vite server, as the page's sessions name it.
+    origins: ["http://127.0.0.1:5300"],
+    pool_key: { file: `${dir}/pool-key.json` },
     admin_key: { file: `${dir}/admin-key.json` },
     state_file: `${dir}/keeper-state.json`,
     pause_file: `${dir}/lend.pause`,

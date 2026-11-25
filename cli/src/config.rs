@@ -18,6 +18,10 @@ pub enum KeySource {
 }
 
 impl KeySource {
+    pub fn is_file(&self) -> bool {
+        matches!(self, KeySource::File(_))
+    }
+
     pub fn secret(&self) -> Result<String> {
         Ok(match self {
             KeySource::File(path) => std::fs::read_to_string(path)
@@ -47,11 +51,18 @@ pub enum Prover {
     Helius { keychain: String },
 }
 
+/// The highest priority fee a config may set, micro-lamports per compute
+/// unit: 7,000,000 lamports (0.007 SOL) on a 1.4M-unit transaction.
+pub const MAX_PRIORITY_FEE: u64 = 5_000_000;
+
 #[derive(Clone, Deserialize)]
 pub struct Network {
     pub rpc_url: String,
     pub indexer_url: String,
     pub prover: Prover,
+    /// Micro-lamports per compute unit on every transaction sent; default 0.
+    #[serde(default)]
+    pub priority_fee: u64,
 }
 
 impl Network {
@@ -60,6 +71,7 @@ impl Network {
             rpc_url,
             indexer_url,
             prover: Prover::Local,
+            priority_fee: 0,
         }
     }
 
@@ -81,7 +93,11 @@ impl Network {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    pub fn check(&self) -> Result<()> {
+        ensure!(
+            self.priority_fee <= MAX_PRIORITY_FEE,
+            "network.priority_fee must be at most {MAX_PRIORITY_FEE} micro-lamports per compute unit"
+        );
         if let Prover::Helius { .. } = self.prover {
             for url in [&self.rpc_url, &self.indexer_url] {
                 ensure!(
@@ -644,6 +660,7 @@ mod tests {
             prover: Prover::Helius {
                 keychain: "k".into(),
             },
+            priority_fee: 0,
         };
         assert!(net("https://devnet.helius-rpc.com").check().is_ok());
         assert!(net("http://devnet.helius-rpc.com").check().is_err());
@@ -708,6 +725,7 @@ mod tests {
             prover: Prover::Helius {
                 keychain: "keeler-helius-api-key".into(),
             },
+            priority_fee: 0,
         };
         let (rpc_url, _) = net.urls().unwrap();
         let common = Common {

@@ -33,6 +33,8 @@ pub enum LendError {
     InvalidAccounts = 20_008,
     /// A mint other than the pool's.
     UnknownMint = 20_009,
+    /// A `pool_viewing` argument other than the compiled `POOL_VIEWING`.
+    WrongPoolViewing = 20_010,
 
     // cancel_intent.
     /// Cancel is allowed only after the intent's expiry.

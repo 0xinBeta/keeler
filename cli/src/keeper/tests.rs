@@ -12,6 +12,7 @@ const USD: u64 = 1_000_000;
 const SOL: u64 = 1_000_000_000;
 const DOLLAR: u64 = 1_000_000_000;
 const NET: &str = "localnet";
+const ORIGIN: &str = "http://127.0.0.1:5300";
 
 #[derive(Default)]
 struct World {
@@ -29,6 +30,8 @@ struct World {
     /// Sends land unless this is set.
     hold: bool,
     history: Vec<Note>,
+    /// What other keepers paid for, by keeper.
+    peer_history: HashMap<Address, Vec<Note>>,
     next: u64,
     /// Checked at each send: the state file must already hold the build.
     state: Option<PathBuf>,
@@ -41,6 +44,13 @@ struct World {
     /// The `after` of each history and intents read.
     history_after: Vec<Option<String>>,
     intents_after: Vec<Option<String>>,
+    /// The keeper's own debt token, and how often it was read.
+    held: u64,
+    held_reads: u32,
+    /// History reads of peers fail.
+    peer_history_fails: bool,
+    /// This keeper's own history read past its mark ("mark") is empty.
+    history_honours_mark: bool,
 }
 
 #[derive(Default)]
@@ -313,7 +323,11 @@ impl Ledger for Fake {
                     vec![res.nullifier.clone(), receipt.nullifier.clone()],
                     vec![
                         new_reserve(res.amount - amount, -(*amount as i64), 0)?,
-                        receipt_note(&wallet, 0, n + 2),
+                        receipt_note(
+                            &wallet,
+                            receipt.state::<ReceiptState>()?.supply_shares - amount,
+                            n + 2,
+                        ),
                     ],
                 )
             }
@@ -390,16 +404,37 @@ impl Ledger for Fake {
         }
         Ok("sig".into())
     }
-    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+    fn debt_held(&self) -> Result<u64> {
         let mut w = self.w();
+        w.held_reads += 1;
+        Ok(w.held)
+    }
+    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+        let mut w = self.w();
+        if let Some(list) = w.peer_history.get(payer) {
+            if w.peer_history_fails {
+                bail!("the RPC does not have a peer's transaction");
+            }
+            // A peer's mark moves with each note it adds.
+            let mark = format!("peer-{}", list.len());
+            let new = if after == Some(mark.as_str()) {
+                Vec::new()
+            } else {
+                list.clone()
+            };
+            return Ok((new, Some(mark)));
+        }
         w.history_after.push(after.map(str::to_owned));
+        if w.history_honours_mark && after == Some("mark") {
+            return Ok((Vec::new(), Some("mark".into())));
+        }
         Ok((w.history.clone(), Some("mark".into())))
     }
 }
 
 fn lend_cfg(extra: &str) -> Lend {
     serde_json::from_str(&format!(
-        r#"{{"program_id":"{}","network":"{NET}"{extra}}}"#,
+        r#"{{"program_id":"{}","network":"{NET}","origins":["{ORIGIN}"]{extra}}}"#,
         keeler_lend::ID
     ))
     .unwrap()
@@ -442,8 +477,10 @@ impl User {
         f.insert("wallet".into(), self.addr().to_string());
         f.insert("sessionKey".into(), self.session.pubkey().to_string());
         f.insert("sessionExpiry".into(), self.expiry.to_string());
+        f.insert("origin".into(), ORIGIN.into());
         let text = lend_auth::authorisation_text(
             NET,
+            ORIGIN,
             &keeler_lend::ID,
             &self.addr(),
             &self.session.pubkey(),
@@ -472,9 +509,21 @@ fn body(f: &BTreeMap<String, String>) -> Vec<u8> {
     serde_json::to_vec(f).unwrap()
 }
 
-fn query(f: &BTreeMap<String, String>) -> String {
-    let q: Vec<String> = f.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    format!("/lend/account?{}", q.join("&"))
+/// An account read, as the page posts it, with the tickets it holds.
+fn account_with(k: &Keeper<Fake>, u: &User, tickets: Value) -> (u16, Value) {
+    let f = u.signed("POST", "/lend/account", &[], now_of(k));
+    let mut b = serde_json::to_value(&f).unwrap();
+    b["tickets"] = tickets;
+    k.http(
+        "POST",
+        "/lend/account",
+        &serde_json::to_vec(&b).unwrap(),
+        false,
+    )
+}
+
+fn account(k: &Keeper<Fake>, u: &User) -> (u16, Value) {
+    account_with(k, u, json!([]))
 }
 
 struct Setup {
@@ -483,6 +532,8 @@ struct Setup {
     signer: Keypair,
     state: PathBuf,
     dir: PathBuf,
+    /// The other keepers of the set.
+    set: Vec<Address>,
 }
 
 impl Setup {
@@ -507,11 +558,19 @@ impl Setup {
             signer: Keypair::new(),
             state,
             dir,
+            set: Vec::new(),
         }
     }
 
     fn keeper(&self) -> Keeper<'_, Fake> {
-        Keeper::open(&self.cfg, &self.fake, &self.signer, self.state.clone()).unwrap()
+        Keeper::open_in(
+            &self.cfg,
+            &self.fake,
+            &self.signer,
+            self.state.clone(),
+            &self.set,
+        )
+        .unwrap()
     }
 
     fn user(&self) -> User {
@@ -536,7 +595,7 @@ fn now_of(k: &Keeper<Fake>) -> u64 {
 
 fn ticket(k: &Keeper<Fake>, u: &User, extra: &[(&str, String)]) -> (u16, Value) {
     let f = u.signed("POST", "/lend/ticket", extra, now_of(k));
-    k.http("POST", "/lend/ticket", &body(&f))
+    k.http("POST", "/lend/ticket", &body(&f), false)
 }
 
 fn supply_ticket(k: &Keeper<Fake>, u: &User, amount: u64) -> (u16, Value) {
@@ -579,7 +638,7 @@ fn repay_ticket(k: &Keeper<Fake>, u: &User, position: u64, amount: u64) -> (u16,
 
 fn build_req(k: &Keeper<Fake>, u: &User, extra: &[(&str, String)]) -> (u16, Value) {
     let f = u.signed("POST", "/lend/build", extra, now_of(k));
-    k.http("POST", "/lend/build", &body(&f))
+    k.http("POST", "/lend/build", &body(&f), false)
 }
 
 fn draw(k: &Keeper<Fake>, u: &User, position: u64, borrow: u64) -> (u16, Value) {
@@ -682,7 +741,7 @@ fn tickets_are_signed_saved_and_limited() {
     );
     let sig: [u8; 64] = hex_bytes(v["signature"].as_str().unwrap()).unwrap();
     assert!(lend_auth::ticket_signed_by(&s.signer.pubkey(), &m, &sig));
-    let saved = load_book(&s.state, &s.signer.pubkey(), &keeler_lend::ID).unwrap();
+    let saved = load_book(&s.state, &[s.signer.pubkey()], &keeler_lend::ID).unwrap();
     assert_eq!(saved.tickets.len(), 1);
     // Two open at a time per wallet, three an hour; the 422 above did not
     // count.
@@ -734,20 +793,23 @@ fn signed_requests_refuse_replay_stale_expired_forged_and_unknown_fields() {
         ("amount", (2 * USD).to_string()),
     ];
     let f = u.signed("POST", "/lend/ticket", &extra, T0);
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&f)).0, 200);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&f), false).0, 200);
     assert_eq!(
-        k.http("POST", "/lend/ticket", &body(&f)).0,
+        k.http("POST", "/lend/ticket", &body(&f), false).0,
         401,
         "replayed nonce"
     );
     let stale = u.signed("POST", "/lend/ticket", &extra, T0 - 121);
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&stale)).0, 401);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&stale), false).0, 401);
     // A request signed for another path does not verify here.
     let other_path = u.signed("POST", "/lend/build", &extra, T0);
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&other_path)).0, 401);
+    assert_eq!(
+        k.http("POST", "/lend/ticket", &body(&other_path), false).0,
+        401
+    );
     let mut forged = u.signed("POST", "/lend/ticket", &extra, T0);
     forged.insert("amount".into(), (3 * USD).to_string());
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&forged)).0, 401);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&forged), false).0, 401);
     let mut expired = User::new(T0);
     expired.expiry = T0;
     s.fake.w().registered.insert(expired.addr());
@@ -755,7 +817,8 @@ fn signed_requests_refuse_replay_stale_expired_forged_and_unknown_fields() {
         k.http(
             "POST",
             "/lend/ticket",
-            &body(&expired.signed("POST", "/lend/ticket", &extra, T0))
+            &body(&expired.signed("POST", "/lend/ticket", &extra, T0)),
+            false
         )
         .0,
         401
@@ -764,20 +827,21 @@ fn signed_requests_refuse_replay_stale_expired_forged_and_unknown_fields() {
     let mut stolen = u.signed("POST", "/lend/ticket", &extra, T0);
     let thief = User::new(T0);
     stolen.insert("wallet".into(), thief.addr().to_string());
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&stolen)).0, 401);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&stolen), false).0, 401);
     let mut extra2 = extra.to_vec();
     extra2.push(("memo", "x".into()));
     assert_eq!(
         k.http(
             "POST",
             "/lend/ticket",
-            &body(&u.signed("POST", "/lend/ticket", &extra2, T0))
+            &body(&u.signed("POST", "/lend/ticket", &extra2, T0)),
+            false
         )
         .0,
         400
     );
-    assert_eq!(k.http("POST", "/lend/ticket", b"not json").0, 400);
-    assert_eq!(k.http("GET", "/lend/nothing", b"").0, 404);
+    assert_eq!(k.http("POST", "/lend/ticket", b"not json", false).0, 400);
+    assert_eq!(k.http("GET", "/lend/nothing", b"", false).0, 404);
 }
 
 #[test]
@@ -944,8 +1008,8 @@ fn owner_builds_check_ownership_health_and_reserve_the_pool() {
     assert_eq!(draw(&k, &a, 1, 8 * USD).0, 423);
     assert_eq!(draw(&k, &a, 1, USD / 2).0, 422);
     assert_eq!(redeem(&k, &lender, 101 * USD).0, 422);
-    // Stale price.
-    s.fake.w().quote.as_mut().unwrap().published = (T0 - 61) as i64;
+    // Stale price: draws allow 65 s.
+    s.fake.w().quote.as_mut().unwrap().published = (T0 - 66) as i64;
     assert_eq!(draw(&k, &a, 1, USD).0, 412);
     s.fake.w().quote.as_mut().unwrap().published = T0 as i64;
     // A good draw: the reply carries what the page checks.
@@ -1100,8 +1164,7 @@ fn redeem_spends_the_receipt_the_page_names() {
     assert_eq!(st, 200, "{v}");
     assert_eq!(k.snapshot().unwrap().pending[0].inputs[1], big.nullifier);
     // The account view states the pool's indices at chain time.
-    let f = lender.signed("GET", "/lend/account", &[], now_of(&k));
-    let (st, v) = k.http("GET", &query(&f), b"");
+    let (st, v) = account(&k, &lender);
     assert_eq!(st, 200, "{v}");
     assert_eq!(v["index"]["supply"], json!("1000000000000"));
     assert_eq!(v["index"]["at"], json!(now_of(&k)));
@@ -1163,7 +1226,7 @@ fn restarts_recover_from_the_file_and_the_chain() {
         assert_eq!(k.snapshot().unwrap().pending.len(), 1);
     }
     // It landed while the keeper was down.
-    let p = load_book(&s.state, &s.signer.pubkey(), &keeler_lend::ID)
+    let p = load_book(&s.state, &[s.signer.pubkey()], &keeler_lend::ID)
         .unwrap()
         .pending[0]
         .clone();
@@ -1183,7 +1246,7 @@ fn restarts_recover_from_the_file_and_the_chain() {
     drop(k);
     // Killed between recording and sending: the build never lands and is
     // dropped after its window; the ticket is filled on a retry.
-    let mut book = load_book(&s.state, &s.signer.pubkey(), &keeler_lend::ID).unwrap();
+    let mut book = load_book(&s.state, &[s.signer.pubkey()], &keeler_lend::ID).unwrap();
     let mut ghost = p.clone();
     ghost.inputs = vec![book.reserve.as_ref().unwrap().nullifier.clone()];
     ghost.spends = ghost.inputs.first().cloned();
@@ -1229,7 +1292,7 @@ fn restarts_recover_from_the_file_and_the_chain() {
         .w()
         .history
         .push(reserve_note(&fresh_reserve(0, 0), 0, 99_999));
-    assert!(Keeper::open(&s.cfg, &s.fake, &s.signer, s.state.clone()).is_err());
+    assert!(Keeper::open_in(&s.cfg, &s.fake, &s.signer, s.state.clone(), &s.set).is_err());
 }
 
 #[test]
@@ -1242,8 +1305,7 @@ fn account_and_pools_views() {
     drain(&k);
     let (_, v) = repay_ticket(&k, &a, 7, USD);
     assert!(v["error"].is_string(), "no debt to repay");
-    let f = a.signed("GET", "/lend/account", &[], now_of(&k));
-    let (st, v) = k.http("GET", &query(&f), b"");
+    let (st, v) = account(&k, &a);
     assert_eq!(st, 200, "{v}");
     assert_eq!(v["receipts"], json!([]));
     assert_eq!(v["positions"][0]["position"], json!("7"));
@@ -1253,15 +1315,13 @@ fn account_and_pools_views() {
         .unwrap();
     assert_eq!(&m[..8], &SOL.to_le_bytes());
     assert_eq!(v["intents"][0]["status"], json!("filled"));
-    let f = lender.signed("GET", "/lend/account", &[], now_of(&k));
-    let (_, v) = k.http("GET", &query(&f), b"");
+    let (_, v) = account(&k, &lender);
     assert_eq!(v["positions"], json!([]));
     assert_eq!(v["receipts"][0]["shares"], json!((100 * USD).to_string()));
     // A ticket never used turns refundable after its expiry.
     let (_, t) = supply_ticket(&k, &lender, 2 * USD);
     s.fake.advance(601);
-    let f = lender.signed("GET", "/lend/account", &[], now_of(&k));
-    let (_, v) = k.http("GET", &query(&f), b"");
+    let (_, v) = account(&k, &lender);
     let i = v["intents"]
         .as_array()
         .unwrap()
@@ -1271,7 +1331,7 @@ fn account_and_pools_views() {
         .clone();
     assert_eq!(i["status"], json!("refundable"));
     // Pools: coarse and bucketed.
-    let (st, v) = k.http("GET", "/lend/pools", b"");
+    let (st, v) = k.http("GET", "/lend/pools", b"", false);
     assert_eq!(st, 200);
     let p = &v["pools"][0];
     assert_eq!(p["size"], json!("100000000"));
@@ -1279,7 +1339,7 @@ fn account_and_pools_views() {
     let first = v.clone();
     s.fake.advance(1);
     assert_eq!(
-        k.http("GET", "/lend/pools", b"").1,
+        k.http("GET", "/lend/pools", b"", false).1,
         first,
         "same bucket, same figures"
     );
@@ -1651,7 +1711,14 @@ fn one_keeper_per_state_file() {
 fn history_and_intent_scans_go_on_from_their_marks() {
     let s = Setup::new("marks", "");
     let k = s.keeper();
-    assert_eq!(k.snapshot().unwrap().scanned.as_deref(), Some("mark"));
+    assert_eq!(
+        k.snapshot()
+            .unwrap()
+            .scanned
+            .get(&s.signer.pubkey().to_string())
+            .map(String::as_str),
+        Some("mark")
+    );
     drop(k);
     let k = s.keeper();
     assert_eq!(s.fake.w().history_after, vec![None, Some("mark".into())]);
@@ -1667,9 +1734,16 @@ fn the_slot_answers_503_until_the_keeper_is_up() {
     let s = Setup::new("slot", "");
     let cell = OnceLock::new();
     let slot = Slot(&cell);
-    assert_eq!(slot.lend("GET", "/lend/pools", b"").0, 503);
+    let (st, v) = slot.lend("GET", "/lend/pools", b"", false);
+    // No `error` field: the Worker tries the next keeper.
+    assert_eq!(st, 503);
+    assert_eq!(
+        v.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["starting"]
+    );
+    assert!(v["starting"].is_string());
     assert!(cell.set(s.keeper()).is_ok());
-    assert_eq!(slot.lend("GET", "/lend/pools", b"").0, 200);
+    assert_eq!(slot.lend("GET", "/lend/pools", b"", false).0, 200);
 }
 
 #[test]
@@ -1681,4 +1755,697 @@ fn coarse_up_rounds_up_to_two_figures() {
     assert_eq!(coarse_up(5_005_000), 5_100_000);
     assert_eq!(coarse_up(5_000_000), 5_000_000);
     assert_eq!(coarse_up(u64::MAX), u64::MAX);
+}
+
+/// What `k` holds now, as the chain's history would show it to anyone.
+fn publish_notes(s: &Setup, k: &Keeper<Fake>) {
+    let b = k.snapshot().unwrap();
+    s.fake.w().history = b
+        .reserve
+        .iter()
+        .chain(&b.receipts)
+        .chain(&b.positions)
+        .cloned()
+        .collect();
+}
+
+/// A supply ticket as the page holds it: the request and the reply.
+fn held_supply(reply: &Value, amount: u64) -> Value {
+    json!({
+        "id": reply["id"],
+        "expiry": reply["expiry"],
+        "signature": reply["signature"],
+        "keeper": reply["keeper"],
+        "purpose": "supply",
+        "pool": vault1().debt_mint.to_string(),
+        "amount": amount.to_string(),
+    })
+}
+
+#[test]
+fn a_peer_takes_on_a_ticket_and_the_issuer_closes_it() {
+    let s = Setup::new("peers", "");
+    let a = s.keeper();
+    with_liquidity(&s, &a);
+    publish_notes(&s, &a);
+    let b_key = Keypair::new();
+    let b = Keeper::open_in(
+        &s.cfg,
+        &s.fake,
+        &b_key,
+        s.dir.join("b.json"),
+        &[s.signer.pubkey()],
+    )
+    .unwrap();
+    assert!(b.snapshot().unwrap().reserve.is_some(), "b sees a's pool");
+    let u = s.user();
+    let (st, reply) = supply_ticket(&a, &u, 3 * USD);
+    assert_eq!(st, 200, "{reply}");
+    assert_eq!(reply["keeper"], json!(s.signer.pubkey().to_string()));
+    let held = held_supply(&reply, 3 * USD);
+    // Forged, tampered, too long-lived, or too many: nothing is taken on.
+    let mut stranger = held.clone();
+    stranger["keeper"] = json!(Keypair::new().pubkey().to_string());
+    let mut more = held.clone();
+    more["amount"] = json!((30 * USD).to_string());
+    let mut late = held.clone();
+    late["expiry"] = json!(now_of(&b) + 901);
+    let (st, v) = account_with(&b, &u, json!([stranger, more, late]));
+    assert_eq!(st, 200, "{v}");
+    assert!(b.snapshot().unwrap().tickets.is_empty());
+    assert_eq!(account_with(&b, &u, json!(vec![held.clone(); 9])).0, 400);
+    // The real one: b keeps it, a's signature and all.
+    assert_eq!(account_with(&b, &u, json!([held.clone()])).0, 200);
+    let t = b.snapshot().unwrap().tickets;
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].keeper, Some(s.signer.pubkey().to_string()));
+    // Both race to fill it; b's lands.
+    s.fake.add_intent(
+        &u.addr(),
+        purpose::SUPPLY,
+        1,
+        3 * USD,
+        reply["expiry"].as_u64().unwrap(),
+    );
+    s.fake.w().hold = true;
+    assert_eq!(drain(&b), vec![Op::Supply]);
+    assert_eq!(drain(&a), vec![Op::Supply]);
+    let won = b.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&won);
+    s.fake.w().hold = false;
+    b.resolve().unwrap();
+    publish_notes(&s, &b);
+    assert!(drain(&a).is_empty());
+    assert!(
+        a.snapshot().unwrap().pending.is_empty(),
+        "a's build lost the reserve"
+    );
+    // After the backoff a looks again and finds the intent spent.
+    s.fake.advance(RETRY_SECS << 1);
+    assert!(drain(&a).is_empty());
+    let id = reply["id"].as_str().unwrap();
+    let book = a.snapshot().unwrap();
+    assert_eq!(ticket_of(&book, id).status, TicketStatus::Filled);
+    let theirs = b.snapshot().unwrap();
+    assert_eq!(book.reserve, theirs.reserve, "a follows b's reserve");
+    assert_eq!(ticket_of(&theirs, id).status, TicketStatus::Filled);
+}
+
+#[test]
+fn a_standby_liquidates_after_its_grace() {
+    let s = Setup::new("standby", r#","role":"standby","standby_grace_secs":30"#);
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    let price = |dollars: u64| {
+        let now = now_of(&k) as i64;
+        s.fake.w().quote = Some(Quote {
+            low: dollars * DOLLAR,
+            high: dollars * DOLLAR + 1,
+            published: now,
+        });
+    };
+    price(8);
+    assert!(drain(&k).is_empty(), "the grace starts");
+    s.fake.advance(20);
+    price(10);
+    assert!(drain(&k).is_empty(), "healthy again: the grace restarts");
+    s.fake.advance(1);
+    price(8);
+    drain(&k);
+    s.fake.advance(29);
+    price(8);
+    assert!(drain(&k).is_empty(), "29 s past");
+    s.fake.advance(1);
+    price(8);
+    assert_eq!(drain(&k), vec![Op::Liquidate]);
+}
+
+#[test]
+fn bad_debt_beyond_the_surplus_halts_borrowing() {
+    let s = Setup::new("bad-debt", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    let c = s.user();
+    fund_intent(&s, &k, &c, purpose::DEPOSIT, 3, 10 * SOL);
+    drain(&k);
+    let pools = k.http("GET", "/lend/pools", b"", false).1;
+    assert_eq!(pools["pools"][0]["badDebt"], json!("0"));
+    // The first position is worth $5 against $7 of debt, and cannot be
+    // liquidated.
+    s.fake.w().fail.push(Op::Liquidate);
+    s.fake.w().quote = Some(Quote {
+        low: 5 * DOLLAR,
+        high: 5 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    drain(&k);
+    let (st, v) = draw(&k, &c, 3, USD);
+    assert_eq!(st, 403, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("bad debt"));
+    // The price back up: borrowing resumes.
+    s.fake.w().quote = Some(Quote {
+        low: 10 * DOLLAR,
+        high: 10 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    drain(&k);
+    assert_eq!(draw(&k, &c, 3, USD).0, 200);
+}
+
+#[test]
+fn an_old_single_scan_mark_is_this_keepers() {
+    let s = Setup::new("old-mark", "");
+    let old = json!({"reserve":null,"receipts":[],"positions":[],"tickets":[],
+        "pending":[],"reservation":null,"scanned":"m1"});
+    std::fs::write(&s.state, serde_json::to_vec(&old).unwrap()).unwrap();
+    let k = s.keeper();
+    assert_eq!(s.fake.w().history_after[0].as_deref(), Some("m1"));
+    let marks = k.snapshot().unwrap().scanned;
+    assert_eq!(
+        marks.keys().collect::<Vec<_>>(),
+        [&s.signer.pubkey().to_string()]
+    );
+}
+
+#[test]
+fn the_chain_must_be_the_network_named() {
+    use crate::chain::Cluster;
+    assert!(check_cluster(&lend_cfg(""), Cluster::Local).is_ok());
+    assert!(check_cluster(&lend_cfg(""), Cluster::Devnet).is_err());
+    let mut dev = lend_cfg("");
+    dev.network = "devnet".into();
+    assert!(check_cluster(&dev, Cluster::Devnet).is_ok());
+    assert!(check_cluster(&dev, Cluster::Mainnet).is_err());
+}
+
+#[test]
+fn caps_count_funded_tickets_and_hold_at_fill() {
+    let s = Setup::new(
+        "caps",
+        r#","limits":{"max_pool_size":110000000,"max_supply_per_wallet":105000000,"max_total_collateral":3000000000,"max_position_collateral":2000000000,"max_position_debt":6000000,"min_position_debt":2000000}"#,
+    );
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    // Pool 100 of 110; the lender has 100 of 105, and its own tickets count.
+    assert_eq!(supply_ticket(&k, &lender, 6 * USD).0, 422, "per wallet");
+    fund_intent(&s, &k, &lender, purpose::SUPPLY, 1, 5 * USD);
+    assert_eq!(
+        supply_ticket(&k, &lender, USD).0,
+        422,
+        "its own open ticket"
+    );
+    // Another wallet's ticket with no intent on chain blocks nobody.
+    let other = s.user();
+    let (st, idle) = supply_ticket(&k, &other, 6 * USD);
+    assert_eq!(st, 200, "{idle}");
+    // Once the lender's intent is seen, its ticket counts for everyone.
+    s.pause(true);
+    k.step().unwrap();
+    s.pause(false);
+    assert_eq!(
+        supply_ticket(&k, &s.user(), 6 * USD).0,
+        422,
+        "a funded ticket"
+    );
+    assert_eq!(drain(&k), vec![Op::Supply]);
+    // At 105, the other's 6, funded late, no longer fits.
+    let expiry = idle["expiry"].as_u64().unwrap();
+    s.fake
+        .add_intent(&other.addr(), purpose::SUPPLY, 1, 6 * USD, expiry);
+    assert!(drain(&k).is_empty(), "the pool size at fill");
+
+    let a = s.user();
+    assert_eq!(
+        deposit_ticket(&k, &a, 1, 2 * SOL + 1).0,
+        422,
+        "per position"
+    );
+    fund_intent(&s, &k, &a, purpose::DEPOSIT, 1, 2 * SOL);
+    assert_eq!(
+        deposit_ticket(&k, &a, 2, SOL + 1).0,
+        422,
+        "its own tickets, in total"
+    );
+    let b = s.user();
+    let (st, late) = deposit_ticket(&k, &b, 1, SOL + 1);
+    assert_eq!(st, 200, "another's unfunded ticket does not count: {late}");
+    assert_eq!(drain(&k), vec![Op::DepositOpen]);
+    let c = s.user();
+    fund_intent(&s, &k, &c, purpose::DEPOSIT, 1, SOL);
+    assert_eq!(drain(&k), vec![Op::DepositOpen]);
+    // The vault holds its 3 SOL: no new position, but a top-up, which may
+    // save a position, is never held to the total.
+    assert_eq!(
+        deposit_ticket(&k, &s.user(), 1, SOL / 10).0,
+        422,
+        "in total"
+    );
+    fund_intent(&s, &k, &c, purpose::DEPOSIT, 1, SOL / 2);
+    assert_eq!(drain(&k), vec![Op::DepositAdd]);
+    // b's, funded now, no longer fits at fill.
+    let expiry = late["expiry"].as_u64().unwrap();
+    s.fake
+        .add_intent(&b.addr(), purpose::DEPOSIT, 1, SOL + 1, expiry);
+    assert!(drain(&k).is_empty(), "the collateral caps at fill");
+    assert_eq!(draw(&k, &a, 1, USD).0, 422, "below the minimum debt");
+    assert_eq!(draw(&k, &a, 1, 7 * USD).0, 422, "above the most debt");
+    assert_eq!(draw(&k, &a, 1, 6 * USD).0, 200);
+}
+
+#[test]
+fn the_minimum_debt_binds_borrows_and_part_repays_only() {
+    let mut s = Setup::new("min-debt", r#","limits":{"min_position_debt":2000000}"#);
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    let a = borrower(&s, &k, SOL, 3 * USD);
+    // 1.5 of 3 would leave 1.5, under the 2 floor; 1, or all of it, is fine.
+    assert_eq!(repay_ticket(&k, &a, 1, 3 * USD / 2).0, 422);
+    assert_eq!(repay_ticket(&k, &a, 1, USD).0, 200);
+    assert_eq!(repay_ticket(&k, &a, 1, 3 * USD).0, 200);
+    // The floor raised past the debt: borrowing a little more is refused,
+    // withdrawing collateral is not.
+    drop(k);
+    s.cfg = lend_cfg(r#","limits":{"min_position_debt":5000000}"#);
+    let k = s.keeper();
+    assert_eq!(draw(&k, &a, 1, USD).0, 422);
+    let (st, v) = build_req(
+        &k,
+        &a,
+        &[
+            ("op", "draw".into()),
+            ("vault", "1".into()),
+            ("position", "1".into()),
+            ("borrow", "0".into()),
+            ("withdraw", (SOL / 10).to_string()),
+        ],
+    );
+    assert_eq!(st, 200, "{v}");
+}
+
+/// A setup whose keeper set has one peer, with a history of its own.
+fn with_peer(name: &str, extra: &str) -> (Setup, Address) {
+    let mut s = Setup::new(name, extra);
+    let peer = Keypair::new().pubkey();
+    s.set = vec![peer];
+    s.fake.w().peer_history.insert(peer, Vec::new());
+    (s, peer)
+}
+
+#[test]
+fn each_keeper_has_its_own_mark_and_a_peers_notes_join_the_book() {
+    let (s, peer) = with_peer("peer-marks", "");
+    let u = s.user();
+    // The peer opened u's position 1 (a deposit spends no reserve).
+    s.fake
+        .w()
+        .peer_history
+        .insert(peer, vec![position_note(&u.addr(), 1, SOL, 0, 900)]);
+    let k = s.keeper();
+    let b = k.snapshot().unwrap();
+    assert_eq!(b.positions.len(), 1, "the peer's note");
+    let mark = |b: &Book, k: &Address| b.scanned.get(&k.to_string()).cloned();
+    assert_eq!(mark(&b, &s.signer.pubkey()).as_deref(), Some("mark"));
+    assert_eq!(mark(&b, &peer).as_deref(), Some("peer-1"));
+    // Nothing new: nothing changes, nothing is saved.
+    std::fs::remove_file(&s.state).unwrap();
+    k.merge_history(&[peer], false).unwrap();
+    assert!(!s.state.exists(), "a scan with nothing new saves nothing");
+    assert_eq!(k.snapshot().unwrap(), b);
+    // The peer tops it up: the old note is spent, the new one is in the
+    // peer's history, and the reserve is untouched.
+    {
+        let mut w = s.fake.w();
+        w.spent.insert(b.positions[0].nullifier().unwrap());
+        w.peer_history
+            .get_mut(&peer)
+            .unwrap()
+            .push(position_note(&u.addr(), 1, 2 * SOL, 0, 901));
+    }
+    k.step().unwrap();
+    let after = k.snapshot().unwrap();
+    assert_eq!(after.reserve, b.reserve);
+    let amounts: Vec<u64> = after.positions.iter().map(|p| p.amount).collect();
+    assert_eq!(amounts, [2 * SOL]);
+    assert_eq!(mark(&after, &peer).as_deref(), Some("peer-2"));
+    assert_eq!(mark(&after, &s.signer.pubkey()).as_deref(), Some("mark"));
+}
+
+#[test]
+fn no_second_position_while_a_peers_successor_is_on_its_way() {
+    let (s, peer) = with_peer("peer-topup", "");
+    let k = s.keeper();
+    let u = s.user();
+    fund_intent(&s, &k, &u, purpose::DEPOSIT, 1, SOL);
+    assert_eq!(drain(&k), vec![Op::DepositOpen]);
+    let old = k.snapshot().unwrap().positions[0].clone();
+    // A top-up; a peer spends the position before its new note is here.
+    let id = fund_intent(&s, &k, &u, purpose::DEPOSIT, 1, SOL / 10);
+    s.fake.w().spent.insert(old.nullifier().unwrap());
+    assert!(drain(&k).is_empty(), "no second position 1");
+    s.fake
+        .w()
+        .peer_history
+        .get_mut(&peer)
+        .unwrap()
+        .push(position_note(&u.addr(), 1, 2 * SOL, 0, 900));
+    assert_eq!(drain(&k), vec![Op::DepositAdd], "the top-up goes into it");
+    assert_eq!(
+        ticket_of(&k.snapshot().unwrap(), &id).status,
+        TicketStatus::Filled
+    );
+}
+
+#[test]
+fn a_failed_read_of_a_peers_history_does_not_stop_a_liquidation() {
+    let (s, _) = with_peer("peer-fail", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    s.fake.w().peer_history_fails = true;
+    s.fake.w().quote = Some(Quote {
+        low: 8 * DOLLAR,
+        high: 8 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    assert_eq!(drain(&k), vec![Op::Liquidate]);
+}
+
+#[test]
+fn a_book_that_does_not_add_up_lets_nothing_new_in() {
+    let s = Setup::new("shares", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let u = borrower(&s, &k, SOL, 3 * USD);
+    let other = s.user();
+    fund_intent(&s, &k, &other, purpose::SUPPLY, 1, 5 * USD);
+    assert_eq!(drain(&k), vec![Op::Supply]);
+    // The book loses a receipt: its shares no longer add up to the reserve's.
+    let lost = {
+        let mut b = k.book().unwrap();
+        let i = b
+            .receipts
+            .iter()
+            .position(|r| r.owned_by(&other.addr()))
+            .unwrap();
+        b.receipts.remove(i)
+    };
+    k.resolve().unwrap();
+    assert_eq!(supply_ticket(&k, &lender, 2 * USD).0, 403, "supply");
+    assert_eq!(
+        deposit_ticket(&k, &s.user(), 2, SOL).0,
+        403,
+        "a new position"
+    );
+    assert_eq!(draw(&k, &u, 1, USD).0, 403, "borrowing");
+    // Repays, top-ups, withdrawals and redeems go on.
+    fund_intent(&s, &k, &u, purpose::REPAY, 1, USD);
+    fund_intent(&s, &k, &u, purpose::DEPOSIT, 1, SOL / 10);
+    assert_eq!(drain(&k), vec![Op::Repay, Op::DepositAdd]);
+    let (st, v) = build_req(
+        &k,
+        &u,
+        &[
+            ("op", "draw".into()),
+            ("vault", "1".into()),
+            ("position", "1".into()),
+            ("borrow", "0".into()),
+            ("withdraw", (SOL / 10).to_string()),
+        ],
+    );
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    s.fake.advance(21);
+    let (st, v) = redeem(&k, &lender, USD);
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    // The receipt back: lending opens again.
+    k.book().unwrap().receipts.push(lost);
+    k.resolve().unwrap();
+    assert_eq!(supply_ticket(&k, &lender, 2 * USD).0, 200);
+}
+
+#[test]
+fn a_reserve_lost_past_the_marks_is_found_by_reading_everything_again() {
+    let s = Setup::new("lost-reserve", "");
+    let k = s.keeper();
+    let old = k.snapshot().unwrap().reserve.unwrap();
+    let newer = reserve_note(&fresh_reserve(0, 0), 0, 77);
+    {
+        // Spent by a transaction older than the mark that this book missed.
+        let mut w = s.fake.w();
+        w.spent.insert(old.nullifier().unwrap());
+        w.history = vec![old, newer.clone()];
+        w.history_honours_mark = true;
+        w.history_after.clear();
+    }
+    k.resolve().unwrap();
+    assert_eq!(k.snapshot().unwrap().reserve, Some(newer));
+    assert_eq!(s.fake.w().history_after, [Some("mark".into()), None]);
+}
+
+#[test]
+fn a_landed_build_does_not_replace_a_newer_reserve() {
+    let r1 = reserve_note(&fresh_reserve(0, 0), 0, 1);
+    let r2 = reserve_note(&fresh_reserve(5, 0), 5, 2);
+    let r3 = reserve_note(&fresh_reserve(9, 0), 9, 3);
+    let p = Pending {
+        op: Op::Supply,
+        wallet: Keypair::new().pubkey().to_string(),
+        spends: Some(r1.nullifier.clone()),
+        inputs: vec![r1.nullifier.clone()],
+        outputs: vec![r2.hash.clone()],
+        notes: vec![r2.clone()],
+        now: T0,
+        ticket: None,
+        owner_signed: false,
+        signature: None,
+    };
+    // A merge already put r3, built on r2 by a peer, in the book.
+    let mut book = Book {
+        reserve: Some(r3.clone()),
+        pending: vec![p.clone()],
+        ..Book::default()
+    };
+    apply(&mut book, &p, &[]);
+    assert_eq!(book.reserve, Some(r3));
+    // Over the reserve it spent, its own output is taken.
+    let mut book = Book {
+        reserve: Some(r1),
+        pending: vec![p.clone()],
+        ..Book::default()
+    };
+    apply(&mut book, &p, &[]);
+    assert_eq!(book.reserve.map(|r| r.hash), Some(r2.hash));
+}
+
+#[test]
+fn the_workers_pause_header_stops_new_money_only() {
+    let s = Setup::new("paused-header", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let a = borrower(&s, &k, SOL, 3 * USD);
+    let paused = |u: &User, path: &str, extra: &[(&str, String)]| {
+        let f = u.signed("POST", path, extra, now_of(&k));
+        k.http("POST", path, &body(&f), true)
+    };
+    let supply: Vec<(&str, String)> = vec![
+        ("purpose", "supply".into()),
+        ("pool", vault1().debt_mint.to_string()),
+        ("amount", USD.to_string()),
+    ];
+    let deposit = |position: u64| -> Vec<(&str, String)> {
+        vec![
+            ("purpose", "deposit".into()),
+            ("vault", "1".into()),
+            ("position", position.to_string()),
+            ("amount", (SOL / 10).to_string()),
+        ]
+    };
+    let repay: Vec<(&str, String)> = vec![
+        ("purpose", "repay".into()),
+        ("vault", "1".into()),
+        ("position", "1".into()),
+        ("amount", USD.to_string()),
+    ];
+    let draw_of = |borrow: u64, withdraw: u64| -> Vec<(&str, String)> {
+        vec![
+            ("op", "draw".into()),
+            ("vault", "1".into()),
+            ("position", "1".into()),
+            ("borrow", borrow.to_string()),
+            ("withdraw", withdraw.to_string()),
+        ]
+    };
+    assert_eq!(paused(&lender, "/lend/ticket", &supply).0, 403, "supply");
+    assert_eq!(
+        paused(&a, "/lend/ticket", &deposit(2)).0,
+        403,
+        "a new position"
+    );
+    assert_eq!(paused(&a, "/lend/ticket", &deposit(1)).0, 200, "a top-up");
+    assert_eq!(paused(&a, "/lend/ticket", &repay).0, 200, "a repay");
+    assert_eq!(
+        paused(&a, "/lend/build", &draw_of(USD, 0)).0,
+        403,
+        "a borrow"
+    );
+    let (st, v) = paused(&a, "/lend/build", &draw_of(0, SOL / 10));
+    assert_eq!(st, 200, "a withdrawal: {v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    s.fake.advance(21);
+    let redeem: Vec<(&str, String)> = vec![
+        ("op", "redeem".into()),
+        ("pool", vault1().debt_mint.to_string()),
+        ("amount", USD.to_string()),
+    ];
+    let (st, v) = paused(&lender, "/lend/build", &redeem);
+    assert_eq!(st, 200, "a redeem: {v}");
+    // Without the header, supply goes.
+    assert_eq!(supply_ticket(&k, &lender, USD).0, 200);
+}
+
+#[test]
+fn a_standby_posts_the_test_price_only_once_it_has_gone_stale() {
+    let s = Setup::new(
+        "standby-price",
+        r#","role":"standby","price_refresh_secs":45"#,
+    );
+    let k = s.keeper();
+    // Its own control file names another price: not posted over a fresh one.
+    let want = TestPrice {
+        vault: 1,
+        price: 6 * DOLLAR,
+        confidence: 1_000,
+    };
+    write_private(&price_file(&s.state), &serde_json::to_vec(&want).unwrap()).unwrap();
+    assert!(!k.refresh_price().unwrap());
+    s.fake.advance(59);
+    assert!(!k.refresh_price().unwrap(), "the primary has 15 s more");
+    s.fake.advance(1);
+    assert!(k.refresh_price().unwrap());
+}
+
+#[test]
+fn the_keepers_own_funds_are_checked_once_a_minute() {
+    let s = Setup::new("funds", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 3 * USD);
+    let book = k.snapshot().unwrap();
+    let r = accrued(book.reserve.as_ref().unwrap(), now_of(&k)).unwrap();
+    assert_eq!(largest_debt(&book, &r).unwrap(), 3 * USD);
+    let reads = || s.fake.w().held_reads;
+    k.step().unwrap();
+    assert_eq!(reads(), 0, "checked at the first pass, with nothing owed");
+    s.fake.advance(FUNDS_CHECK_SECS);
+    k.step().unwrap();
+    k.step().unwrap();
+    assert_eq!(reads(), 1);
+    s.fake.advance(FUNDS_CHECK_SECS - 1);
+    k.step().unwrap();
+    assert_eq!(reads(), 1);
+    s.fake.advance(1);
+    k.step().unwrap();
+    assert_eq!(reads(), 2);
+}
+
+/// A mainnet lend section, with `origins` and `min_position_debt`.
+fn mainnet_lend(origins: &str, min_debt: u64) -> Value {
+    serde_json::from_str(&format!(
+        r#"{{"program_id":"{}","network":"mainnet","origins":{origins},"price":"pyth",
+        "limits":{{"max_pool_size":1,"max_total_collateral":1,"max_position_collateral":1,
+        "max_position_debt":1,"max_supply_per_wallet":1,"min_position_debt":{min_debt}}}}}"#,
+        keeler_lend::ID
+    ))
+    .unwrap()
+}
+
+#[test]
+fn mainnet_role_and_origin_settings_are_checked() {
+    let lend = |v: Value| serde_json::from_value::<Lend>(v).unwrap();
+    let main = lend(mainnet_lend(r#"["https://keeler.example"]"#, 1));
+    assert!(main.check().is_ok(), "{:?}", main.check());
+    assert!(
+        lend(mainnet_lend(r#"["http://keeler.example"]"#, 1))
+            .check()
+            .is_err(),
+        "http on mainnet"
+    );
+    assert!(
+        lend(mainnet_lend(r#"["https://keeler.example"]"#, 0))
+            .check()
+            .is_err(),
+        "no minimum debt on mainnet"
+    );
+    let mut uncapped = mainnet_lend(r#"["https://keeler.example"]"#, 1);
+    uncapped["limits"]["max_pool_size"] = json!(0);
+    assert!(
+        lend(uncapped).check().is_err(),
+        "a cap left at 0 on mainnet"
+    );
+    assert!(lend_cfg(r#","standby_grace_secs":601"#).check().is_err());
+    assert!(lend_cfg(r#","role":"standby""#).check().is_ok());
+    assert!(
+        lend_cfg(r#","role":"standby","price_refresh_secs":61"#)
+            .check()
+            .is_err(),
+        "a standby 15 s late would let the price pass 75 s"
+    );
+    let fee = crate::config::MAX_PRIORITY_FEE;
+    assert!(lend_cfg(&format!(r#","liquidation_priority_fee":{fee}"#))
+        .check()
+        .is_ok());
+    assert!(
+        lend_cfg(&format!(r#","liquidation_priority_fee":{}"#, fee + 1))
+            .check()
+            .is_err()
+    );
+    let with = |rest: &str| {
+        serde_json::from_str::<Lend>(&format!(
+            r#"{{"program_id":"{}","network":"{NET}"{rest}}}"#,
+            keeler_lend::ID
+        ))
+    };
+    assert!(with(r#","origins":["https://a"],"role":"leader""#).is_err());
+    assert!(
+        with("").is_err() || with("").unwrap().check().is_err(),
+        "origins are required"
+    );
+    for bad in [
+        "[]",
+        r#"["ftp://x"]"#,
+        r#"["https://"]"#,
+        r#"["https://a/b"]"#,
+    ] {
+        let c = with(&format!(r#","origins":{bad}"#)).unwrap();
+        assert!(c.check().is_err(), "origins {bad}");
+    }
+}
+
+#[test]
+fn a_mainnet_keeper_takes_its_http_key_from_the_keychain_and_bounds_its_fee() {
+    let cfg = |http_key: Value, fee: u64| -> KeeperConfig {
+        serde_json::from_value(json!({
+            "network": {"rpc_url": "http://127.0.0.1:8899", "indexer_url": "http://127.0.0.1:8784",
+                "prover": "local", "priority_fee": fee},
+            "key": {"keychain": "keeper"},
+            "http": {"listen": "127.0.0.1:47000", "key": http_key},
+            "lend": mainnet_lend(r#"["https://keeler.example"]"#, 1),
+        }))
+        .unwrap()
+    };
+    let keychain = json!({"keychain": "http"});
+    assert!(cfg(keychain.clone(), 0).check().is_ok());
+    assert!(cfg(json!({"file": "/tmp/key"}), 0).check().is_err());
+    let max = crate::config::MAX_PRIORITY_FEE;
+    assert!(cfg(keychain.clone(), max).check().is_ok());
+    assert!(cfg(keychain, max + 1).check().is_err());
 }

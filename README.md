@@ -136,7 +136,30 @@ binary finds the proving keys (`SWAP_KEYS_DIR`).
     rewrites the Worker's `DEALERS` (backing off on failure) when the
     `*-*.trycloudflare.com` URL changes.
   - `set-upgrade-authority.sh` hands the authority to an existing
-    system-owned account after you type its address again.
+    system-owned account after you type its address again (refused for a
+    mainnet plan: there only a checked Squads vault takes it). With
+    `--squads <multisig> <vault-index> <program> [plan]` it hands it to that
+    Squads v4 vault instead, after checking the multisig (threshold 2 or more,
+    no config authority) and a typed confirmation.
+- `scripts/deploy-lend-devnet.sh [--estimate] [name]`: the lend program on
+  devnet, with the dealer (and an optional standby) as keepers and a pool key
+  of its own (`docs/lend-deploy.md`). `--estimate` sends nothing and creates
+  no Keychain items.
+- `scripts/deploy-mainnet.sh swap|lend [--estimate] ...`: the mainnet deploy
+  (`docs/mainnet-runbook.md`). Every parameter is given explicitly; it
+  refuses a dirty tree, a non-mainnet RPC, a test-price build, verifying keys
+  that are not the ceremony manifest's, and a Squads multisig that one key
+  controls. For lend it builds its own `keeler` with the program's build
+  parameters and checks, before the deploy, everything the reserve's
+  creation needs (`keeler deploy reserve check`); the last step creates the
+  reserve unless it exists, so a rerun after any failure finishes.
+  `build.json` records the commit and its tag. `--build-only` builds and
+  checks for an upgrade through the multisig; `--check-so` checks an
+  existing `.so`. Until the key ceremony's verifying keys are committed it
+  stops with `no key ceremony yet`; `--estimate` works before that. Its
+  refusals are tested without a network by
+  `cargo test -p keeler --test deploy_mainnet_refusals` (stub `security`
+  and `cargo`); `-- --ignored` adds a read-only devnet RPC refusal.
 - Dealer HTTP (loopback only, every request carries `x-keeler-key`, 4 KiB
   body cap), amounts as decimal strings:
   `POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` ->
@@ -244,7 +267,7 @@ Dealer:
 
 ```bash
 cargo test -p keeler-core
-cargo test -p keeler --lib --test fixtures
+cargo test -p keeler --lib --test fixtures --test deploy_mainnet_refusals
 source .tools/env && cargo test --release -p keeler --test e2e -- --nocapture
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p keeler-core -p keeler -- --check

@@ -74,8 +74,13 @@ pub mod vault {
 /// How far the public `now` may trail the cluster clock, in seconds.
 pub const NOW_WINDOW: i64 = 120;
 
-// `ID`, `ADMIN` and `KEEPER`, from the build environment (see build.rs).
+// `ID`, `ADMIN`, `KEEPERS`, `POOL_VIEWING` and the vault's mints and oracle,
+// from the build environment (see build_params.rs).
 include!(concat!(env!("OUT_DIR"), "/ids.rs"));
+
+#[cfg(test)]
+#[path = "../build_params.rs"]
+mod build_params;
 
 #[cfg(all(feature = "bpf-entrypoint", not(feature = "build-circuits"), not(xark)))]
 mod entrypoint {

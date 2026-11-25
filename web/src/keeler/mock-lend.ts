@@ -185,7 +185,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
           continue; // not liquidatable, or nothing to take
         }
         r = { ...r, debtShares: r.debtShares - (p.debtShares - l.debtShares) };
-        p.lastLiquidation = { at: now(), debtRepaid: l.repay, collateralSold: l.payout, price: vault.price };
+        p.lastLiquidation = { at: now(), debtRepaid: l.repay, collateralSold: l.payout, price: vault.price, collateralLeft: l.collateral, debtLeft: L.debtOf(l.debtShares, r.borrowPrice) };
         p.debtShares = l.debtShares;
         p.collateral = l.collateral;
       }
@@ -229,9 +229,12 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
         debt: debtOf(p),
         lastLiquidation: p.lastLiquidation,
       }));
+      // As the real client: a position a liquidation left with nothing is gone, and listed as emptied.
+      const gone = (p: Position) => p.collateral === 0n && p.debt === 0n;
       return {
         receipts: myShares > 0n ? [{ pool: pool.id, shares: myShares, value: L.assetsOf(myShares, r.supplyPrice) }] : [],
-        positions: positionsOut,
+        positions: positionsOut.filter((p) => !gone(p)),
+        emptied: positionsOut.filter((p) => gone(p) && p.lastLiquidation),
         operations: ops.map(strip),
         asOf: now(),
       };

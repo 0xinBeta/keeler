@@ -20,7 +20,8 @@ the page's signer. Regenerate it with `UPDATE_FIXTURES=1 pnpm test tests/lend-au
 | Variable | What |
 | --- | --- |
 | `VITE_LEND_PROGRAM_ID` | The lend program. Lending is shown only when `/api/config` has `lend` and its `programId` equals this; otherwise Earn and Borrow stay hidden |
-| `VITE_LEND_KEEPER` | The keeper's Solana address. It signs tickets and pays for keeper-built transactions; the page checks both against this key. Lending is hidden without it |
+| `VITE_LEND_KEEPERS` | The program's keeper set (`KEEPERS`). Each keeper signs its tickets and pays for the transactions it builds; the page checks both against the keeper the reply names, which must be in this set. Lending is hidden without it, or when the service (`/api/config.lend.keepers`, the keepers the Worker runs) lists a keeper that is not in it |
+| `VITE_LEND_POOL_VIEWING` | The pool viewing key (`POOL_VIEWING`), 66 hex: the key the page makes intents to |
 
 Records in `localStorage` are keyed `keeler:lend:v1:<network>:<program>:<wallet>:<kind>:<id>`.
 They hold note openings (amount, blinding, state) and transaction signatures, never key material.
@@ -29,16 +30,28 @@ They hold note openings (amount, blinding, state) and transaction signatures, ne
 
 | Route | Method | Signed | Request | Reply |
 | --- | --- | --- | --- | --- |
-| `/lend/pools` | GET | no | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
-| `/lend/account` | GET | yes | query: the signed fields | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}], index?: {supply, borrow, at}}` |
-| `/lend/ticket` | POST | yes | signed fields, `purpose`, `amount`, and `pool` (supply) or `vault` + `position` (deposit, repay) | `{id, expiry, signature}` |
-| `/lend/build` | POST | yes | signed fields, `op`; redeem: `pool`, exactly one of `amount`, `shares`, and optionally `receipt`; draw: `vault`, `position`, `borrow`, `withdraw` | `{transaction, outputs, now, bound?, index?}` |
+| `/lend/pools` | GET | no | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps, surplus, badDebt}]}`, at most 8 |
+| `/lend/account` | POST | yes | the signed fields, and `tickets`: the open tickets the page holds (at most 8, not signed) | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}], index?: {supply, borrow, at}}` |
+| `/lend/ticket` | POST | yes | signed fields, `purpose`, `amount`, and `pool` (supply) or `vault` + `position` (deposit, repay) | `{id, expiry, signature, keeper}` |
+| `/lend/build` | POST | yes | signed fields, `op`; redeem: `pool`, exactly one of `amount`, `shares`, and optionally `receipt`; draw: `vault`, `position`, `borrow`, `withdraw` | `{transaction, outputs, now, bound?, index?, keeper}` |
 
 Amounts are decimal strings of base units (u64). `vault` is a number, `position` a decimal string
 of a u63.
 
 - **pools**: `at` is the chain time the figures are from; `size` is the pool's total supply in base
-  units. These are coarse public figures; the page shows them as they are.
+  units. These are coarse public figures; the page shows them as they are. `surplus` (idle plus
+  debt less what suppliers are owed, 0 when short) and `badDebt` (the debt of positions whose
+  collateral at `price − confidence` is worth less than it) are decimal strings of debt-token base
+  units, two significant figures, `"0"` until the keeper's first pass with a price. While `badDebt`
+  exceeds `surplus` the keeper refuses new borrowing (403).
+- **account `tickets`**: each as the page got it, the reply's `id`, `expiry`, `signature` and
+  `keeper` with the request's `purpose`, `amount` and `pool` (supply) or `vault` (a number) and
+  `position` (deposit, repay). A keeper takes on a ticket another keeper of the set signed for this
+  wallet when the signature checks against that keeper and the expiry is more than 15 s and at most
+  900 s ahead, and fills its intent as its own; anything else is ignored. More than 8, or not an
+  array of objects, is a 400. So when the keeper that issued a ticket is down, the next one fills it.
+- **`keeper`** (ticket and build replies): the address of the keeper that answered: it signed the
+  ticket, and it is the build's fee payer.
 - **account**: the keeper's view of what it has filled for this wallet. `message` is base64 of the
   note opening, `amount u64 LE ‖ blinding [32] ‖ state` (the Borsh `ReceiptState` or
   `PositionState`). The page trusts none of it: it recomputes the note's hash under its own user
@@ -97,6 +110,8 @@ Keeler Lend: allow this browser session
 This lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.
 
 Network: <network>
+Origin: <the page's origin, e.g. https://keeler.example>
+The keeper can see your lending amounts.
 Program: <lend program id, base58>
 Wallet: <wallet, base58>
 Session key: <session key, base58>
@@ -115,12 +130,12 @@ Every signed request carries:
 | `sessionKey` | base58 address |
 | `sessionExpiry` | unix seconds, number |
 | `sessionAuth` | 128 lowercase hex |
+| `origin` | the `Origin:` of the authorisation text; one of the keeper's `lend.origins` |
 | `nonce` | 32 lowercase hex (16 random bytes) |
 | `timestamp` | chain unix seconds, number |
 | `signature` | 128 lowercase hex: the session key's signature over the request bytes |
 
-In the GET query every value is a string; the Worker turns `timestamp` and `sessionExpiry` back into
-numbers. The keeper verifies against the decimal form either way.
+The keeper verifies numbers against their decimal form.
 
 ### Request bytes
 
@@ -137,8 +152,9 @@ each as `key=value\n`, numbers in decimal (so `sessionExpiry=1800086000\n`). Key
 ### What the keeper checks, in order
 
 1. `sessionExpiry` is in the future and at most 86,400 s after the keeper's chain time.
-2. `sessionAuth` is `wallet`'s signature over the authorisation text rebuilt from the keeper's own
-   network and program, `wallet`, `sessionKey` and `sessionExpiry`.
+2. `origin` is one of `lend.origins`, and `sessionAuth` is `wallet`'s signature over the
+   authorisation text rebuilt from the keeper's own network and program, `origin`, `wallet`,
+   `sessionKey` and `sessionExpiry`.
 3. `signature` is `sessionKey`'s signature over the request bytes.
 4. Freshness: `timestamp` within 120 s of the keeper's chain time, either side.
 5. Replay: `(wallet, nonce)` not seen before; the keeper remembers nonces for 240 s (twice the
@@ -162,7 +178,8 @@ with exactly the ticket's purpose, target, amount and expiry.
 ## Intents
 
 An intent moves one private note's `amount` into a note the user PDA (`["user", wallet]`) owns
-under the keeper's registered viewing key, slot 1 (slot 0 is the change). It carries no message:
+under the pool viewing key the program and the keepers were compiled with (`POOL_VIEWING`, the
+page's `VITE_LEND_POOL_VIEWING`), slot 1 (slot 0 is the change). Any keeper of the set can open it. It carries no message:
 the keeper knows the wallet from the ticket and scans that wallet's PDA, as for intents the Rust SDK
 builds. The page sends it itself (the user pays) and then waits for the keeper to fill it. After
 `expiry` the user can cancel it (`cancel_intent`) and take the funds back.
@@ -178,7 +195,10 @@ position with no debt; the whole collateral comes back at slot 0.
 The Worker's `PAUSED` switch is the swap's and does not apply to `/api/lend/*`: repayments,
 withdrawals and refunds must keep working while liquidations run. Lending is paused at the keeper,
 which then refuses new supply, new positions and borrowing with a 403 (`paused` on the page, the
-keeper's sentence shown) and keeps serving everything else.
+keeper's sentence shown) and keeps serving everything else: repay tickets, deposit tickets into an
+open position, redeems and withdrawals. It pauses for a request when its `pause_file` exists, the
+request carries `x-keeler-paused: 1` (the Worker's lend pause, `LEND_PAUSED`), or its book does not
+add up (its notes' shares differ from the reserve's, logged as a warning) until it does.
 
 ## Errors
 
@@ -188,17 +208,25 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | Status | Page code | Meaning |
 | --- | --- | --- |
 | 401 | `network` | Session or signature refused (the page retries once with a new session) |
-| 403 | `paused` | Lending paused at the keeper (new supply, new positions, borrowing) |
+| 403 | `paused` | Lending paused at the keeper (new supply, new positions, borrowing), or borrowing halted while the pool's bad debt exceeds its surplus |
 | 404 | `storage` | No such position or receipt |
 | 409 | `busy` | The reserve is in use, or this wallet let its reservation lapse unused within `reservation_secs`; try again shortly |
 | 410 | `no-liquidity` | Not enough in the pool (checked last, at the amount rounded up to two significant figures) |
-| 412 | `price-stale` | The oracle price is too old |
-| 422 | `below-minimum` | Under a minimum |
+| 412 | `price-stale` | The oracle price is missing, unverified or older than 65 s (draws) |
+| 422 | `below-minimum` | Under a minimum, or over a cap (pool size, supply per wallet, collateral in all or per position, debt per position) |
 | 423 | `unhealthy` | The position would be unhealthy |
 | 429 | `rate-limited` | Too many requests: tickets or builds per wallet per hour, open tickets per wallet, open intents in all, or the 8 receipts or positions a wallet may hold (open tickets count) |
-| 502, 504 | `keeper-offline` | The keeper did not answer (Worker) |
-| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured (Worker); the keeper still starting or failing to start inside the dealer; a build that took over 25 s |
+| 502, 504 | `keeper-offline` | No keeper answered with its JSON (Worker): no answer, a reply that is not the keeper's, or a keeper's own 5xx `{"error": ...}` (such as a build that took over 25 s) |
+| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured, lending paused, or every keeper still starting (Worker) |
 | other | `network` | |
+
+A keeper that is starting, or failing to start, inside the dealer answers 503 with
+`{"starting": "<sentence>"}` and no `error` field. The Worker treats that as no answer and asks the
+next keeper of `LEND_KEEPERS` (up to four, in order); when none is left and the last said
+`starting`, it answers 503 "Lending is starting up. Try again in a minute.", otherwise 502. Keeper
+URLs must be `https://` unless `NETWORK` is `local`; `NETWORK` takes only `local`, `devnet` or
+`mainnet`. A live keeper's own 5xx with
+`{"error": ...}` is its answer: it is not retried and reaches the page as a 502.
 
 ## Layouts the page checks
 

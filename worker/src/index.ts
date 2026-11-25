@@ -39,6 +39,8 @@ export interface Env {
   LEND_TICKET_GLOBAL_LIMIT?: RateLimit;
   LEND_BUILD_LIMIT?: RateLimit;
   LEND_KEEPER_URL?: string;
+  LEND_KEEPERS?: unknown;
+  LEND_PAUSED?: string;
 }
 
 const RPC_BODY_CAP = 64 * 1024;
@@ -97,6 +99,8 @@ const LOCAL = { rpc: "http://127.0.0.1:8899", indexer: "http://127.0.0.1:8784", 
 const CSP =
   "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'";
 
+const NETWORKS = ["local", "devnet", "mainnet"];
+
 class Fail extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
@@ -125,6 +129,7 @@ export default {
 
 async function api(request: Request, env: Env, url: URL, path: string): Promise<Response> {
     try {
+      if (!NETWORKS.includes(env.NETWORK)) throw new Fail(500, "The server setting NETWORK is not local, devnet or mainnet.");
       const origin = request.headers.get("origin");
       if (origin !== null && origin !== url.origin) throw new Fail(403, "Cross-origin requests are not allowed.");
       if (path === "/api/config") return only(request, "GET") ?? json(config(env));
@@ -211,9 +216,12 @@ function parsed(value: unknown, name: string): unknown {
   }
 }
 
+/** A dealer or keeper URL: https, or http too on a local network (DEALER_KEY goes with every request). */
+const upstreamUrl = (env: Env, v: unknown) => typeof v === "string" && (env.NETWORK === "local" ? /^https?:\/\/[^\s/]+/ : /^https:\/\/[^\s/]+/).test(v);
+
 function dealers(env: Env): { url: string; pubkey: string }[] {
   const list = parsed(env.DEALERS ?? [], "DEALERS");
-  if (!Array.isArray(list) || !list.every((d) => typeof d?.url === "string" && typeof d?.pubkey === "string")) {
+  if (!Array.isArray(list) || !list.every((d) => upstreamUrl(env, d?.url) && typeof d?.pubkey === "string")) {
     throw new Fail(500, "The server setting DEALERS is malformed.");
   }
   return list;
@@ -232,7 +240,7 @@ function config(env: Env) {
     maxTtlSecs: Number(env.MAX_TTL_SECS ?? 0),
     faucet: env.FAUCET === "1",
     paused: env.PAUSED === "1",
-    ...(lendConfig(env) === undefined ? {} : { lend: lendConfig(env) }),
+    ...(lendConfig(env) === undefined ? {} : { lend: { ...lendConfig(env), keepers: keepers(env).map((k) => k.pubkey) } }),
   };
 }
 
@@ -663,11 +671,11 @@ function dealerKey(env: Env): string {
 }
 
 /** POSTs `body`, or GETs when there is none. */
-async function askDealer(dealerUrl: string, route: string, key: string, body: string | undefined, timeoutMs: number): Promise<Response | null> {
+async function askDealer(dealerUrl: string, route: string, key: string, body: string | undefined, timeoutMs: number, extra: Record<string, string> = {}): Promise<Response | null> {
   try {
     return await fetch(`${dealerUrl.replace(/\/+$/, "")}${route}`, {
       method: body === undefined ? "GET" : "POST",
-      headers: { "content-type": "application/json", "x-keeler-key": key },
+      headers: { "content-type": "application/json", "x-keeler-key": key, ...extra },
       body,
       redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
@@ -726,7 +734,11 @@ async function faucet(request: Request, env: Env): Promise<Response> {
 const vaultId: Check = (v) => uint(v) && (v as number) <= 0xffff;
 // A request signed by the browser session key (`sessionKey`), which the wallet authorised once (`sessionAuth`, over
 // the text in docs/lend-api.md) until `sessionExpiry`; with a nonce and a timestamp. The keeper verifies all of it.
-const SIGNED: Spec = { wallet: [address, true], nonce: [hex(32), true], timestamp: [uint, true], sessionKey: [address, true], sessionExpiry: [uint, true], sessionAuth: [hex(128), true], signature: [hex(128), true] };
+const SIGNED: Spec = {
+  wallet: [address, true], nonce: [hex(32), true], timestamp: [uint, true], sessionKey: [address, true], sessionExpiry: [uint, true], sessionAuth: [hex(128), true], signature: [hex(128), true],
+  // The page's `location.origin`, named in the authorisation text; it must be the request's Origin.
+  origin: [(v) => typeof v === "string" && v.length <= 200 && /^https?:\/\/[A-Za-z0-9.:[\]-]+$/.test(v), true],
+};
 const PURPOSE = oneOf("supply", "deposit", "repay");
 // The owner message, encrypted to the owner's viewing key.
 const message = base64(512);
@@ -734,12 +746,19 @@ const message = base64(512);
 const POOLS_REPLY: Spec = {
   pools: [list(object({
     mint: [address, true], at: [uint, true], size: [amount, true], utilisationBps: [bps, true], supplyRateBps: [uint, true], borrowRateBps: [uint, true],
+    // The keeper's coarse solvency figures (docs/lend-keeper.md): borrowing stops while badDebt exceeds surplus.
+    surplus: [amount, true], badDebt: [amount, true],
   }), 0, 8), true],
 };
 const TICKET_REQUEST: Spec = {
   ...SIGNED, purpose: [PURPOSE, true], amount: [amount, true], pool: [address, false], vault: [vaultId, false], position: [amount, false],
 };
-const TICKET_REPLY: Spec = { id: [hex(32), true], expiry: [uint, true], signature: [hex(128), true] };
+// `keeper`: the keeper that signed the ticket (or the build) and pays for its transaction.
+const TICKET_REPLY: Spec = { id: [hex(32), true], expiry: [uint, true], signature: [hex(128), true], keeper: [address, true] };
+// An open ticket as the keeper issued it (its reply) with the terms it was asked for, so another keeper can adopt it.
+const TICKET_HELD: Spec = { ...TICKET_REPLY, purpose: [PURPOSE, true], amount: [amount, true], pool: [address, false], vault: [vaultId, false], position: [amount, false] };
+// `tickets` is not covered by the session signature: each ticket carries the keeper's own.
+const ACCOUNT_REQUEST: Spec = { ...SIGNED, tickets: [list(object(TICKET_HELD), 0, 8), true] };
 const BUILD_REQUEST: Spec = {
   ...SIGNED, op: [oneOf("redeem", "draw"), true], pool: [address, false], vault: [vaultId, false], position: [amount, false],
   amount: [amount, false], shares: [amount, false], borrow: [amount, false], withdraw: [amount, false],
@@ -749,7 +768,7 @@ const BUILD_REQUEST: Spec = {
 /** A redeem names exactly one of `amount` and `shares`; only a redeem takes `shares`. */
 const buildFits = (b: Record<string, unknown>) => (b.op === "redeem" ? (b.amount === undefined) !== (b.shares === undefined) : b.shares === undefined && b.receipt === undefined);
 // A v1 transaction is at most 4,096 bytes: 5,464 base64 characters.
-const BUILD_REPLY: Spec = { transaction: [base64(5464), true], outputs: [list(hex(64), 1, 8), true], now: [uint, true], bound: [amount, false], index: [amount, false] };
+const BUILD_REPLY: Spec = { transaction: [base64(5464), true], outputs: [list(hex(64), 1, 8), true], now: [uint, true], bound: [amount, false], index: [amount, false], keeper: [address, true] };
 const ACCOUNT_REPLY: Spec = {
   receipts: [list(object({ pool: [address, true], shares: [amount, true], message: [message, true] }), 0, 8), true],
   positions: [list(object({
@@ -762,27 +781,30 @@ const ACCOUNT_REPLY: Spec = {
   index: [object({ supply: [amount, true], borrow: [amount, true], at: [uint, true] }), false],
 };
 
-type LendRoute = {
-  method: "GET" | "POST"; keeper: string; limits: [LimitName, LimitName | null]; timeoutMs: number;
-  /** The query for a GET, the body for a POST. */
-  request: Spec; reply: Spec;
-};
+type LendRoute = { method: "GET" | "POST"; keeper: string; limits: [LimitName, LimitName | null]; timeoutMs: number; request: Spec; reply: Spec };
 const LEND_ROUTES: Record<string, LendRoute> = {
   "/api/lend/pools": { method: "GET", keeper: "/lend/pools", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: {}, reply: POOLS_REPLY },
-  "/api/lend/account": { method: "GET", keeper: "/lend/account", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: SIGNED, reply: ACCOUNT_REPLY },
+  "/api/lend/account": { method: "POST", keeper: "/lend/account", limits: ["LEND_READ_LIMIT", "LEND_READ_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: ACCOUNT_REQUEST, reply: ACCOUNT_REPLY },
   "/api/lend/ticket": { method: "POST", keeper: "/lend/ticket", limits: ["LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT"], timeoutMs: LEND_TIMEOUT_MS, request: TICKET_REQUEST, reply: TICKET_REPLY },
   "/api/lend/build": { method: "POST", keeper: "/lend/build", limits: ["LEND_BUILD_LIMIT", null], timeoutMs: LEND_BUILD_TIMEOUT_MS, request: BUILD_REQUEST, reply: BUILD_REPLY },
 };
 
-// shortcut: one keeper, LEND_KEEPER_URL or else the first DEALERS entry; return a list here when there is more than one.
-function keeper(env: Env): { url: string } {
-  if (env.LEND_KEEPER_URL !== undefined) {
-    if (!/^https?:\/\/[^\s/]+/.test(env.LEND_KEEPER_URL)) throw new Fail(500, "The server setting LEND_KEEPER_URL is malformed.");
-    return { url: env.LEND_KEEPER_URL };
+/**
+ * The lending keepers in failover order: LEND_KEEPERS, or else one keeper at LEND_KEEPER_URL (or the first DEALERS
+ * entry's url) under the first DEALERS entry's key. Empty when none is configured.
+ */
+function keepers(env: Env): { url: string; pubkey: string }[] {
+  const url = { test: (v: unknown) => upstreamUrl(env, v) };
+  if (env.LEND_KEEPERS !== undefined) {
+    const raw = parsed(env.LEND_KEEPERS, "LEND_KEEPERS");
+    const ok = Array.isArray(raw) && raw.length > 0 && raw.length <= 4 &&
+      raw.every((k, i) => shaped(k, { url: [(v) => typeof v === "string" && url.test(v), true], pubkey: [address, true] }) !== null && raw.findIndex((j) => j.pubkey === k.pubkey) === i);
+    if (!ok) throw new Fail(500, "The server setting LEND_KEEPERS is malformed.");
+    return raw as { url: string; pubkey: string }[];
   }
+  if (env.LEND_KEEPER_URL !== undefined && !url.test(env.LEND_KEEPER_URL)) throw new Fail(500, "The server setting LEND_KEEPER_URL is malformed.");
   const first = dealers(env)[0];
-  if (first === undefined) throw new Fail(503, "No lending keeper is configured.");
-  return first;
+  return first === undefined ? [] : [{ url: env.LEND_KEEPER_URL ?? first.url, pubkey: first.pubkey }];
 }
 
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -834,6 +856,8 @@ export async function signedByWallet(env: Env, method: string, keeperPath: strin
     "This lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.",
     "",
     `Network: ${env.NETWORK}`,
+    `Origin: ${f.origin}`,
+    "The keeper can see your lending amounts.",
     `Program: ${env.LEND_PROGRAM_ID}`,
     `Wallet: ${f.wallet}`,
     `Session key: ${f.sessionKey}`,
@@ -841,7 +865,7 @@ export async function signedByWallet(env: Env, method: string, keeperPath: strin
   ].join("\n");
   if (!(await ed25519(f.wallet as string, f.sessionAuth as string, utf8(auth)))) return false;
   const canonical = Object.keys(f)
-    .filter((k) => k !== "signature" && k !== "nonce" && k !== "timestamp")
+    .filter((k) => k !== "signature" && k !== "nonce" && k !== "timestamp" && k !== "tickets")
     .sort()
     .map((k) => `${k}=${String(f[k])}\n`)
     .join("");
@@ -853,6 +877,9 @@ export async function signedByWallet(env: Env, method: string, keeperPath: strin
   return ed25519(f.sessionKey as string, f.signature as string, message);
 }
 
+const LEND_PAUSED_TEXT = "Lending is paused: no new deposits into Earn, new positions or borrowing for now. Repayments, top-ups and withdrawals still work.";
+const LEND_STARTING_TEXT = "Lending is starting up. Try again in a minute.";
+
 async function lend(request: Request, env: Env, url: URL, path: string): Promise<Response> {
   const route = Object.hasOwn(LEND_ROUTES, path) ? LEND_ROUTES[path]! : undefined;
   if (lendConfig(env) === undefined || route === undefined) throw new Fail(404, "Not found.");
@@ -863,45 +890,63 @@ async function lend(request: Request, env: Env, url: URL, path: string): Promise
   await limit(env, route.limits[0], request);
 
   let body: string | undefined;
-  let query = "";
   let fields: Record<string, unknown> = {};
   if (route.method === "POST") {
     const clean = shaped(await smallJson(request, LEND_BODY_CAP), route.request);
     if (clean === null || (route.request === BUILD_REQUEST && !buildFits(clean))) throw new Fail(400, `The request body does not have the fields ${route.keeper} takes.`);
     body = JSON.stringify(clean);
     fields = clean;
-  } else {
-    const params = [...url.searchParams];
-    const given = Object.fromEntries(params.map(([k, v]) => [k, (k === "timestamp" || k === "sessionExpiry") && /^(0|[1-9][0-9]{0,15})$/.test(v) ? Number(v) : v]));
-    const clean = params.length === Object.keys(given).length ? shaped(given, route.request) : null;
-    if (clean === null) throw new Fail(400, `The query does not have the fields ${route.keeper} takes.`);
-    if (params.length > 0) query = "?" + new URLSearchParams(Object.entries(clean).map(([k, v]) => [k, String(v)]));
-    fields = clean;
-  }
+  } else if (url.search !== "") throw new Fail(400, `${route.keeper} takes no query.`);
+  // LEND_PAUSED, the Worker's lending switch for every keeper: it refuses new Earn deposits itself and marks the rest
+  // `x-keeler-paused`, so the keeper refuses opening a position and any build that borrows; reads, repayments, top-ups
+  // and withdrawals pass (only the keeper knows whether a deposit's position is open or a build borrows).
+  const paused = env.LEND_PAUSED === "1";
+  if (paused && route.request === TICKET_REQUEST && fields.purpose === "supply") throw new Fail(503, LEND_PAUSED_TEXT);
   const key = dealerKey(env);
-  const target = keeper(env);
-  if ("signature" in route.request && !(await signedByWallet(env, route.method, route.keeper, fields))) {
-    throw new Fail(401, "This request is not signed by a lending session its wallet authorised.");
+  const list = keepers(env);
+  if (list.length === 0) throw new Fail(503, "No lending keeper is configured.");
+  if ("signature" in route.request) {
+    // The dev server's proxy drops Origin on a local network; anywhere else a session works only on the site it names.
+    const origin = request.headers.get("origin");
+    if (origin !== fields.origin && !(origin === null && env.NETWORK === "local")) throw new Fail(401, "This lending session was authorised for another site.");
+    if (!(await signedByWallet(env, route.method, route.keeper, fields))) throw new Fail(401, "This request is not signed by a lending session its wallet authorised.");
   }
-  // Charged only once the request passed every check, signatures included. A repayment ticket is never held
-  // back by other people's traffic (its client limit still applies), and a build has no global limit: the
+  // Charged once, only after every check, signatures included, whichever keeper answers. A repayment ticket is never
+  // held back by other people's traffic (its client limit still applies), and a build has no global limit: the
   // keeper's one-at-a-time lane (409) paces builds, and a build that would prove needs the wallet's own note.
   const global = route.limits[1];
   if (global !== null && !(path === "/api/lend/ticket" && fields.purpose === "repay")) await limit(env, global, request, 1, true);
 
-  const response = await askDealer(target.url, route.keeper + query, key, body, route.timeoutMs);
-  if (response === null) throw new Fail(502, "The lending keeper did not answer.");
-  let reply: unknown = null;
-  try {
-    const bytes = await readCapped(response.body, LEND_BODY_CAP);
-    reply = bytes && JSON.parse(new TextDecoder().decode(bytes));
-  } catch {}
-  if (response.ok) {
-    const clean = shaped(reply, route.reply);
-    if (clean === null) throw new Fail(502, "The lending keeper sent a malformed reply.");
-    return json(clean);
+  // Each keeper in order, the next only when there was no answer or the answer is not the keeper's JSON (a tunnel's
+  // error page, a malformed reply, a keeper still starting inside its dealer: 503 {"starting"}); a keeper's own
+  // refusal or 5xx with an `error` is its answer. A retried ticket may leave an unused one on a keeper; it expires.
+  let failure = new Fail(502, "The lending keeper did not answer.");
+  for (const k of list) {
+    const response = await askDealer(k.url, route.keeper, key, body, route.timeoutMs, paused ? { "x-keeler-paused": "1" } : {});
+    if (response === null) {
+      failure = new Fail(502, "The lending keeper did not answer.");
+      continue;
+    }
+    let reply: unknown = null;
+    try {
+      const bytes = await readCapped(response.body, LEND_BODY_CAP);
+      reply = bytes && JSON.parse(new TextDecoder().decode(bytes));
+    } catch {}
+    if (response.ok) {
+      const clean = shaped(reply, route.reply);
+      // A ticket or a build names the keeper that made it: the one asked.
+      if (clean !== null && (clean.keeper === undefined || clean.keeper === k.pubkey)) return json(clean);
+      failure = new Fail(502, "The lending keeper sent a malformed reply.");
+      continue;
+    }
+    const error = (reply as { error?: unknown } | null)?.error;
+    if (typeof error !== "string") {
+      const starting = response.status === 503 && typeof (reply as { starting?: unknown } | null)?.starting === "string";
+      failure = starting ? new Fail(503, LEND_STARTING_TEXT) : new Fail(502, "The lending keeper could not do this right now.");
+      continue;
+    }
+    if (response.status >= 400 && response.status < 500) return json({ error: error.slice(0, 200) }, response.status);
+    throw new Fail(502, "The lending keeper could not do this right now.");
   }
-  const error = (reply as { error?: unknown } | null)?.error;
-  if (response.status >= 400 && response.status < 500 && typeof error === "string") return json({ error: error.slice(0, 200) }, response.status);
-  throw new Fail(502, "The lending keeper could not do this right now.");
+  throw failure;
 }
