@@ -11,10 +11,10 @@ mechanism:
 - **page**: a check the web page makes before the wallet signs (`web/src/keeler/lend-check.ts`);
 - **trust**: nothing enforces it; the party is trusted.
 
-Sections are marked **[exists]** for what the code does today and **[proposal]** for what it does
-not.
+Every section describes what the code does today, except the Nitro Enclave section, which is a
+proposal and marks each of its parts **[exists]** or **[proposal]**.
 
-## Devnet today [exists]
+## Devnet today
 
 The deployed program (`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`, devnet) is built with the
 test proving keys (`zolana zk compile --test`, a fixed public seed) and the `test-price` feature.
@@ -57,8 +57,11 @@ Can:
   fixes the expiry and the page uses it; an intent made by hand is the maker's own risk.
 - Cancel its intent after expiry and close a debt-free position without the keeper (`cancel_intent`
   and `close`: user-signed, no keeper signature in the program).
-- Hold the pool's single lane by asking for owner builds and never sending them (audit K-1;
-  bounded by `builds_per_wallet_hour` and the reservation cooldown, trust in the keeper's limits).
+- Hold the pool's single lane with owner builds (review K-1). Builds never sent cost a wallet a
+  doubling cooldown, so N such wallets hold the lane about N x 160 s an hour; a wallet that sends
+  every build just after its reservation ran out is forgiven each time and can hold one
+  reservation per build, up to `builds_per_wallet_hour` (`docs/lend-keeper.md`, "The queue";
+  trust in the keeper's limits).
 
 Cannot:
 
@@ -76,8 +79,10 @@ Sees the public chain (table in `README.md`). Can call every instruction, but ev
 that spends a reserve or fills an intent requires a keeper signer (program, `require_keeper`), and
 note spends need openings it does not have (SPP). Can post a fully verified, newer Pyth update to
 the push account (Pyth's `update_price_feed`), which makes the 90 s age limit a window for choosing
-among recent prices (`docs/plan-lend.md`, "Prices"); it cannot post an unverified or older one
-(program checks owner, discriminator, verification level, feed id, age).
+among recent prices (`docs/plan-lend.md`, "Prices"). Whether an older update may replace the one
+the account holds is Pyth's push oracle's rule, not the lend program's. The lend program checks
+the account's owner, discriminator, verification level and feed id, and that the price was
+published within 90 s of the cluster clock.
 
 ### A keeper
 
@@ -94,20 +99,25 @@ Can:
   can halt the pool for its peers too. Earn deposits and indebted positions then cannot move;
   intents refund after expiry and debt-free positions close without a keeper (trust).
 - Order operations and refuse service to a wallet (trust).
+- Write a reserve nobody can open. The program pins the `pool_viewing` argument
+  (`require_pool_viewing`), so an honest build encrypts the reserve to the shared key and a
+  misconfigured keeper fails. It does not check the ciphertext (trust).
 - Choose the liquidation size `x` within the circuit's bounds and choose when to liquidate (see
   below).
 - On devnet: forge proofs and set the test price (see "Devnet today").
 
 Cannot (with real keys):
 
-- Take principal. Who is paid and how much is fixed by each circuit: intent proceeds go to the
-  maker's receipt or position, change to the maker, redeem and draw payouts to the recorded owner
-  (circuit).
+- Take principal directly. Who is paid and how much is fixed by each circuit: intent proceeds go
+  to the maker's receipt or position, change to the maker, redeem and draw payouts to the recorded
+  owner (circuit). A keeper that withholds liquidation, its own positions' included, can still let
+  bad debt grow, and there is no write-off: the loss falls on the suppliers who leave last
+  (trust).
 - Spend a user's own notes (SPP: needs the user's nullifier secret).
-- Write the reserve under another key: `pool_viewing` must equal the compiled `POOL_VIEWING`
-  (program, `require_pool_viewing`).
-- Liquidate a healthy position: the program requires the liquidation bound at or above
-  `price + confidence`, and the circuit requires the debt above the threshold at that bound.
+- Liquidate a healthy position at the price it uses: the program requires the liquidation bound
+  at or above `price + confidence`, and the circuit requires the debt above the threshold at that
+  bound. The keeper may itself post the verified Pyth update it liquidates at, so within the 90 s
+  window it chooses among recent prices, as an outsider can.
 - Liquidate more than the rules allow: `0 < x <= debt`, at least one debt share removed, payout
   capped at the collateral, and the position not left healthier than the threshold unless it was
   above the max limit (circuit).
@@ -127,8 +137,8 @@ keeper requests. In this design it is the keeper's operator.
 
 - Serves the page's code. **The page checks protect users from a keeper, not from whoever serves
   the page**: a different page could skip them. Users trust the operator for the code they run.
-- Sees account views in clear: `/lend/account` replies carry the wallet's note openings (audit W-3,
-  accepted).
+- Sees account views in clear: `/lend/account` replies carry the wallet's note openings (review
+  W-3, accepted).
 - Holds `HELIUS_API_KEY` and `DEALER_KEY` (the keeper HTTP key); never returns them (it refuses an
   upstream reply that contains the API key).
 - Can rate-limit, pause (`LEND_PAUSED`) or drop requests.
@@ -141,8 +151,8 @@ Sees which wallets and PDAs are read and from where. Could return false data. Th
 every note hash it is given and checks it is appended and unspent; the keeper reads nullifier
 accounts from the RPC and outputs from the indexer and checks each against the hash on chain. A
 provider that lies about the reference price could move a draw bound within the page's 2% margin
-(audit W-2: the fix is a second provider). A faulty indexer could make a keeper's history replay
-skip an output (audit K-3).
+(review W-2: the fix is a second provider). A faulty RPC or indexer stops a keeper's history
+replay with an error; the scan mark stays (review K-3).
 
 ### The prover
 
@@ -176,102 +186,178 @@ used, and the page checks it only grows within the curve's top rate). Over time 
 utilisation and notice very large operations. `/lend/pools` publishes size, utilisation and rates
 rounded to two significant figures, at most once per `bucket_secs`.
 
-## Accepted findings from the internal audit
+## Accepted findings from the internal security review
 
 From `docs/audit-2026-11-25.md` (internal, not an external audit; the compiled constraints and the
 proof system were not covered):
 
 | ID | Finding | Why accepted |
 | --- | --- | --- |
-| P-1 | A repay worth less than one debt share is accepted and removes no debt (about one base unit) | The keeper refuses repays under `min_repay`; fixing it changes a circuit for a loss of 0.000001 of a token; it goes in with the next circuit change |
 | K-2 | Two keepers filling deposits at once can pass `max_total_collateral`, because a deposit does not spend the reserve | Only during a failover; the caps are a per-keeper soft limit |
 | W-3 | Account views cross the Worker in clear | The Worker is run by the keeper's operator and serves the page |
 
-The other findings were decided "fix"; the audit document is the record of each one's status.
+The other findings were fixed or mitigated; the review document records each one's status.
 Also not enforced by any circuit, and documented in `lend/AGENTS.md`: the unbounded intent expiry
 and the liquidator change blinding above.
 
-## Running the keeper in an AWS Nitro Enclave [proposal]
+## Running the keeper in an AWS Nitro Enclave
 
-Nothing in this section is built. The aim: make the claim "the keeper runs this code, and only
-this code holds the keys" checkable by a user, instead of "trust the operator's hosts".
+The aim: let a user check which code holds the keeper and pool keys, instead of trusting the
+operator's hosts with them. It narrows what the operator is trusted for; it does not remove the
+operator. References are at the end of the section.
 
-### What is measured
+### What exists today [exists]
 
-- The keeper is built reproducibly from a tagged commit into an enclave image (EIF): the
-  `keeler keeper` binary built with the program's build parameters (`docs/mainnet-runbook.md`,
-  section 6), the ceremony's proving keys checked against the manifest, a minimal init, no shell.
-- The image's measurements are published beside the release: PCR0 (the whole image), PCR1 (kernel
-  and boot), PCR2 (the application), and PCR8 (the signing certificate, if the image is signed).
-  Anyone can rebuild from the tag and compare PCR0.
-- The enclave runs in production mode only. A debug-mode enclave reports all-zero PCRs; every
-  verifier refuses them.
+- The keeper is a `keeler keeper` process on an operator's host. Its keeper key, the pool key and
+  the HTTP key are read from the macOS Keychain (`keychain_secret` in `cli/src/config.rs`); the
+  state file is JSON, mode 0600, on that host's disk, with a lock that stops two processes on one
+  file (`docs/lend-keeper.md`, "The state file").
+- The pool key is made once, on the deploy machine, and copied to each keeper host
+  (`docs/mainnet-runbook.md`, section 4). The operator holds every key in clear.
+- The only TEE in the system is Helius' prover for the shielded pool's proofs ("The prover"
+  above). Nothing in this repository runs in, or checks, a Nitro Enclave.
 
-### How a user or the page checks it
+### What is measured, and how the image is built [proposal]
 
-- The keeper gains a route, `/lend/attestation?nonce=<32 hex>`, that returns a fresh Nitro
-  attestation document (CBOR, COSE_Sign1, signed by the Nitro hypervisor's certificate chain).
-- Its `nonce` field is the page's nonce; its `user_data` is
-  `SHA-256("keeler-keeper-attest-v1" ‖ program id ‖ keeper address ‖ pool viewing key ‖ nonce)`;
-  its `public_key` is the enclave's TLS key, so the HTTPS session terminates inside the enclave
-  and the parent instance sees only ciphertext.
-- The page (and a standalone `keeler attest-check` command) verifies the chain to the AWS Nitro
-  Enclaves root certificate, the signature, the freshness, that PCR0 is one of the values compiled
-  into the site (as the keeper set and pool key are today), and that `user_data` names the keeper
-  that signs tickets and pays builds. Lending stays hidden when the check fails, as it does today
-  for an unknown keeper.
+- The keeper runs from an enclave image file (EIF) made with `nitro-cli build-enclave` from a
+  tagged commit: the `keeler keeper` binary built with the deploy's build parameters
+  (`docs/mainnet-runbook.md`, section 6), the ceremony's proving keys checked against the
+  manifest, a minimal init, no shell.
+- The PCRs, as AWS defines them: PCR0 measures the image file, PCR1 the kernel and boot ramfs,
+  PCR2 the application, PCR8 the signing certificate (only for a signed image). PCR3 is a hash of
+  the parent instance's IAM role ARN and PCR4 of the parent's instance id: they describe the host,
+  not the code. The release publishes PCR0, PCR1 and PCR2; the KMS policy below may also pin PCR3.
+- Anyone can rebuild the tag and compare. That needs a pinned `nitro-cli` with the kernel and init
+  blobs it ships (they set PCR1), a container image pinned by digest, `cargo build --locked` with
+  fixed paths and timestamps, and a file system with fixed order, owners and times. AWS's pages
+  define the PCRs but say nothing about reproducible builds, so reproducibility has to be shown by
+  independent rebuilds that match, not assumed.
+- Production mode only. AWS states that an enclave booted in debug mode, or with an attached
+  console, produces attestation documents whose PCRs are all zeros and that cannot be used for
+  attestation. A KMS policy pinned to the published values refuses it, and so does every verifier
+  below.
 
-### Keys sealed to the measurement
+### Keys made inside the enclave and sealed to the measurement [proposal]
 
-- The keeper key and the pool key exist outside the enclave only as AWS KMS ciphertexts. The KMS
-  key policy allows `Decrypt` only with a Nitro attestation whose image hash equals the published
-  PCR0 (KMS condition keys of the `kms:RecipientAttestation:*` family; to be checked against AWS's
-  documentation before implementation). KMS then returns the plaintext encrypted to the enclave's
-  attested key, so the parent instance never holds it.
-- The key policy denies policy changes to everyone but a separate administrator role behind the
-  same Squads-style quorum used for the upgrade authority, and CloudTrail records every decrypt.
-- A new release means a new PCR0, a policy change through that quorum, and a site rebuild with the
-  new value: the same gate as a keeper-set change today.
+- The enclave generates the keeper key and the pool key itself and never exports them. The
+  current pool key was made on the deploy machine, so this means a new deployment with new
+  compiled `KEEPERS` and `POOL_VIEWING`; it cannot be applied to the present keys.
+- To keep them across restarts, the enclave calls KMS `GenerateDataKey` with an attestation
+  document as the `Recipient`. KMS returns the data key encrypted to the document's public key
+  (`CiphertextForRecipient`; the plaintext field is empty) and a copy encrypted under the KMS key.
+  The enclave seals its keys and state with the data key (AES-256-GCM) and gives the parent only
+  ciphertext.
+- After a restart the enclave calls `Decrypt` on that copy with a fresh attestation document. The
+  key policy allows `Decrypt` and `GenerateDataKey` only when `kms:RecipientAttestation:ImageSha384`
+  and `kms:RecipientAttestation:PCR<n>` (PCR0 to PCR2, and PCR3 for the role) equal the published
+  values; a request without an attestation document cannot satisfy the condition.
+- The policy denies `Encrypt` and `ReEncrypt*` to everyone. Neither takes an attestation document
+  (the operations that do are `Decrypt`, `DeriveSharedSecret`, `GenerateDataKey`,
+  `GenerateDataKeyPair` and `GenerateRandom`). With `Encrypt`, the operator could seal a key it
+  knows in a form the enclave accepts; with `ReEncrypt`, it could move the sealed data key under a
+  KMS key it may decrypt without attestation.
+- A new release has a new PCR0, so the key policy is changed to admit it and the site is rebuilt
+  with the new values. Who may change the key policy is set inside the operator's AWS account; it
+  is not a public, on-chain change like a keeper-set upgrade through the multisig.
 
-### Encrypted state outside the enclave
+### How the page or a checker verifies an attestation [proposal]
 
-- The state file (openings, tickets, pending builds, scan marks) is sealed with AES-256-GCM under
-  a data key from KMS `GenerateDataKey`, released by the same attestation policy, and written by
-  the parent to disk or S3. The parent stores bytes it cannot read.
-- Each sealed write carries a version number. The enclave refuses a state blob older than the
-  version recorded in the lease (below), so the operator cannot roll the keeper back to an old copy
-  (today's `docs/lend-keeper.md` already says a wrong state file is unrecoverable; an empty one is
-  rebuilt from the chain).
+- A keeper route, `/lend/attestation?nonce=<32 hex>`, returns a fresh attestation document: CBOR,
+  COSE_Sign1 signed with ES384, carrying `module_id`, `timestamp`, `digest`, `pcrs`,
+  `certificate`, `cabundle` and the optional `nonce`, `user_data` and `public_key` (each at most
+  1,024 bytes). `nonce` is the caller's. `public_key` is an enclave-generated key the page
+  encrypts its requests to. `user_data` is `SHA-256("keeler-keeper-attest-v1" ‖ program id ‖
+  keeper address ‖ pool viewing key ‖ reply key)`, the reply key being a second enclave key that
+  signs every keeper reply. The route's reply also carries a signature by the keeper key over the
+  document, so the enclave shows it holds a compiled keeper key rather than only naming one.
+- The check: the certificate chain from `cabundle` to the AWS Nitro Enclaves root certificate
+  (whose fingerprint AWS publishes), each certificate's validity, the COSE signature, the nonce,
+  the timestamp's age, PCR0 to PCR2 against the values compiled into the site (as the keeper set
+  and pool key are today), no all-zero PCR, and the keeper signature against the compiled
+  `KEEPERS`. Lending stays hidden when it fails, as it does today for an unknown keeper.
+- What the page's check binds: a request encrypted to `public_key` can be read only by an enclave
+  running the published image, and a reply signed by the reply key came from it. Both still pass
+  through the Cloudflare Worker, where the page's TLS ends. The Worker cannot read those requests
+  or forge those replies, but can delay, drop or replay them (the keeper's nonce and session
+  checks stand against replay). Page JavaScript cannot see its TLS peer's key, so the page cannot
+  bind a TLS channel to the enclave.
+- What it cannot bind: the page is served by the operator, and a different page could skip the
+  check ("The Worker operator" above). A standalone `keeler attest-check`, run by the user, does
+  not depend on the page; when it connects to the enclave directly with a TLS key the enclave
+  names in `user_data`, it can also bind that TLS channel to the enclave.
 
-### A single-writer lease
+### Encrypted state outside the enclave [proposal]
 
-- Today the state-file lock stops two processes on one file, not two machines with one key
-  (`docs/lend-keeper.md`, "Never"). In an enclave fleet the lease is a DynamoDB item per keeper
-  key: holder id, expiry, a fencing token that only grows, and the latest state version.
-- The enclave takes and renews it with conditional writes over TLS that terminates in the enclave.
-  It sends no transaction and writes no state unless it holds an unexpired lease, and stops a safe
-  margin before expiry when a renewal fails. Each state write includes the fencing token; a write
-  with an older token is refused.
-- The chain remains the final arbiter: two builds on one reserve cannot both land (the reserve's
-  nullifier), so a lease failure costs a fee, not funds.
+- The state file (openings, tickets, pending builds, scan marks) is sealed under the data key and
+  stored by the parent, which holds bytes it cannot read.
+- The parent can hand the enclave an older blob. The chain is the anchor against that: on load
+  the enclave checks each note it holds against its nullifier account and replays the history
+  from its scan mark, as the keeper does today (`docs/lend-keeper.md`, "Recovery"), so an old
+  reserve opening is seen to be spent and the current notes are read back from the chain. What a
+  rollback can still change is the record that is not on chain: tickets and pending builds.
+- No version counter is proposed: kept in a store the operator controls (a DynamoDB item, a
+  file), it can be restored together with the blob.
 
-### What the enclave cannot fix
+### A single-writer lease [proposal]
+
+- Today the lock stops two processes on one file, not two machines with one key
+  (`docs/lend-keeper.md`, "Never"). An enclave fleet adds a lease per keeper key in a store with
+  conditional writes (for example a DynamoDB item: holder, expiry, a fencing token that only
+  grows). The enclave sends nothing and writes no state without an unexpired lease, and stops a
+  margin before expiry when a renewal fails.
+- A fencing token protects only what checks it: the state store must refuse a write with an older
+  token. The chain checks no token.
+- The expiry needs a time source the operator cannot skew, and the operator owns the lease table,
+  can rewrite or delete the item, and carries the enclave's network traffic. So the lease guards
+  against faults (a host that stalls and comes back, a failover run twice), not against the
+  operator.
+- The backstop is the chain: two builds on one reserve cannot both land (the reserve's
+  nullifier), so two writers cost a fee. Deposits spend no reserve, so two writers can still pass
+  `max_total_collateral` together (review K-2).
+
+### What the enclave cannot fix [proposal]
 
 - **Liveness.** The operator can stop the instance, cut its network or withhold the vsock proxy.
   The pool still halts; the trust statement stays.
-- **The operator chooses the image.** Users check the measurement against a value the site
-  compiles in, and the site is served by the same operator. Independent parties who rebuild the
-  tag and publish PCR0 are the check on that.
+- **The operator chooses the image and the key policy.** Users compare the PCRs with values the
+  site compiles in, and the site is served by the same operator; independent parties who rebuild
+  the tag and publish the PCRs are the check on that. The KMS key policy and CloudTrail are inside
+  the operator's AWS account and not publicly readable, so "only the published image can decrypt
+  the keys" is the operator's statement, not something a user can verify.
+- **The hardware and cloud vendor.** AWS, the Nitro hypervisor and the Nitro root certificate
+  become part of the trusted base.
+- **Side channels.** The proposal claims no protection against timing or microarchitectural side
+  channels, nor against what the parent learns from the size and timing of the enclave's traffic.
 - **Corrupt ciphertext.** An enclave running honest code will not write an unreadable reserve, but
   nothing on chain proves it did not.
+- **Public wallets.** Wallets are public on every operation in the Default Ring; the enclave
+  changes nothing on chain.
 - **The Worker.** Account views still cross it in clear (W-3) unless the keeper encrypts them to
   the browser's session key, a separate change.
-- AWS and its Nitro root of trust become part of the trusted base.
 
-### What Custom Rings would change
+### What Custom Rings would change [proposal]
 
 A ring that checks output encryption to an auditor key would remove the "corrupt ciphertext" halt
 and let any successor rebuild the pool from the chain; hidden owners would remove the public
 wallets. The keeper would still see amounts and could still go offline, so the enclave and the
-ring answer different questions: the enclave makes the keeper's code checkable, the ring makes its
-writes checkable.
+ring answer different questions: the enclave makes the keeper's code attestable, the ring makes its
+writes checkable on chain.
+
+### References
+
+AWS documentation read on 2026-11-25:
+
+- Nitro Enclaves, cryptographic attestation (the PCRs, debug mode):
+  https://docs.aws.amazon.com/enclaves/latest/user/set-up-attestation.html
+- Nitro Enclaves, the attestation document and its validation:
+  https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html
+- Nitro Enclaves, using AWS KMS: https://docs.aws.amazon.com/enclaves/latest/user/kms.html
+- `nitro-cli run-enclave` (debug mode):
+  https://docs.aws.amazon.com/enclaves/latest/user/cmd-nitro-run-enclave.html
+- AWS KMS, how Nitro Enclaves use KMS:
+  https://docs.aws.amazon.com/kms/latest/developerguide/services-nitro-enclaves.html
+- AWS KMS, attested calls (`Recipient`, `CiphertextForRecipient`):
+  https://docs.aws.amazon.com/kms/latest/developerguide/attested-calls.html
+- AWS KMS, attestation condition keys:
+  https://docs.aws.amazon.com/kms/latest/developerguide/conditions-attestation.html
+- AWS KMS API, `ReEncrypt`: https://docs.aws.amazon.com/kms/latest/APIReference/API_ReEncrypt.html

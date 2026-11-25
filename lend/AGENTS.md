@@ -1,8 +1,10 @@
 # Keeler Lend: notes for contributors and coding agents
 
-The design is `docs/plan-lend.md`; the toolkit notes are `../docs/notes-for-xark-builders.md`.
-`lend/` is its own Cargo workspace (members `program`, `sdk`, `spike`), outside the root one.
-`scripts/setup-lend.sh` reads the tool paths from `.tools/env` and writes only under `lend/target`.
+Paths are relative to `lend/`. The design is `../docs/plan-lend.md`; the toolkit notes are
+`../docs/notes-for-xark-builders.md`. `lend/` is its own Cargo workspace (members `program`, `sdk`, `spike`), outside the root one.
+`../scripts/setup-lend.sh` reads the tool paths from the main checkout's `.tools/env` and writes
+under `target` (or `KEELER_LEND_OUT`), into `../web/public/lend` (the browser package it replaces
+there), and with `--update-checksums` into `lend-keys.CHECKSUM`.
 
 ## Layout
 
@@ -16,7 +18,7 @@ The design is `docs/plan-lend.md`; the toolkit notes are `../docs/notes-for-xark
 Adding an instruction: a tag in `lib.rs`, an instruction module, a circuit in
 `circuits/mod.rs`, its verifier in `program/src/verifier/mod.rs`, an error
 range in `error.rs`, its id in `sdk/src/proof.rs`, and its files in
-`lend-keys.CHECKSUM` (`scripts/setup-lend.sh --update-checksums`). A change to
+`lend-keys.CHECKSUM` (`../scripts/setup-lend.sh --update-checksums`). A change to
 a circuit changes its keys: the checksum check fails until they are
 regenerated, and a deployed program needs the new verifying key.
 
@@ -34,7 +36,7 @@ regenerated, and a deployed program needs the new verifying key.
   `refresh(state, pool, salt)`, which only stores the new rate and salt: it
   does not accrue, so every circuit that spends a reserve calls `accrue`
   itself first. Also share conversions, `assert_borrow_cap`, `VaultParams`. It passes
-  `web/tests/fixtures/lend-vectors.json` (`cargo test -p keeler-lend
+  `../web/tests/fixtures/lend-vectors.json` (`cargo test -p keeler-lend
   --features build-circuits --lib`).
 
 ## Xark rules learnt the hard way
@@ -74,7 +76,7 @@ scripts/run-chain-test.sh                 # local network, port offset 2100
 ```
 
 Features: exactly one of `insecure-test-setup` (the default) and `mainnet`.
-`test-price` is not a default: `scripts/setup-lend.sh` passes it for the
+`test-price` is not a default: `../scripts/setup-lend.sh` passes it for the
 local and devnet `.so`, and it cannot build with `mainnet`; such a `.so`
 contains the string `KEELER_LEND_TEST_PRICE_BUILD`. A `mainnet` build needs
 every build parameter set and refuses public test keys

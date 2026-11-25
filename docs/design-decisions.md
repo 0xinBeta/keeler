@@ -49,8 +49,10 @@ so an observer can tell a new position from a top-up.
   the openings and build those transactions.
 - **It restricts who can write a note the others must read.** The Default Ring does not check
   output ciphertexts. A reserve written by someone outside the keeper set could be encrypted to
-  nobody, which would halt the pool. With a keeper signature required and `pool_viewing` pinned
-  to the compiled key, only the set writes the reserve, and only under the key the set shares.
+  nobody, which would halt the pool. With a keeper signature required, only the set writes the
+  reserve. The program also pins the `pool_viewing` argument, so an honest build encrypts the
+  reserve to the shared key and a misconfigured keeper fails; it does not check the ciphertext,
+  so a keeper can still write a reserve nobody can open (trust).
 - **It serialises the lane.** Racing keepers spend the same reserve; one transaction fails on the
   nullifier.
 
@@ -62,7 +64,8 @@ circuit's rule (who is paid, how much, at what price).
 `draw` and `liquidate` take a public `bound`, the collateral price the health check uses. The
 program requires `price − confidence >= bound` for a draw and `price + confidence <= bound` for a
 liquidation (`check_draw_bound`, `check_liquidate_bound` in
-`lend/program/src/instructions/vault.rs`), with the price no older than 90 s.
+`lend/program/src/instructions/vault.rs`), with the price published within 90 s of the cluster
+clock.
 
 - **A bound derived from the position would publish its health.** A liquidation price, or a bound
   computed from collateral and debt, is a function of the private amounts. The bound is instead the
@@ -92,7 +95,8 @@ derive (`Poseidon(domain, spent note's blinding)`), which is what makes this che
 ## Liquidation is sized off-chain and only bounded in-circuit
 
 The keeper computes the repay `x` with `core::lend::liquidate` (the largest that leaves the
-position at the threshold, or the whole debt above the max limit). The circuit does not recompute
+position at the threshold, or above the max limit the largest `x <= debt` whose payout fits the
+collateral). The circuit does not recompute
 it; it requires (`lend/program/src/circuits/liquidate.rs`):
 
 - the position is past the threshold at the bound;
@@ -109,7 +113,7 @@ leaves the position still liquidatable and costs the keeper, never the owner.
 
 From the Privacy Rings documentation (`docs/plan-lend.md`, "Background: Privacy Rings"): in the
 Default Ring owners are public signers, output owner tags and counts are public, and ciphertexts
-are unchecked; custom rings were in audit until December 2026. With a custom ring:
+are unchecked; custom rings are in audit until December 2026. With a custom ring:
 
 - **Hidden owners.** Wallets would stop being public on every operation, which today shows who
   supplies, borrows and is liquidated.
