@@ -1796,7 +1796,6 @@
       },
       "name": "back to the threshold",
       "out": {
-        "buffer": "1766784",
         "collateral": "8810365160",
         "debt_shares": "1123321558",
         "payout": "1189634840",
@@ -1819,7 +1818,6 @@
       },
       "name": "back to the threshold, grown borrow price",
       "out": {
-        "buffer": "2650176",
         "collateral": "8215547734",
         "debt_shares": "997602225",
         "payout": "1784452266",
@@ -1842,7 +1840,6 @@
       },
       "name": "just past the threshold",
       "out": {
-        "buffer": "7",
         "collateral": "9999995247",
         "debt_shares": "1274999394",
         "payout": "4753",
@@ -1865,7 +1862,6 @@
       },
       "name": "a few units past the threshold",
       "out": {
-        "buffer": "0",
         "collateral": "9999999960",
         "debt_shares": "1274999995",
         "payout": "40",
@@ -1905,7 +1901,6 @@
       },
       "name": "at the max limit, partial",
       "out": {
-        "buffer": "5300353",
         "collateral": "6431095427",
         "debt_shares": "819964667",
         "payout": "3568904573",
@@ -1928,7 +1923,6 @@
       },
       "name": "above the max limit, all debt",
       "out": {
-        "buffer": "14000000",
         "collateral": "573333334",
         "debt_shares": "0",
         "payout": "9426666666",
@@ -1951,7 +1945,6 @@
       },
       "name": "bad debt, collateral used up",
       "out": {
-        "buffer": "14851485",
         "collateral": "0",
         "debt_shares": "114851485",
         "payout": "10000000000",
@@ -1991,7 +1984,6 @@
       },
       "name": "normal branch capped by the collateral",
       "out": {
-        "buffer": "9900",
         "collateral": "1",
         "debt_shares": "1901",
         "payout": "999999",
@@ -2014,7 +2006,6 @@
       },
       "name": "coarse collateral: price 1000 per unit",
       "out": {
-        "buffer": "10",
         "collateral": "9",
         "debt_shares": "7650",
         "payout": "1",

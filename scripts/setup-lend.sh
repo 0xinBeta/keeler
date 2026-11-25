@@ -9,9 +9,11 @@
 # scripts/setup.sh there once) and changes nothing outside lend/target.
 #
 # Build parameters (environment): KEELER_LEND_PROGRAM_ID, KEELER_LEND_ADMIN,
-# KEELER_LEND_KEEPER and the KEELER_LEND_VAULT1_* (see lend/program/build.rs;
-# the defaults are local test keys). Pass --update-checksums after changing a
-# circuit.
+# KEELER_LEND_KEEPERS, KEELER_LEND_POOL_VIEWING and the KEELER_LEND_VAULT1_*
+# (see lend/program/build_params.rs; the defaults are local test keys). The
+# .so it builds has the test price (marker string KEELER_LEND_TEST_PRICE_BUILD);
+# a mainnet build is scripts/deploy-mainnet.sh's. Pass --update-checksums
+# after changing a circuit.
 #
 # KEELER_LEND_OUT (default lend/target) is where the .so and keeler-lend-env
 # go, so a build for another network leaves the local test build alone. The

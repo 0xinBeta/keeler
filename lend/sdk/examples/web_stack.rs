@@ -31,7 +31,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use keeler_lend_sdk::{builders, purpose, KEEPER};
+use keeler_lend_sdk::{builders, purpose, KEEPERS};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use solana_address::Address;
@@ -425,13 +425,18 @@ fn main() -> Result<()> {
     let keeper_key = fixture::actor(0);
     let admin_key = fixture::actor(3);
     ensure!(
-        keeper_key.pubkey() == KEEPER && admin_key.pubkey() == keeler_lend::ADMIN,
+        keeper_key.pubkey() == KEEPERS[0] && admin_key.pubkey() == keeler_lend::ADMIN,
         "build the program with the default keeper and admin"
     );
-    let keeper = ShieldedKeypair::from_keypair(&keeper_key)?;
+    let keeper = keeler_lend_sdk::fixture_keeper_keypair(&keeper_key)?;
     user_registry::ensure_registered(net.client.rpc(), &keeper_key, &keeper).map_err(err)?;
     write_key(&dir.join("keeper-key.json"), &keeper_key)?;
     write_key(&dir.join("admin-key.json"), &admin_key)?;
+    // The keeper's `lend.pool_key`: the pool viewing key derives from it.
+    write_key(
+        &dir.join("pool-key.json"),
+        &Keypair::new_from_array(keeler_lend_sdk::FIXTURE_POOL_SEED),
+    )?;
     let user_key = Keypair::new_from_array(WALLET_SEED);
     let user = ShieldedKeypair::from_keypair(&user_key)?;
     let tusd = fixture::spl_mint();
@@ -453,7 +458,9 @@ fn main() -> Result<()> {
         "indexerUrl": ports.photon_url(),
         "proverUrl": prover,
         "programId": keeler_lend_sdk::ID.to_string(),
-        "keeper": KEEPER.to_string(),
+        "keeper": KEEPERS[0].to_string(),
+        "keepers": KEEPERS.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+        "poolViewing": hex(&keeler_lend::POOL_VIEWING),
         "helperUrl": format!("http://127.0.0.1:{port}"),
         "tusd": tusd.to_string(),
         "walletSeed": hex(&WALLET_SEED),

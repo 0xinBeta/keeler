@@ -72,7 +72,6 @@ const fns: Record<string, (i: J) => unknown> = {
     const x = L.liquidate(n(i.debt_shares), n(i.borrow_price), n(i.collateral), n(i.price), vaultOf(i.vault));
     return {
       repay: str(x.repay),
-      buffer: str(x.buffer),
       payout: str(x.payout),
       debt_shares: str(x.debtShares),
       collateral: str(x.collateral),

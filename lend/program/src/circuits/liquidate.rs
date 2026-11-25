@@ -1,11 +1,11 @@
 //! `liquidate`: the keeper, from its own note of the debt token, repays `x`
-//! of a position past the liquidation threshold at the public bound, pays a
-//! buffer of `floor(x x penalty / 1e4)` into the reserve (with no shares),
-//! and takes `floor((x + buffer) x 1e12 / bound)` of collateral, capped at
-//! the position's. Unless the position was above the max limit, it may not be
-//! left healthier than the threshold, and `x` must remove at least one debt
-//! share. The circuit does not prove `x` is the largest: the keeper computes
-//! it with `core::lend::liquidate`. No owner
+//! of a position past the liquidation threshold at the public bound, paying
+//! exactly `x` into the reserve, and takes `floor((x + floor(x x penalty /
+//! 1e4)) x 1e12 / bound)` of collateral, capped at the position's: the
+//! penalty is its reward. Unless the position was above the max limit, it
+//! may not be left healthier than the threshold, and `x` must remove at least
+//! one debt share. The circuit does not prove `x` is the largest: the keeper
+//! computes it with `core::lend::liquidate`. No owner
 //! signature; the rest of the collateral stays in the position.
 use spr_program::{
     circuit::{
@@ -30,7 +30,7 @@ use super::{
 
 pub const LIQUIDATE_POSITION_SLOT: usize = 0;
 pub const LIQUIDATE_RESERVE_SLOT: usize = 1;
-/// The liquidator's note after paying `x + buffer`.
+/// The liquidator's note after paying `x`.
 pub const LIQUIDATE_CHANGE_SLOT: usize = 2;
 /// The collateral, to the liquidator.
 pub const LIQUIDATE_PAYOUT_SLOT: usize = 3;
@@ -118,18 +118,19 @@ impl Liquidate {
         require(is_liquidatable(debt, worth, &v));
         let absorb = above_max_limit(debt, worth, &v);
 
-        // x, the buffer, and the payout at the bound, capped at the collateral.
+        // x, and the payout for x plus the penalty at the bound, capped at
+        // the collateral.
         let x = p.repay;
         require(x != 0 && x <= debt);
-        let buffer = to_u64(div_floor::<78, 14>(
+        let penalty = to_u64(div_floor::<78, 14>(
             Field::from(x),
             Field::from(v.penalty_bps),
             Field::from(BPS),
         ));
-        let paid_in = add(x, buffer);
+        let worth_taken = add(x, penalty);
         // A zero bound is refused by the division.
         let formula = to_u64(div_floor::<104, 64>(
-            Field::from(paid_in),
+            Field::from(worth_taken),
             Field::from(PRICE_SCALE),
             Field::from(public.bound),
         ));
@@ -152,7 +153,7 @@ impl Liquidate {
         require(removed != 0);
         reserve.debt_shares = sub(reserve.debt_shares, removed);
         position.debt_shares = shares;
-        funds.transfer(&mut reserve, &paid_in)?;
+        funds.transfer(&mut reserve, &x)?;
         let mut collateral_payout =
             TokenUtxos::new_init(&liquidator, &position.asset()).with_zero_output();
         position.transfer(&mut collateral_payout, &payout)?;

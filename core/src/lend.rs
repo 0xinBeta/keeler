@@ -42,9 +42,9 @@
 //! value`; liquidatable when `debt × 1e4 > lt × value`; above the max limit
 //! when `debt × 1e4 > lml × value`.
 //!
-//! Liquidation repaying `x`: the liquidator also pays `buffer = floor(x × p /
-//! 1e4)` into the reserve and receives `payout(x) = floor((x + buffer) × 1e12
-//! / price)` of collateral. `x` is fixed: above the max limit, the largest `x
+//! Liquidation repaying `x`: the liquidator transfers exactly `x` into the
+//! reserve and receives `payout(x) = floor((x + floor(x × p / 1e4)) × 1e12 /
+//! price)` of collateral, the penalty `p` being its reward. `x` is fixed: above the max limit, the largest `x
 //! <= debt` whose payout fits the collateral; otherwise also the largest such
 //! `x` with `(debt − x) × 1e4 >= lt × floor((collateral − payout(x)) × price /
 //! 1e12)` (the position is left at or just above the threshold, never pushed
@@ -411,10 +411,8 @@ pub fn above_max_limit(debt: u64, value: u64, v: &Vault) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Liquidation {
-    /// Debt repaid, `x`.
+    /// Debt repaid, `x`: exactly what the liquidator pays in.
     pub repay: u64,
-    /// Paid on top of `repay`, kept by the reserve.
-    pub buffer: u64,
     /// Collateral to the liquidator.
     pub payout: u64,
     /// The position after.
@@ -482,7 +480,6 @@ pub fn liquidate(
     }
     Ok(Liquidation {
         repay: x as u64,
-        buffer: (x * p / B) as u64,
         payout: paid as u64,
         debt_shares: after.shares,
         collateral: (c - paid) as u64,

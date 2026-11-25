@@ -8,7 +8,7 @@ use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
-    check_now, cpi, parse, require_keeper,
+    check_now, cpi, parse, require_keeper, require_pool_viewing,
     vault::{check_liquidate_bound, first_nullifier, mints, vault},
     verified, Pda,
 };
@@ -40,6 +40,7 @@ pub fn process(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     require_keeper(iter.next_signer_mut("keeper")?)?;
     let price = iter.next_account("price")?;
     let (args, transact, bytes) = parse::<LiquidateArgs>(data)?;
+    require_pool_viewing(&args.pool_viewing)?;
     check_now(args.now)?;
     let vault = vault(args.vault)?;
     check_liquidate_bound(price, vault, args.bound)?;

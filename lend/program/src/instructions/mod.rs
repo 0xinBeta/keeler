@@ -152,10 +152,29 @@ pub(crate) fn verified(result: Result<(), spr_program::verifier::VerifyError>) -
     result.map_err(|_| LendError::InvalidProof.into())
 }
 
-/// Requires `account` to be the keeper and to have signed. Every instruction
-/// that spends a reserve calls it on its keeper account.
+/// Requires `account` to be one of the keepers and to have signed. Every
+/// instruction that spends a reserve calls it on its keeper account.
 pub(crate) fn require_keeper(account: &AccountView) -> ProgramResult {
-    require_signer(account, &crate::KEEPER, LendError::NotKeeper)
+    if !account.is_signer() {
+        return Err(LendError::MissingSignature.into());
+    }
+    if !crate::KEEPERS
+        .iter()
+        .any(|k| address_eq(account.address(), k))
+    {
+        return Err(LendError::NotKeeper.into());
+    }
+    Ok(())
+}
+
+/// Requires `viewing` to be the compiled pool viewing key, so no keeper can
+/// write a reserve its peers cannot open. Every instruction that takes a
+/// `pool_viewing` argument calls it.
+pub(crate) fn require_pool_viewing(viewing: &[u8; 33]) -> ProgramResult {
+    if viewing != &crate::POOL_VIEWING {
+        return Err(LendError::WrongPoolViewing.into());
+    }
+    Ok(())
 }
 
 pub(crate) fn require_admin(account: &AccountView) -> ProgramResult {

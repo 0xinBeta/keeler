@@ -11,7 +11,7 @@ use spr_client::{ProofAuthority, SprIndexer, TransferInput};
 use spr_interface::{
     instruction::instruction_data::transact::TransactIxData, SHIELDED_POOL_PROGRAM_ID,
 };
-use spr_keypair::ShieldedKeypair;
+use spr_keypair::{ShieldedKeypair, SigningKey};
 use spr_program::{instruction::nullifier_pda_accounts, DataUtxo, Field, ProgramOwner};
 use spr_transaction::{instructions::transact::SppProofInputs, WalletUtxo};
 
@@ -23,8 +23,31 @@ pub use keeler_lend::{
         cancel_intent::CancelIntentArgs, init_reserve::InitReserveArgs, intent::IntentArgs,
         redeem::RedeemArgs, supply::SupplyArgs,
     },
-    tag, ADMIN, ID, KEEPER, POOL_SEED, USER_SEED,
+    tag, ADMIN, ID, KEEPERS, POOL_SEED, POOL_VIEWING, USER_SEED,
 };
+
+/// The secret of the local test pool key (public): the default build's
+/// `POOL_VIEWING` is its viewing key. Neither fixture keeper's key.
+pub const FIXTURE_POOL_SEED: [u8; 32] = *b"keeler lend fixture pool key\0\0\0\0";
+
+/// A keeper's shielded keypair: its own signing and nullifier keys under the
+/// pool viewing key, the viewing key `pool` derives as any wallet's would.
+/// The builders encrypt pool notes to `keeper.viewing_pubkey()`, so every
+/// keeper built this way writes and reads the same notes. The program
+/// refuses a pool viewing key other than [`POOL_VIEWING`].
+pub fn keeper_keypair(
+    keeper: impl Into<SigningKey>,
+    pool: impl Into<SigningKey>,
+) -> Result<ShieldedKeypair> {
+    let viewing = ShieldedKeypair::from_keypair(pool)?.viewing_key;
+    Ok(ShieldedKeypair::with_viewing_key(keeper.into(), viewing)?)
+}
+
+/// [`keeper_keypair`] with the fixture pool key ([`FIXTURE_POOL_SEED`]):
+/// local networks and tests only.
+pub fn fixture_keeper_keypair(keeper: impl Into<SigningKey>) -> Result<ShieldedKeypair> {
+    keeper_keypair(keeper, SigningKey::from_ed25519_bytes(&FIXTURE_POOL_SEED))
+}
 
 pub(crate) fn err(e: impl core::fmt::Debug) -> anyhow::Error {
     anyhow::anyhow!("{e:?}")

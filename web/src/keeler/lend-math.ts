@@ -44,7 +44,7 @@ export type Curve = { kinks: readonly Kink[] };
 export type Pool = { curve: Curve; feeBps: bigint };
 export type Vault = { cfBps: bigint; ltBps: bigint; lmlBps: bigint; penaltyBps: bigint };
 export type Repaid = { shares: bigint; change: bigint };
-export type Liquidation = { repay: bigint; buffer: bigint; payout: bigint; debtShares: bigint; collateral: bigint };
+export type Liquidation = { repay: bigint; payout: bigint; debtShares: bigint; collateral: bigint };
 export type Apr = { borrowBps: bigint; supplyBps: bigint };
 
 export const TUSD_POOL: Pool = {
@@ -300,7 +300,6 @@ export function liquidate(
   const paid = payoutOf(x, p, price);
   return {
     repay: x,
-    buffer: (x * p) / B,
     payout: paid,
     debtShares: repayShares(debtShares, x, borrowPrice).shares,
     collateral: c - paid,

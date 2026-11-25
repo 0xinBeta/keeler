@@ -222,6 +222,8 @@ pub fn set_test_price(accounts: &mut [AccountView], data: &[u8]) -> ProgramResul
     if !cfg!(feature = "test-price") {
         return Err(VaultError::TestPriceDisabled.into());
     }
+    #[cfg(feature = "test-price")]
+    core::hint::black_box(&crate::vaults::TEST_PRICE_MARKER);
     let [keeper, account, ..] = accounts else {
         return Err(LendError::InvalidAccounts.into());
     };

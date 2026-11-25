@@ -6,7 +6,8 @@ use spr_program::CompressedProof;
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
-    check_now, clock, cpi, mint_halves, parse, require_keeper, require_pool_mint, verified, Pda,
+    check_now, clock, cpi, mint_halves, parse, require_keeper, require_pool_mint,
+    require_pool_viewing, verified, Pda,
 };
 use crate::{error::LendError, verifier::supply as v, POOL_SEED, USER_SEED};
 
@@ -34,6 +35,7 @@ pub fn process(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     let mut iter = AccountIterator::new(accounts);
     require_keeper(iter.next_signer_mut("keeper")?)?;
     let (args, transact, bytes) = parse::<SupplyArgs>(data)?;
+    require_pool_viewing(&args.pool_viewing)?;
     check_now(args.now)?;
     let expiry = i64::try_from(args.expiry).unwrap_or(i64::MAX);
     if clock()? > expiry {

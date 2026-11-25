@@ -7,7 +7,7 @@ use wincode::{SchemaRead, SchemaWrite};
 
 use super::{
     check_now, cpi, identity, mint_halves, parse, require_keeper, require_pool_mint,
-    supply::first_nullifier, verified, Pda,
+    require_pool_viewing, supply::first_nullifier, verified, Pda,
 };
 use crate::{verifier::redeem as v, POOL_SEED, USER_SEED};
 
@@ -33,6 +33,7 @@ pub fn process(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     require_keeper(iter.next_signer_mut("keeper")?)?;
     let owner = *iter.next_signer("owner")?.address();
     let (args, transact, bytes) = parse::<RedeemArgs>(data)?;
+    require_pool_viewing(&args.pool_viewing)?;
     check_now(args.now)?;
     require_pool_mint(&args.mint)?;
     let pool = Pda::new(POOL_SEED, &args.mint, args.pool_bump)?;
