@@ -69,6 +69,8 @@ jobs:
             lend -> target
           cache-workspace-crates: true
       - run: scripts/setup.sh
+      - name: Drop the browser package restored with lend/target, which zolana will not overwrite without its marker
+        run: rm -rf lend/target/wasm
       - run: scripts/setup-lend.sh
       - name: cargo fmt --check
         run: |
