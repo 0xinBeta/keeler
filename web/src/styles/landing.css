@@ -1,10 +1,6 @@
 /* The landing, ported from the design handoff's styles.css and lending-instruments.css. Every rule is scoped under
    .kl-landing so it cannot reach the app's views. */
 
-body:has(.kl-landing) .stage > .top,
-body:has(.kl-landing) > #root > .foot {
-  display: none;
-}
 
 .kl-landing {
   --kl-paper: #f5eee6;

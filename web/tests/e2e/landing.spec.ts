@@ -2,7 +2,7 @@
 // LEND_SCREENS=<dir> also saves a screenshot of each chapter there, named landing-<project>-<n>-<chapter>.jpg.
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
-const panel = (page: Page) => page.getByRole("region", { name: "Private swap" });
+const panel = (page: Page) => page.getByRole("region", { name: "Keeler app" });
 const active = (page: Page) => page.locator('.kl-chapter[data-active="true"]');
 const CHAPTERS: [number, RegExp][] = [
   [0, /^Lend in private\.$/],

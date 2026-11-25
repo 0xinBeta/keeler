@@ -5,7 +5,12 @@ import { readFileSync } from "node:fs";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK } from "../playwright.config";
 
-const panel = (page: Page) => page.getByRole("region", { name: "Private swap" });
+const panel = (page: Page) => page.getByRole("region", { name: "Keeler app" });
+async function view(page: Page, name: string) {
+  const link = page.getByRole("navigation", { name: "Application" }).getByRole("link", { name: new RegExp(`^${name}`) });
+  await link.click();
+  await expect(link).toHaveAttribute("aria-current", "page");
+}
 const ordersSection = (page: Page) => page.locator("section[aria-labelledby=orders-title]");
 
 /** Base units from the page's formatted amount ("1,234.5"). */
@@ -17,7 +22,7 @@ function units(text: string, decimals: number): bigint {
 const DECIMALS: Record<string, number> = { tUSD: 6, tSOL: 9 };
 
 async function balances(page: Page) {
-  await panel(page).getByRole("button", { name: "Balances", exact: true }).click();
+  await view(page, "Balances");
   const table = panel(page).getByRole("table");
   await expect(table.getByText("Reading balances…")).toHaveCount(0);
   const out: Record<string, { public: bigint; private: bigint }> = {};
@@ -31,7 +36,7 @@ async function balances(page: Page) {
 
 async function move(page: Page, mode: "Deposit" | "Withdraw", amount: string, symbol: string) {
   const p = panel(page);
-  await p.getByRole("button", { name: "Balances", exact: true }).click();
+  await view(page, "Balances");
   await p.getByRole("group", { name: "Direction" }).getByRole("button", { name: mode }).click();
   await p.getByRole("combobox", { name: "Asset", exact: true }).selectOption({ label: symbol });
   await p.locator("#move-amt").fill(amount);
@@ -42,7 +47,7 @@ async function move(page: Page, mode: "Deposit" | "Withdraw", amount: string, sy
 /** Sells `amount` tUSD for tSOL with the selected quote; resolves once the order is locked or settled. */
 async function startSwap(page: Page, amount: string, onProving?: () => void) {
   const p = panel(page);
-  await p.getByRole("button", { name: "Swap", exact: true }).click();
+  await view(page, "Swap");
   await p.locator("#sell-amt").fill(amount);
   await p.getByRole("button", { name: "Get quotes" }).click();
   await expect(p.getByText("Signature verified")).toBeVisible({ timeout: 30_000 });
@@ -133,6 +138,7 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
     await page.reload();
     await connectAndUnlock(page);
     await expect(panel(page).getByRole("heading", { name: "Swap privately" })).toBeVisible({ timeout: 60_000 });
+    await view(page, "Activity");
     const orders = ordersSection(page);
     await orders.getByRole("button", { name: "Find my orders" }).click();
     await expect(orders.getByRole("button", { name: "Find my orders" })).toBeEnabled({ timeout: 120_000 });
