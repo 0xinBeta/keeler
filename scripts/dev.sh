@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The whole app on a local network, in one command:
 #   1. scripts/localnet.sh start <offset>: validator, Photon, prover, dealer (HTTP + faucet);
-#   2. builds web/dist with VITE_DEALERS taken from the stack's keeler-web.json;
+#   2. builds web/dist with VITE_DEALERS and VITE_ASSETS taken from the stack's keeler-web.json;
 #   3. writes worker/.dev.vars from the same file;
 #   4. runs the real Worker under `wrangler dev`, serving the built site.
 # Stops everything it started on exit (Ctrl-C, SIGTERM).
@@ -29,6 +29,8 @@ bash "$root/scripts/localnet.sh" start "$offset" >/dev/null
 # What a deploy sets at build time (plan G1): the site's own copy of the dealer keys.
 VITE_DEALERS=$(node -e 'const w = require(process.argv[1]); console.log(JSON.stringify([w.dealer.pubkey]))' "$json")
 export VITE_DEALERS
+VITE_ASSETS=$(node -e 'const w = require(process.argv[1]); console.log(JSON.stringify(w.assets.map(({ mint, symbol, decimals }) => ({ mint, symbol, decimals }))))' "$json")
+export VITE_ASSETS
 # The client refuses a service on another network than the one it was built for.
 export VITE_NETWORK=local
 (cd "$root/web" && pnpm build)

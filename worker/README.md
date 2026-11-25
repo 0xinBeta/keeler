@@ -51,7 +51,7 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `UPSTREAM_INDEXER` | var | Overrides `UPSTREAM_SPR` for the indexer paths. Default on `local`: `http://127.0.0.1:8784` |
 | `UPSTREAM_PROVER` | var | Overrides `UPSTREAM_SPR` for the prover paths. Default on `local`: `http://127.0.0.1:3001` |
 | `PROGRAM_ID` | var | Swap program ID |
-| `ASSETS` | var | JSON `[{"mint","symbol","decimals"}]` |
+| `ASSETS` | var | JSON `[{"mint","symbol","decimals"}]`, each optionally with `maxSell` (a decimal string of base units). The site carries its own copy in `VITE_ASSETS` (required on `mainnet`) and refuses an asset it was not built with or with another symbol or decimals; of each asset it takes only `maxSell` from here |
 | `BAND_BPS`, `MIN_TTL_SECS`, `MAX_TTL_SECS` | var | Numbers |
 | `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}`: fixed prices for mints without a Pyth account. Ignored on `mainnet` |
 | `FAUCET` | var | `"1"` turns on `/api/faucet` |
@@ -60,7 +60,7 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_ACCOUNTS`. A price older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
 | `LEND_PROGRAM_ID` | var | Lend program ID (base58) |
 | `LEND_POOLS` | var | JSON `[{"mint","curve":[{"utilisationBps","rateBps"}],"feeBps","maxUtilisationBps","minSupply"}]`. The curve has 2 to 8 points, utilisation strictly rising from 0 to 10000 |
-| `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps`. Every pool mint and collateral mint must also be in `ASSETS` (the page reads lend amounts with its decimals) |
+| `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps`. The page refuses a vault whose `id` and risk parameters are not the ones compiled into it (vault 1: 8000, 8500, 9000, 100). Every pool mint and collateral mint must also be in `ASSETS` (the page reads lend amounts with its decimals) |
 | `LEND_KEEPERS` | var | Optional JSON `[{"url","pubkey"}]`, 1 to 4 keepers in the order to ask them, no repeated `pubkey`, each `url` `https://` (`http://` only on `local`). Unset: one keeper, at `LEND_KEEPER_URL` (or the first `DEALERS` entry's `url`) with the first `DEALERS` entry's `pubkey` |
 | `LEND_KEEPER_URL` | var | Optional `https://` (on `local` also `http://`) base URL of the lending keeper, used only without `LEND_KEEPERS`. Default: the first `DEALERS` entry's `url` |
 | `LEND_PAUSED` | var | `"1"` refuses `supply` tickets (new deposits into Earn) with a 503, and sends everything else (`pools`, `account`, `repay` and `deposit` tickets, every `build`) with `x-keeler-paused: 1`: the keeper then refuses a deposit that opens a position and any build that borrows. Repaying, topping up, withdrawing from Earn and withdrawing collateral keep working, and tickets issued before the switch still fill |
@@ -193,12 +193,12 @@ stay open (wallets need them) and count under the RPC limits.
 ## Run locally against a local network
 
 `scripts/dev.sh [offset] [port]` does all of this in one command: it starts the local network,
-builds the site with `VITE_DEALERS`, writes `worker/.dev.vars` from the network's
+builds the site with `VITE_DEALERS` and `VITE_ASSETS`, writes `worker/.dev.vars` from the network's
 `target/localnet/keeler-web-<offset>.json` and runs `wrangler dev`; Ctrl-C stops it all.
 
 By hand: start the local network (`scripts/localnet.sh`), build the site
-(`cd ../web && VITE_NETWORK=local VITE_DEALERS='["<dealer pubkey>"]' pnpm build`; the site refuses a
-service whose `NETWORK` differs from `VITE_NETWORK`), then put this in
+(`cd ../web && VITE_NETWORK=local VITE_DEALERS='["<dealer pubkey>"]' VITE_ASSETS='[{"mint":"REPLACE_MINT_A","symbol":"tUSD","decimals":6},{"mint":"REPLACE_MINT_B","symbol":"tSOL","decimals":9}]' pnpm build`;
+the site refuses a service whose `NETWORK` differs from `VITE_NETWORK`, or whose `ASSETS` differ from `VITE_ASSETS`), then put this in
 `worker/.dev.vars` (git-ignored; placeholder values):
 
 ```sh
