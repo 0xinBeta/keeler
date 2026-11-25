@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
-import type { Vault } from "../keeler/index";
+import type { Balance, Pool, Vault } from "../keeler/index";
 import { canDraw, collateralValue } from "../keeler/lend-math";
-import { grow, healthBps, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceFromWhole, priceText } from "./lend-view";
+import { borrowLimits, drawPrice, earnLimits, grow, healthBps, lendingShown, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceFromWhole, priceText } from "./lend-view";
 
 const tUSD = { mint: "u", symbol: "tUSD", decimals: 6 };
 const tSOL = { mint: "s", symbol: "tSOL", decimals: 9 };
@@ -50,4 +50,40 @@ test("display growth, percentages and prices", () => {
   expect(pct(7023)).toBe("70.2%");
   expect(pct(Infinity)).toBe("—");
   expect(priceText(priceFromWhole(120n * USD, vault), vault)).toBe("120");
+});
+
+test("earn limits: one note to deposit, the largest of this pool's receipts to withdraw", () => {
+  const pool = { id: "u", asset: tUSD } as Pool;
+  const balances = [{ asset: tUSD, public: 0n, private: 900n * USD, largestNote: 600n * USD }] as Balance[];
+  const receipts = [
+    { pool: "u", shares: 1n, value: 300n * USD },
+    { pool: "u", shares: 1n, value: 500n * USD },
+    { pool: "u", shares: 0n, value: 0n },
+    { pool: "other", shares: 1n, value: 900n * USD },
+  ];
+  const l = earnLimits(pool, receipts, balances);
+  expect(l.note).toBe(600n * USD);
+  expect(l.largestReceipt).toBe(500n * USD);
+  expect(l.mine).toHaveLength(2);
+  expect(earnLimits(pool, null, null)).toEqual({ mine: [], largestReceipt: 0n, note: null });
+});
+
+test("borrow limits per action match the note and canDraw limits", () => {
+  const balances = [
+    { asset: tSOL, public: 0n, private: 5n * SOL, largestNote: 3n * SOL },
+    { asset: tUSD, public: 0n, private: 0n, largestNote: 0n },
+  ] as Balance[];
+  const l = borrowLimits(vault, 4n * SOL, 100n * USD, balances);
+  expect(l.add).toBe(3n * SOL);
+  expect(l.repay).toBe(0n);
+  expect(l.borrow).toBe(maxBorrow(4n * SOL, 100n * USD, drawPrice(vault), 8000));
+  expect(l.withdraw).toBe(maxWithdraw(4n * SOL, 100n * USD, drawPrice(vault), 8000));
+  expect(borrowLimits(vault, 0n, 0n, null)).toEqual({ add: null, borrow: 0n, repay: null, withdraw: 0n });
+});
+
+test("lending is presented from the build until the config is read, then from the client", () => {
+  expect(lendingShown(false, false, true)).toBe(true);
+  expect(lendingShown(false, false, false)).toBe(false);
+  expect(lendingShown(true, false, true)).toBe(false);
+  expect(lendingShown(true, true, false)).toBe(true);
 });

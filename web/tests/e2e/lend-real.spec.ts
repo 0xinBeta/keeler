@@ -24,7 +24,7 @@ const SEED_KEY = "keeler:in-page-wallet:v1";
 const KEEPER = 240_000;
 const PROVE = 240_000;
 
-const panel = (page: Page) => page.getByRole("region", { name: "Private swap" });
+const panel = (page: Page) => page.getByRole("region", { name: "Keeler app" });
 const activity = (page: Page) => page.locator("section[aria-labelledby=lending-title]");
 
 function units(text: string, decimals: number): bigint {
@@ -65,7 +65,8 @@ let page: Page;
 const problems: string[] = [];
 
 async function open() {
-  await page.goto("/");
+  await page.goto("/#swap");
+  await page.reload();
   const p = panel(page);
   await p.getByRole("button", { name: /Browser test wallet/ }).click();
   await p.getByRole("button", { name: "Sign to unlock" }).click();
@@ -74,13 +75,17 @@ async function open() {
 /** Private balance of `symbol` from the Balances tab, in base units. */
 async function privateBalance(symbol: string, decimals: number) {
   const p = panel(page);
-  await p.getByRole("group", { name: "Panel" }).getByRole("button", { name: "Balances", exact: true }).click();
+  await page.getByRole("navigation", { name: "Application" }).getByRole("link", { name: "Balances" }).click();
   const row = p.locator("table.bal tr", { has: page.locator("th", { hasText: new RegExp(`^${symbol}$`) }) });
   const v = units(await row.locator("td").nth(1).innerText(), decimals);
   return v;
 }
 
-const tab = (name: "Earn" | "Borrow") => panel(page).getByRole("group", { name: "Panel" }).getByRole("button", { name, exact: true }).click();
+const tab = async (name: "Earn" | "Borrow" | "Activity") => {
+  const link = page.getByRole("navigation", { name: "Application" }).getByRole("link", { name: new RegExp(`^${name}`) });
+  await link.click();
+  await expect(link).toHaveAttribute("aria-current", "page");
+};
 
 /** Clicks `button` and waits for the operation to land, then Done. */
 async function landed(button: string, done: RegExp | string, what: string, timeout = KEEPER + PROVE) {
@@ -118,7 +123,7 @@ test.beforeAll(async ({ browser }) => {
   await open();
   const p = panel(page);
   await p.getByRole("button", { name: "Register" }).click();
-  await expect(p.getByRole("heading", { name: "Swap privately" })).toBeVisible({ timeout: 60_000 });
+  await expect(page.locator("#sell-amt")).toBeVisible({ timeout: 60_000 });
   await expect.poll(() => privateBalance("tUSD", 6), { timeout: 60_000 }).toBe(50_000_000n);
 });
 
@@ -220,7 +225,9 @@ test("liquidation: borrow near the limit, the price drops, the keeper liquidates
   const collateral = units(await position(0).innerText(), 9);
   expect(collateral).toBeLessThan(1_000_000_000n);
   expect(collateral).toBeGreaterThan(500_000_000n);
+  await tab("Activity");
   await expect(activity(page).getByText("Liquidation", { exact: true })).toBeVisible();
+  await tab("Borrow");
   setPrice(10);
   // Repay the rest: the position is debt-free for the cases below.
   await borrowAction("Repay", "max", "Repay", "Done. The repayment is applied.", "repay all after the liquidation");
@@ -246,6 +253,7 @@ test("recovery: with the browser's storage cleared, the receipt and the position
   await timed("recovery: reload to receipts and positions shown", async () => {
     await open();
     // The page never asks the wallet on its own: the reader allows the session to fetch the keeper's view.
+    await tab("Earn");
     await page.getByRole("button", { name: "Check with the keeper" }).click({ timeout: 120_000 });
     await tab("Earn");
     await expect(p.locator(".mine-big")).toBeVisible({ timeout: 120_000 });

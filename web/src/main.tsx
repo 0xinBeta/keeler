@@ -1,7 +1,5 @@
 /// <reference types="vite/client" />
-import "@fontsource/unbounded/300.css";
-import "@fontsource/unbounded/400.css";
-import "@fontsource-variable/onest/wght.css";
+import "./styles/tokens.css";
 import "./styles/app.css";
 import { createRoot } from "react-dom/client";
 import type { Keeler } from "./keeler/index";

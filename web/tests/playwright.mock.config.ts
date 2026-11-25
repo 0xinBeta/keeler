@@ -6,7 +6,7 @@ const port = Number(process.env.KEELER_MOCK_PORT ?? 5292);
 
 export default defineConfig({
   testDir: "./e2e",
-  testMatch: /lend\.spec\.ts/,
+  testMatch: /(landing|lend)\.spec\.ts/,
   timeout: 180_000,
   workers: 1,
   reporter: "list",

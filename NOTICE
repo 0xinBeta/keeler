@@ -57,6 +57,6 @@ Mollusk (mollusk-svm), Pinocchio
   https://github.com/anza-xyz/mollusk, https://github.com/anza-xyz/pinocchio
   Apache-2.0. Dependencies from crates.io.
 
-Onest and Unbounded fonts (@fontsource-variable/onest, @fontsource/unbounded)
+Archivo and Unbounded fonts (@fontsource-variable/archivo, @fontsource-variable/unbounded)
   SIL Open Font License 1.1. Bundled into the built web page, not this
   repository.

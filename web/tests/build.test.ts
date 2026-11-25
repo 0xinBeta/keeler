@@ -7,14 +7,10 @@ import { lendCompiled, parseConfig } from "../src/keeler/client";
 import * as L from "../src/ui/Landing";
 import { pageHtml } from "../vite.config";
 
-/** Every landing section's copy, as App renders it for `network` with the symbols `pair`. */
-function landing(network: string, pair = L.pairOf(null, network)) {
-  const r = (c: unknown, props: Record<string, unknown> = {}) => renderToStaticMarkup(createElement(c as never, props as never));
-  return [
-    r(L.Facts), r(L.Features), r(L.ChainSees, { pair }), r(L.Steps), r(L.Audience), r(L.Dealers),
-    r(L.LendFeatures, { market: null, onOpen: () => {}, pair }), r(L.LendPrivacy, { pair }), r(L.LendLiquidation, { pair }), r(L.LendNumbers),
-    r(L.Faq, { lend: true, network, pair }), r(L.Faq, { lend: false, network, pair }), r(L.Closing, { onStart: () => {} }),
-  ].join("\n");
+/** The landing's text, as App renders it for `network`, with or without lending. */
+function landing(network: string, { lend = true, market = null as Parameters<typeof L.pairOf>[0] } = {}) {
+  const html = renderToStaticMarkup(createElement(L.Landing, { config: null, market: market as never, lend, open: () => {}, network }));
+  return html.replace(/<[^>]+>/g, "").replaceAll("&#x27;", "'").replaceAll("&amp;", "&");
 }
 const TEST_WORDS = /devnet|test tokens?|test proving keys|test price|browser test wallet|test version|unaudited|tSOL|tUSD/i;
 
@@ -56,6 +52,19 @@ describe("the compiled lend settings", () => {
   });
 });
 
+describe("a deployment without lending", () => {
+  it("gets the swap-led landing: the hero and the closing chapter only, and the swap FAQ", () => {
+    for (const network of ["devnet", "mainnet"]) {
+      const page = landing(network, { lend: false });
+      expect(page).toContain("Swap in private.");
+      expect(page).toContain("Try private swaps.");
+      expect(page).toContain("Start a swap");
+      for (const t of ["Lend in private.", "Put ", "Borrow against", "liquidation price", "Private amounts.", "Who runs the pool?", "attested enclave"]) expect(page).not.toContain(t);
+    }
+    expect(landing("devnet", { lend: false })).toContain("Try it with free test tokens.");
+  });
+});
+
 describe("a mainnet build", () => {
   const served = { network: "mainnet", rpcPath: "/api/rpc", sprPath: "/v1/spr", programId: PROGRAM, assets: [], dealers: [], bandBps: 0, minTtlSecs: 0, maxTtlSecs: 0, faucet: true, paused: false };
 
@@ -67,12 +76,26 @@ describe("a mainnet build", () => {
   it("names no test token and says nothing of a test version anywhere on the page, and the devnet page still does", () => {
     const mainnet = landing("mainnet");
     expect(mainnet).not.toMatch(TEST_WORDS);
-    expect(mainnet).toContain("Lock SOL and borrow USDC");
-    expect(mainnet).toContain("1,250 USDC");
+    for (const t of ["Supply USDC or borrow against SOL on Solana.", "Borrow against your SOL.", "Supply or borrow from your private balance on Solana.", "attested enclave"]) expect(mainnet).toContain(t);
+    expect(landing("mainnet", { lend: false })).not.toMatch(TEST_WORDS);
     // The market's symbols win when the service names them.
-    expect(landing("mainnet", L.pairOf({ vaults: [{ collateral: { symbol: "JitoSOL" }, debt: { symbol: "USDT" } }] }))).toContain("Borrow against JitoSOL");
+    expect(landing("mainnet", { market: { pools: [], vaults: [{ collateral: { symbol: "JitoSOL" }, debt: { symbol: "USDT" }, collateralFactorBps: 7500, liquidationThresholdBps: 8000 }] } as never })).toMatch(/Borrow against your JitoSOL\..*75% limit with no existing debt.*80% liquidation threshold/);
     const devnet = landing("devnet");
-    for (const s of ["Lock tSOL and borrow tUSD", "tUSD → tSOL", "116.08 tUSD per tSOL", "as the tSOL price falls", "85% loan-to-value for tSOL → tUSD", "Not yet."]) expect(devnet).toContain(s);
+    for (const t of [
+      "Supply tUSD or borrow against tSOL on Solana. Your lending amounts stay hidden from the public chain.",
+      "Put tUSD to work.",
+      "Borrow against your tSOL.",
+      "Know your liquidation price.",
+      "Lending amounts are visible to you and to Keeler's keeper service.",
+      "Try it with free test tokens.",
+      "Illustrative borrow capacity",
+      "Illustrative position of 4 tSOL against 420 tUSD debt.",
+      "Running the keeper in an attested enclave, so that Keeler's operators cannot read amounts, is planned.",
+      "85% loan-to-value for tSOL → tUSD",
+      "Not yet.",
+    ])
+      expect(devnet).toContain(t);
+    expect(devnet).not.toMatch(/encrypted on-chain|only you and the keeper|sample balance|demo/i);
     const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
     expect(pageHtml(html, "devnet")).toBe(html);
     expect(html).toContain("Test version, test tokens only, unaudited.");
