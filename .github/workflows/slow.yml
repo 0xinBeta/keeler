@@ -1,0 +1,81 @@
+name: Slow suites
+
+# Run by hand (Actions, "Slow suites", Run workflow); never gates a pull request.
+# Mollusk on the built .so, the local-network tests, the keeper and swap end to end,
+# and the page's mock browser suite. The page against a real local keeper
+# (scripts/lend-web-stack.sh, pnpm e2e:lend) is not here: run it locally.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AGAVE_VERSION: v4.1.2
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  slow:
+    name: Mollusk, local network, end to end, browser
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Cache Agave, platform tools and Zolana downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.cache/solana
+            ~/.config/zolana/cache
+          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ hashFiles('scripts/setup.sh') }}
+      - name: Install Agave
+        run: |
+          bin=$HOME/.local/share/solana/install/active_release/bin
+          [[ -x $bin/cargo-build-sbf ]] || sh -c "$(curl -sSfL https://release.anza.xyz/$AGAVE_VERSION/install)"
+          echo "$bin" >>"$GITHUB_PATH"
+      - name: Install the pinned Rust toolchains
+        run: |
+          rustup toolchain install
+          (cd lend && rustup toolchain install)
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: slow
+          workspaces: |
+            . -> target
+            lend -> target
+            .tools/privacy-ring-examples/swap/xark -> target
+          cache-workspace-crates: true
+      - run: scripts/setup.sh
+      - run: scripts/setup-lend.sh
+      - name: Mollusk program tests
+        working-directory: lend
+        run: cargo test -p keeler-lend --test program --test earn --test vault
+      - name: Local-network tests
+        working-directory: lend
+        run: scripts/run-chain-test.sh
+      - name: Keeper end to end
+        run: scripts/run-lend-e2e.sh
+      - name: Swaps end to end
+        run: scripts/run-swap-e2e.sh
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Browser suite against the mock client
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          pnpm e2e:mock

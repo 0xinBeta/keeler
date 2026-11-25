@@ -45,9 +45,11 @@ impl SpikeInit {
         let p = &self.private;
         let public = &self.public;
         assert_mint(&p.mint, public.mint_hi, public.mint_lo);
-        let mut reserve =
-            UniqueDataUtxo::<ReserveState>::new_init(public.pool_owner.owner(), &reserve_seed(&p.mint)?)?
-                .with_asset(&p.mint)?;
+        let mut reserve = UniqueDataUtxo::<ReserveState>::new_init(
+            public.pool_owner.owner(),
+            &reserve_seed(&p.mint)?,
+        )?
+        .with_asset(&p.mint)?;
         reserve.supply_price = PRICE_SCALE;
         reserve.borrow_price = PRICE_SCALE;
         reserve.last_update = public.now;
@@ -290,8 +292,8 @@ impl SpikeTouch {
         require_eq(position.position_id, p.position_id);
 
         // The optional input: a maker's note, or a dummy slot.
-        let mut top_up = TokenUtxos::new_mut(core::slice::from_ref(&p.top_up))?
-            .with_optional(&maker, &p.mint);
+        let mut top_up =
+            TokenUtxos::new_mut(core::slice::from_ref(&p.top_up))?.with_optional(&maker, &p.mint);
         let mut repay = TokenUtxos::new_init(&maker, &p.mint);
         let all = intent.amount()?;
         intent.transfer(&mut repay, &all)?;

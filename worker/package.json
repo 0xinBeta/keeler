@@ -2,6 +2,7 @@
   "name": "keeler-worker",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@10.28.2",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
