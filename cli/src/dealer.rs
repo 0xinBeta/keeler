@@ -306,6 +306,7 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
     let kp = shielded(&signer)?;
     chain.register(&kp)?;
     let state = state_path(cfg, &signer.pubkey())?;
+    let _lock = lock_state(&state)?;
     let loaded = load_state(&state, chain.now()?, &signer.pubkey(), chain.cluster)?;
     let cache = Mutex::new(Cache {
         book: loaded.quotes,
@@ -399,6 +400,20 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
             Ok(Ok(())) => Ok(()),
         }
     })
+}
+
+/// An exclusive lock beside the dealer's state file `state`, held while the
+/// returned file is: two dealers on one state would quote and claim notes
+/// apart. Its `.dealer-lock` extension never names a keeper's `.lock`.
+pub fn lock_state(state: &Path) -> Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.with_extension("dealer-lock"))?;
+    lock.try_lock()
+        .map_err(|_| anyhow!("another dealer is using {}", state.display()))?;
+    Ok(lock)
 }
 
 /// What the HTTP API asks of the dealer.
@@ -930,7 +945,7 @@ fn matches(rfq: &Rfq, q: &Quote, o: &TakerOrder) -> bool {
 
 /// What became of one settle attempt.
 #[derive(Debug, PartialEq, Eq)]
-enum Settle {
+pub enum Settle {
     /// The dealer's take landed.
     Took,
     /// Done with: settled or spent elsewhere, or past the settle margin.
@@ -1105,8 +1120,34 @@ fn settle(
     kp: &ShieldedKeypair,
     order: &OrderUtxo,
 ) -> Result<Settle> {
+    let decimals = (
+        chain.mint_decimals(order.source_mint.asset)?,
+        chain.mint_decimals(order.terms.destination_mint.asset)?,
+    );
+    settle_with(cfg, chain, kp, order, &mut || {
+        fresh_last_look(
+            pricer,
+            chain.client.rpc(),
+            order,
+            decimals,
+            cfg.settle_tolerance_bps,
+        )
+    })
+}
+
+/// [`settle`] with the last look `look`: asked before a note is made for
+/// the take, so a declined one costs no split, and again just before the
+/// take; a decline there, or a take that fails before its send, gives the
+/// note back.
+#[doc(hidden)]
+pub fn settle_with(
+    cfg: &DealerConfig,
+    chain: &Chain,
+    kp: &ShieldedKeypair,
+    order: &OrderUtxo,
+    look: &mut dyn FnMut() -> bool,
+) -> Result<Settle> {
     let hash = hex(&order.hash(0)?);
-    // A take may have landed even though its send reported an error.
     let status = chain.status(order)?;
     if status != Status::Open {
         log!("dealer: order {hash} is {status:?}");
@@ -1116,17 +1157,13 @@ fn settle(
         log!("dealer: order {hash} passed the settle margin unsettled");
         return Ok(Settle::Gone);
     }
+    if !look() {
+        return Ok(Settle::Wait);
+    }
     let t = &order.terms;
-    let (sell, buy) = (order.source_mint.asset, t.destination_mint.asset);
-    let note = chain.exact_note(kp, buy, t.destination_amount)?;
-    let decimals = (chain.mint_decimals(sell)?, chain.mint_decimals(buy)?);
-    if !fresh_last_look(
-        pricer,
-        chain.client.rpc(),
-        order,
-        decimals,
-        cfg.settle_tolerance_bps,
-    ) {
+    let note = chain.exact_note(kp, t.destination_mint.asset, t.destination_amount)?;
+    if !look() {
+        chain.release(&note.utxo_hash);
         return Ok(Settle::Wait);
     }
     chain.take(kp, order, note)?;
@@ -1865,6 +1902,23 @@ mod tests {
         assert!(within_limits(&limits, &sells, addr(1), 51, 2_100).is_err());
         // The first sell leaves the window an hour later.
         assert!(within_limits(&limits, &sells, addr(1), 100, 1_000 + HOUR).is_ok());
+    }
+
+    #[test]
+    fn one_dealer_per_state_file_and_a_keeper_beside_it() {
+        let dir = std::env::temp_dir().join(format!("keeler-dealer-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("dealer-state.json");
+        let held = lock_state(&state).unwrap();
+        assert!(lock_state(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("another dealer"));
+        let keeper = std::fs::File::create(state.with_extension("lock")).unwrap();
+        keeper.try_lock().unwrap();
+        drop(held);
+        lock_state(&state).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

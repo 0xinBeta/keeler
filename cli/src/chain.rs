@@ -60,12 +60,16 @@ pub const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const TESTNET_GENESIS: &str = "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY";
 
 impl Cluster {
-    pub fn of_genesis(hash: &str) -> Result<Self> {
+    /// The cluster of genesis hash `hash`, read from `rpc_url`: an unknown
+    /// hash is a local network only when the RPC is on this machine, so a
+    /// remote chain cannot pass for one and skip the mainnet refusals.
+    pub fn of_genesis(hash: &str, rpc_url: &str) -> Result<Self> {
         Ok(match hash {
             MAINNET_GENESIS => Cluster::Mainnet,
             DEVNET_GENESIS => Cluster::Devnet,
             TESTNET_GENESIS => bail!("testnet is not supported"),
-            _ => Cluster::Local,
+            _ if loopback(rpc_url) => Cluster::Local,
+            _ => bail!("an unknown genesis hash at an RPC that is not on this machine"),
         })
     }
 
@@ -87,6 +91,22 @@ impl Cluster {
     }
 }
 
+/// Whether `rpc_url`'s host is `localhost` or a loopback IP address,
+/// without a DNS lookup.
+pub fn loopback(rpc_url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(rpc_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The cluster `rpc_url` serves, from `getGenesisHash`.
 pub fn cluster_at(rpc_url: &str) -> Result<Cluster> {
     let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getGenesisHash" });
@@ -98,7 +118,7 @@ pub fn cluster_at(rpc_url: &str) -> Result<Cluster> {
         .map_err(|_| anyhow!("getGenesisHash failed"))?
         .json()
         .map_err(|_| anyhow!("getGenesisHash returned no JSON"))?;
-    Cluster::of_genesis(v["result"].as_str().context("no genesis hash")?)
+    Cluster::of_genesis(v["result"].as_str().context("no genesis hash")?, rpc_url)
 }
 
 /// A compute budget of `cu_limit` with `micro_lamports` per unit on top.
@@ -401,7 +421,22 @@ impl Chain {
         Ok(order)
     }
 
+    /// Takes `order` with `note`; a failure before the send gives the
+    /// note's claim back.
     pub fn take(&self, kp: &ShieldedKeypair, order: &OrderUtxo, note: WalletUtxo) -> Result<()> {
+        let hash = note.utxo_hash;
+        let ix = self
+            .take_instruction(kp, order, note)
+            .inspect_err(|_| self.release(&hash))?;
+        self.send(kp, ix)
+    }
+
+    fn take_instruction(
+        &self,
+        kp: &ShieldedKeypair,
+        order: &OrderUtxo,
+        note: WalletUtxo,
+    ) -> Result<Instruction> {
         let take = TakeTransactionParams {
             order_utxo: order.clone(),
             order_leaf_index: self.leaf_index(order)?,
@@ -410,15 +445,14 @@ impl Chain {
             tree_id: TREE_ID,
         }
         .build(kp)?;
-        let ix = Take {
+        Take {
             payer: kp.pubkey(),
             maker: take.maker,
             tree: self.tree,
             spp_proof: self.prove_spp(take.spp_proof_inputs, &TakeAuthority(kp))?,
             take_proof: proof::prove(CircuitId::Take, &take.proof_inputs)?,
         }
-        .instruction()?;
-        self.send(kp, ix)
+        .instruction()
     }
 
     pub fn cancel(&self, kp: &ShieldedKeypair, order: &OrderUtxo) -> Result<()> {
@@ -636,16 +670,32 @@ mod tests {
 
     #[test]
     fn clusters_by_genesis_and_name() {
+        let helius = "https://mainnet.helius-rpc.com/?api-key=x";
         assert_eq!(
-            Cluster::of_genesis(MAINNET_GENESIS).unwrap(),
+            Cluster::of_genesis(MAINNET_GENESIS, helius).unwrap(),
             Cluster::Mainnet
         );
         assert_eq!(
-            Cluster::of_genesis(DEVNET_GENESIS).unwrap(),
+            Cluster::of_genesis(DEVNET_GENESIS, helius).unwrap(),
             Cluster::Devnet
         );
-        assert!(Cluster::of_genesis(TESTNET_GENESIS).is_err());
-        assert_eq!(Cluster::of_genesis("local").unwrap(), Cluster::Local);
+        assert!(Cluster::of_genesis(TESTNET_GENESIS, "http://127.0.0.1:8899").is_err());
+        for local in [
+            "http://127.0.0.1:8899",
+            "http://[::1]:8899",
+            "http://localhost:8899",
+            "http://127.8.0.1",
+        ] {
+            assert_eq!(Cluster::of_genesis("local", local).unwrap(), Cluster::Local);
+        }
+        for remote in [
+            "http://127.0.0.1.evil.com:8899",
+            helius,
+            "http://10.0.0.1:8899",
+            "not a url",
+        ] {
+            assert!(Cluster::of_genesis("local", remote).is_err(), "{remote}");
+        }
         assert_eq!(Cluster::of_name("mainnet-beta"), Cluster::Mainnet);
         assert_eq!(Cluster::of_name("devnet"), Cluster::Devnet);
         assert_eq!(Cluster::of_name("localnet"), Cluster::Local);
