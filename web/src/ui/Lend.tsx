@@ -480,6 +480,8 @@ export function BorrowTab(p: LendProps) {
 
   if (!vault || !pool) return <p className="muted">Reading the vault…</p>;
   const position = p.account?.positions.find((x) => x.vault === vault.id) ?? null;
+  // The latest full liquidation in this vault, shown while there is no position.
+  const emptied = (p.account?.emptied ?? []).filter((x) => x.vault === vault.id && x.lastLiquidation).sort((a, b) => b.lastLiquidation!.at - a.lastLiquidation!.at)[0];
   if (op.run)
     return (
       <Progress
@@ -629,11 +631,12 @@ export function BorrowTab(p: LendProps) {
               {pct(vault.penaltyBps, 0)} penalty. Repay or add collateral to keep more of it.
             </p>
           )}
-          {position.lastLiquidation && <LiquidatedNote position={position} vault={vault} debt={d} now={now} />}
+          {position.lastLiquidation && <LiquidatedNote position={position} vault={vault} now={now} />}
         </div>
       ) : (
         <div className="lend-card mine">
           <span className="muted small">Your position</span>
+          {emptied && <EmptiedNote position={emptied} vault={vault} now={now} />}
           <span className="muted">
             No position yet. Add {vault.collateral.symbol} as collateral, then borrow up to {pct(cf, 0)} of its value, with no term.
           </span>
@@ -727,20 +730,36 @@ export function BorrowTab(p: LendProps) {
   );
 }
 
-function LiquidatedNote({ position, vault, debt, now }: { position: Position; vault: Vault; debt: bigint; now: number | null }) {
+const agoText = (at: number, now: number | null) => {
+  const ago = now === null ? null : Math.max(0, Math.round(now - at));
+  return ago === null ? "" : ago < 60 ? `${ago} s ago` : ago < 3600 ? `${Math.floor(ago / 60)} min ago` : new Date(at * 1000).toLocaleString();
+};
+
+/** What the last liquidation did, from what it left: a repayment made since is not credited to it. */
+export function LiquidatedNote({ position, vault, now }: { position: Position; vault: Vault; now: number | null }) {
   const l = position.lastLiquidation!;
-  const ago = now === null ? null : Math.max(0, Math.round(now - l.at));
-  const when = ago === null ? "" : ago < 60 ? `${ago} s ago` : ago < 3600 ? `${Math.floor(ago / 60)} min ago` : new Date(l.at * 1000).toLocaleString();
   return (
     <div className="note note-error liquidated" role="status">
-      <strong>Liquidated {when}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt was repaid with{" "}
+      <strong>Liquidated {agoText(l.at, now)}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt was repaid with{" "}
       <Amount value={l.collateralSold} asset={vault.collateral} />, the {pct(vault.penaltyBps, 0)} penalty included, at{" "}
       {priceText(l.price, vault)} {vault.debt.symbol}.{" "}
-      {debt === 0n
-        ? "The whole loan is repaid; the rest of your collateral is still yours."
-        : position.collateral === 0n
-          ? "No collateral is left; the remaining debt stays on the position until you repay it."
-          : `The position is back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest is still yours.`}
+      {l.debtLeft === 0n
+        ? "It repaid the whole loan; the rest of your collateral stayed yours."
+        : l.collateralLeft === 0n
+          ? "It left no collateral; the remaining debt stays on the position until you repay it."
+          : `It brought the position back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest stayed yours.`}
+    </div>
+  );
+}
+
+/** A full liquidation that left no collateral and no debt: the position is gone, and this says why. */
+export function EmptiedNote({ position, vault, now }: { position: Position; vault: Vault; now: number | null }) {
+  const l = position.lastLiquidation!;
+  return (
+    <div className="note note-error liquidated" role="status">
+      <strong>Your position was liquidated in full {agoText(l.at, now)}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt
+      was repaid with all of its collateral, <Amount value={l.collateralSold} asset={vault.collateral} />, at {priceText(l.price, vault)}{" "}
+      {vault.debt.symbol}. Nothing is left in it: no collateral and no debt. You can open a new position.
     </div>
   );
 }
@@ -784,7 +803,7 @@ export function LendActivity(p: LendProps) {
   const [error, setError] = useState<string | null>(null);
   const vault = p.market?.vaults[0];
   const ops = p.account?.operations ?? [];
-  const liquidations = (p.account?.positions ?? []).filter((x) => x.lastLiquidation);
+  const liquidations = [...(p.account?.positions ?? []), ...(p.account?.emptied ?? [])].filter((x) => x.lastLiquidation);
 
   const refund = async (id: string) => {
     setBusy(id);

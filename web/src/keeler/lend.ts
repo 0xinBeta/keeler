@@ -58,8 +58,11 @@ export type Owners = { user: Uint8Array; pda: Uint8Array; viewing: Uint8Array; t
 
 export type LendDeps = {
   network: string;
+  /** The page's `location.origin`, which the session authorisation names. */
+  origin: string;
   programId: Address;
-  keeper: Address;
+  /** The keepers compiled into the site: tickets and keeper-built transactions are accepted from these only. */
+  keepers: readonly Address[];
   config: LendServerConfig;
   assets: Asset[];
   wallet(): Address;
@@ -131,7 +134,8 @@ type KeeperAccount = {
   positions: { vault: number; position: string; collateral: string; debtShares: string; message: string }[];
   index?: { supply: string; borrow: string; at: number };
 };
-type WireBuild = { transaction: string; outputs: string[]; now: number; bound?: string; index?: string };
+type WireBuild = { transaction: string; outputs: string[]; now: number; bound?: string; index?: string; keeper?: unknown };
+type WireTicket = { id?: unknown; expiry?: unknown; signature?: unknown; keeper?: unknown };
 
 const NEVER_SENT = "This request was never sent (the wallet did not sign it); nothing moved.";
 const NEVER_LANDED = "The transaction expired before it reached the chain; nothing moved.";
@@ -187,8 +191,8 @@ export function createLend(d: LendDeps): KeelerLend {
     if (!prompt) throw NO_SESSION;
     const keys = await sessionKey(d.sessionSeed());
     const expiry = sessionExpiryFor(now);
-    const auth = await d.signMessage(authorisationMessage({ network: d.network, programId: d.programId, wallet: d.wallet(), sessionKey: keys.key, expiry }));
-    session = { ...keys, expiry, auth: hex(auth) };
+    const auth = await d.signMessage(authorisationMessage({ network: d.network, origin: d.origin, programId: d.programId, wallet: d.wallet(), sessionKey: keys.key, expiry }));
+    session = { ...keys, expiry, auth: hex(auth), origin: d.origin };
     return session;
   };
 
@@ -207,14 +211,16 @@ export function createLend(d: LendDeps): KeelerLend {
     throw Object.assign(keeperError(res.status, said), { status: res.status });
   };
 
-  /** A signed keeper request; one 401 drops the session and asks again (an expired or replaced session). */
-  const keeper = async <T>(method: "GET" | "POST", path: string, body: Fields, prompt = true): Promise<T> => {
+  /**
+   * A signed keeper POST; one 401 drops the session and asks again (an expired or replaced session). `unsigned` joins
+   * the body outside the session signature (an account read's tickets, which carry the keeper's own).
+   */
+  const keeper = async <T>(path: string, body: Fields, prompt = true, unsigned: Record<string, unknown> = {}): Promise<T> => {
     for (let attempt = 0; ; attempt++) {
       const now = await d.chainNow();
-      const fields = await signRequest(await authorise(now, prompt), d.wallet(), method, path, body, now);
+      const fields = await signRequest(await authorise(now, prompt), d.wallet(), "POST", path, body, now);
       try {
-        if (method === "GET") return await call<T>(`/api${path}?${new URLSearchParams(Object.entries(fields).map(([k, v]) => [k, String(v)]))}`);
-        return await call<T>(`/api${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fields) });
+        return await call<T>(`/api${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...fields, ...unsigned }) });
       } catch (e) {
         if (attempt === 0 && (e as { status?: number }).status === 401) {
           session = undefined;
@@ -387,7 +393,9 @@ export function createLend(d: LendDeps): KeelerLend {
     const current = (id: string) => s.all("position").some((x) => x.id === id && !stale.has(hex(x.note.hash)));
     let view: KeeperAccount | undefined;
     if (useKeeper || wanted || spent.length > 0) {
-      view = await keeper<KeeperAccount>("GET", "/lend/account", {}, prompt).catch(() => undefined);
+      // The open tickets go along, so a keeper that did not issue one can adopt it and fill its intent.
+      const tickets = s.all("op").filter((o) => o.ticket && o.intent && o.status === "pending" && o.ticket.expiry > now).sort((a, b) => b.createdAt - a.createdAt).slice(0, 8).map((o) => o.ticket);
+      view = await keeper<KeeperAccount>("/lend/account", {}, prompt, { tickets }).catch(() => undefined);
       wanted = view === undefined && session === undefined;
       if (view?.index) learnIndex(view.index, now);
       for (const r of view?.receipts ?? []) {
@@ -400,17 +408,23 @@ export function createLend(d: LendDeps): KeelerLend {
         if (!v || current(p.position)) continue;
         const got = await adopt("position", v.collateralMint, p.message);
         if (!got || got.decoded.positionId?.toString() !== p.position) continue;
-        if (got.note.amount === 0n && got.decoded.shares === 0n) continue;
         // What a liquidation sold: the spent record before it against its successor.
         const before = spent.find((x) => x.kind === "position" && (x.r as PositionRecord).id === p.position);
         const ix = before ? await spentWith(before.by) : undefined;
         const at = index(v.debtMint, "borrow", now);
         const old = before?.r as PositionRecord | undefined;
-        const lastLiquidation =
-          old && ix?.tag === TAG.liquidate
-            ? { at: now, price: u64At(ix.data.subarray(1), ARGS.liquidate.bound), collateralSold: old.collateral - got.note.amount, debtRepaid: debtOf(old.debtShares, at) - debtOf(got.decoded.shares, at) }
-            : (old?.lastLiquidation ?? null);
-        s.put("position", hex(got.note.hash), { vault: v.id, id: p.position, collateral: got.note.amount, debtShares: got.decoded.shares, note: got.note, lastLiquidation });
+        const liquidated = old !== undefined && ix?.tag === TAG.liquidate;
+        const debtLeft = debtOf(got.decoded.shares, at);
+        const lastLiquidation = liquidated
+          ? { at: now, price: u64At(ix.data.subarray(1), ARGS.liquidate.bound), collateralSold: old.collateral - got.note.amount, debtRepaid: debtOf(old.debtShares, at) - debtLeft, collateralLeft: got.note.amount, debtLeft }
+          : (old?.lastLiquidation ?? null);
+        const record: PositionRecord = { vault: v.id, id: p.position, collateral: got.note.amount, debtShares: got.decoded.shares, note: got.note, lastLiquidation };
+        // A full liquidation that left nothing: the position is gone, and the page says what took it.
+        if (empty(record)) {
+          if (liquidated) s.put("emptied", p.position, record);
+          continue;
+        }
+        s.put("position", hex(got.note.hash), record);
       }
     }
     for (const { kind, r, by } of spent) {
@@ -495,13 +509,15 @@ export function createLend(d: LendDeps): KeelerLend {
     }
   };
 
-  const verifyTicketReply = async (t: { id?: unknown; expiry?: unknown; signature?: unknown }, purpose: number, target: bigint, amount: bigint, now: number) => {
-    if (typeof t.id !== "string" || !/^[0-9a-f]{32}$/.test(t.id) || !Number.isSafeInteger(t.expiry)) throw err("network", "The keeper sent a malformed ticket. Nothing was sent.");
+  /** A ticket signed by the compiled keeper it names, for exactly these terms; returns it as the keeper issued it. */
+  const verifyTicketReply = async (t: WireTicket, purpose: number, target: bigint, amount: bigint, now: number) => {
+    if (typeof t.id !== "string" || !/^[0-9a-f]{32}$/.test(t.id) || !Number.isSafeInteger(t.expiry) || typeof t.signature !== "string") throw err("network", "The keeper sent a malformed ticket. Nothing was sent.");
     const expiry = t.expiry as number;
     if (expiry < now + CHECK.intentMinSecs || expiry > now + CHECK.intentMaxSecs) throw err("network", "The keeper's ticket has an expiry outside the allowed window. Nothing was sent; try again.");
-    const ok = await verifyTicket(d.keeper, t.signature, { programId: d.programId, wallet: d.wallet(), id: t.id, purpose, target, amount, expiry });
-    if (!ok) throw err("network", "The keeper's ticket is not validly signed by the keeper this site was built with. Nothing was sent.");
-    return expiry;
+    const keeper = d.keepers.find((k) => k === t.keeper);
+    const ok = keeper !== undefined && (await verifyTicket(keeper, t.signature, { programId: d.programId, wallet: d.wallet(), id: t.id, purpose, target, amount, expiry }));
+    if (!ok) throw err("network", "The keeper's ticket is not validly signed by a keeper this site was built with. Nothing was sent.");
+    return { id: t.id, expiry, signature: t.signature, keeper };
   };
 
   /** supply, deposit, repay: ticket, intent proof, sign, send; resolves at step "keeper". */
@@ -515,8 +531,9 @@ export function createLend(d: LendDeps): KeelerLend {
       // Any wallet prompt for the session comes before the progress steps start.
       await authorise(now);
       on("proving");
-      const t = await keeper<{ id?: unknown; expiry?: unknown; signature?: unknown }>("POST", "/lend/ticket", { purpose, amount: amount.toString(), ...ticket });
-      const expiry = await verifyTicketReply(t, PURPOSE[purpose], target, amount, now);
+      const terms = { purpose, amount: amount.toString(), ...ticket };
+      const issued = await verifyTicketReply(await keeper<WireTicket>("/lend/ticket", terms), PURPOSE[purpose], target, amount, now);
+      const expiry = issued.expiry;
       const built = await d.build.intent({ source: source.utxo, mint, amount, purpose: PURPOSE[purpose], target, expiry }, () => {}).catch((e) => {
         throw e instanceof KeelerError ? e : err("proof", `Proving the request failed: ${message(e)}`);
       });
@@ -530,6 +547,7 @@ export function createLend(d: LendDeps): KeelerLend {
         expiry,
         createdAt: now,
         intent: { hash: built.hash, output: built.output, purpose: PURPOSE[purpose], target },
+        ticket: { ...issued, ...terms },
       };
       // Without this record the browser could never refund the intent: no record, no send.
       save(record);
@@ -565,12 +583,14 @@ export function createLend(d: LendDeps): KeelerLend {
 
   const parseBuild = (w: WireBuild): BuildReply & { index?: bigint } => {
     const bad = () => err("network", "The keeper sent a malformed transaction. Nothing was sent.");
-    if (typeof w?.transaction !== "string" || !Array.isArray(w.outputs) || !Number.isSafeInteger(w.now)) throw bad();
+    if (typeof w?.transaction !== "string" || !Array.isArray(w.outputs) || !Number.isSafeInteger(w.now) || typeof w.keeper !== "string") throw bad();
     const big = (v: unknown) => (typeof v === "string" && /^\d+$/.test(v) ? BigInt(v) : v === undefined ? undefined : (() => { throw bad(); })());
     return {
       transaction: toBytes(w.transaction),
       outputs: w.outputs.map((o) => (typeof o === "string" && /^[0-9a-f]{64}$/.test(o) ? fromHex(o) : (() => { throw bad(); })())),
       now: w.now,
+      // Checked against the compiled keepers with the transaction (checkKeeperTransaction).
+      keeper: w.keeper as Address,
       ...(w.bound === undefined ? {} : { bound: big(w.bound)! }),
       ...(w.index === undefined ? {} : { index: big(w.index)! }),
     };
@@ -591,13 +611,13 @@ export function createLend(d: LendDeps): KeelerLend {
   ) => {
     await authorise(await d.chainNow());
     on("keeper");
-    const reply = parseBuild(await keeper<WireBuild>("POST", "/lend/build", { op: kind, ...request }));
+    const reply = parseBuild(await keeper<WireBuild>("/lend/build", { op: kind, ...request }));
     const owners = await d.owners();
     const want = expect(reply, owners);
     const seed = d.wasm.seed(SEED_DOMAIN[kind], spent.blinding);
     const checked = await checkKeeperTransaction(
       reply,
-      { op: kind, programId: d.programId, keeper: d.keeper, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, payoutTags: owners.tags, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
+      { op: kind, programId: d.programId, keepers: d.keepers, owner: d.wallet(), chainNow: await d.chainNow(), spends: d.wasm.nullifier(spent.hash, spent.blinding), ownerViewing: owners.viewing, payoutTags: owners.tags, seed, notes: want.notes, ...(want.reference === undefined ? {} : { reference: want.reference }) },
       d.wasm,
     );
     // The keeper's index is kept only once its transaction passed the check.
@@ -693,7 +713,8 @@ export function createLend(d: LendDeps): KeelerLend {
         const v = vaultOf(p.vault);
         return { vault: p.vault, id: p.id, collateral: p.collateral, debt: debtOf(p.debtShares, index(v.debtMint, "borrow", now)), lastLiquidation: p.lastLiquidation };
       });
-      return { receipts, positions, operations: ops.sort((a, b) => b.createdAt - a.createdAt).map(toOp), asOf: now, ...(held.needsSession ? { needsSession: true as const } : {}) };
+      const emptied: Position[] = s.all("emptied").map((p) => ({ vault: p.vault, id: p.id, collateral: 0n, debt: 0n, lastLiquidation: p.lastLiquidation }));
+      return { receipts, positions, emptied, operations: ops.sort((a, b) => b.createdAt - a.createdAt).map(toOp), asOf: now, ...(held.needsSession ? { needsSession: true as const } : {}) };
     },
 
     supply(pool, amount, on) {

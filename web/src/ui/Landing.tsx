@@ -2,6 +2,7 @@
 // against the code, so wording changes here must not add or strengthen one.
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { BUILD_NETWORK } from "../keeler/network";
 import { RingCanvas } from "./RingCanvas";
 
 const reduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -394,7 +395,7 @@ export function LendFeatures({ market, onOpen }: { market: { pools: { supplyAprB
     ["earn", "Earn a floating rate", "Supply to one shared pool. Borrowers pay interest into it, and the value of your share grows as that interest accrues."],
     ["exit", "Out when you want", "Withdraw any time the pool has idle funds. No lock-up period, no term, no waiting for a maturity date."],
     ["borrow", "Borrow up to 80%", "Lock tSOL and borrow tUSD against up to 80% of its value. Repay whenever you like; a loan has no end date."],
-    ["trim", "A liquidation that leaves you standing", "Past 85%, collateral is sold to bring your loan back to 85% or less, and the rest stays yours. The 1% penalty goes to the pool's safety buffer, not to a liquidator."],
+    ["trim", "A liquidation that leaves you standing", "Past 85%, collateral is sold to bring your loan back to 85% or less, and the rest stays yours. The penalty is a fixed 1%, which pays the keeper for doing the liquidation."],
     ["hidden", "Hidden from the chain", "Your deposit, collateral, debt, health and liquidation price stay off the public chain. Only you and the pool's keeper can read them."],
     ["close", "Yours to close", "Once a position has no debt, your browser proves the close and you take your collateral back yourself. No keeper needed."],
   ];
@@ -473,7 +474,7 @@ export function LendLiquidation() {
   const steps = [
     ["Watched", "The keeper checks every position against the oracle price, privately. Nobody else can see how close yours is."],
     ["Trimmed", "Past 85%, it repays part of your debt and sells only enough collateral to bring you back to 85%. Past 90%, it repays the whole loan."],
-    ["Buffered", "The 1% penalty is paid into the pool's safety buffer, not to the liquidator. The rest of your collateral stays yours."],
+    ["Capped", "The penalty is a fixed 1%, which pays the keeper for doing the liquidation. The rest of your collateral stays yours."],
   ];
   return (
     <section className="section" id="liquidation" aria-labelledby="liq-title">
@@ -513,7 +514,7 @@ export function LendNumbers() {
         facts={[
           ["80%", "of your collateral's value you can borrow, with no term"],
           ["85%", "loan-to-value where liquidation starts; the rest of your collateral stays yours"],
-          ["1%", "penalty, paid into the pool's safety buffer, never to a liquidator"],
+          ["1%", "penalty on a liquidation, fixed, and all of it pays for the liquidation"],
           ["0", "amounts on the public chain: deposit, collateral, debt, health and liquidation price stay hidden"],
         ]}
       />
@@ -526,7 +527,7 @@ const LEND_FAQ: [string, string, string?][] = [
   ["What is visible when I lend or borrow?", "Your wallet address, which pool or vault you used, when, and which kind of operation it was; a borrow and a collateral withdrawal look the same. If a position is liquidated, that is public too, with the price used. Your amounts, health and liquidation price are not. People using the same pool can estimate how much of it is borrowed over time, and may notice a very large operation."],
   ["Who runs the pool?", "A keeper service run by Keeler. It holds the pool's private records, so it can see the amounts in every deposit and position. It puts operations in order and performs liquidations. By design it cannot take your principal: your funds only move with your signed request or your wallet's signature, or by a liquidation under the vault's rules. On this devnet beta the proving keys are test keys and the keeper sets the test price, so that guarantee waits for mainnet and its security review."],
   ["What if the keeper is offline?", "Deposits, borrowing, repayments and withdrawals wait until it is back, and your funds stay where they are. A deposit or repayment it hasn't taken in can be taken back once the request expires. A position that could not be topped up while it was offline may be liquidated when it returns. A position with no debt can be closed without the keeper."],
-  ["How does liquidation work?", "Each vault has a liquidation threshold: 85% loan-to-value for tSOL → tUSD. Past it, the keeper repays part of your debt and sells only enough collateral, at a price set from the oracle, to bring you back to 85%, plus a 1% penalty that goes to the pool's safety buffer. If a position gets past 90% before that happens, the whole loan is repaid the same way and the rest of the collateral stays yours."],
+  ["How does liquidation work?", "Each vault has a liquidation threshold: 85% loan-to-value for tSOL → tUSD. Past it, the keeper repays part of your debt and sells only enough collateral, at a price set from the oracle, to bring you back to 85%, plus a 1% penalty that pays the keeper for the liquidation. If a position gets past 90% before that happens, the whole loan is repaid the same way and the rest of the collateral stays yours."],
   ["When can I withdraw from Earn?", "Any time the pool has idle funds. When most of the pool is borrowed, the rate climbs to bring repayments and new deposits in, and no borrow may take the pool above 95% used."],
   ["How are lending rates set?", "By utilisation, the share of the pool that is borrowed. The borrow rate rises gently up to 88% and steeply after it. Suppliers share the borrowers' interest, less a 10% fee. Collateral is not lent out, so it does not earn."],
 ];
@@ -549,8 +550,17 @@ const MAINNET_LEND: [string, string] = [
   "Not yet. Swaps and lending are in beta on Solana devnet with test tokens, so you can try every step for free. Keeler has not been audited yet and uses test proving keys; mainnet follows the security review.",
 ];
 
-export function Faq({ lend = false }: { lend?: boolean }) {
-  const list = lend ? [...FAQ.slice(0, -1), ...LEND_FAQ, MAINNET_LEND] : FAQ;
+/** The answers a mainnet build gives instead: no test tokens, test keys, test price or browser test wallet there. */
+const ON_MAINNET: Record<string, string> = {
+  "Is Keeler on mainnet?": "Yes. This site runs on Solana mainnet, with real funds. Keeler is new, so start with small amounts.",
+  "What if I clear my browser?": "Your orders can be found again from the chain with the same wallet.",
+  "Who runs the pool?": "A keeper service run by Keeler. It holds the pool's private records, so it can see the amounts in every deposit and position. It puts operations in order and performs liquidations. By design it cannot take your principal: your funds only move with your signed request or your wallet's signature, or by a liquidation under the vault's rules, at the price the Pyth oracle publishes.",
+  "How does liquidation work?": "Each vault has a liquidation threshold: 85% loan-to-value for SOL → USDC. Past it, the keeper repays part of your debt and sells only enough collateral, at a price set from the oracle, to bring you back to 85%, plus a 1% penalty that pays the keeper for the liquidation. If a position gets past 90% before that happens, the whole loan is repaid the same way and the rest of the collateral stays yours.",
+};
+
+export function Faq({ lend = false, network = BUILD_NETWORK }: { lend?: boolean; network?: string }) {
+  const all = lend ? [...FAQ.slice(0, -1), ...LEND_FAQ, MAINNET_LEND] : FAQ;
+  const list = network === "mainnet" ? all.map(([q, a, id]) => [q, ON_MAINNET[q] ?? a, id] as const) : all;
   return (
     <section className="section" id="faq" aria-labelledby="faq-title">
       <div className="faq-grid">

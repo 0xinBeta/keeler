@@ -16,7 +16,6 @@ import { bytes32, poseidon, solanaOwnerIdentity, X25519PublicKey } from "@helius
 import { ProgramOwner, toProgramWalletUtxo } from "@heliuslabs/spr/program";
 import { decodeConfidential, decodeOutputData, EncryptedScheme } from "@heliuslabs/spr/transaction";
 import { encodeTransactInstructionData, nullifierPdaAccounts } from "@heliuslabs/spr/internal";
-import { resolveRegisteredAddress } from "@heliuslabs/spr/wallet";
 import type { FoundIntent, LendBuilder, LendChain, LendWasm } from "./lend";
 import { NOTE_KIND, SLOT, TAG, TREE_ID, domainField, u64Bytes } from "./lend-layout";
 import type { NoteOpening } from "./lend-store";
@@ -41,8 +40,8 @@ const SYSTEM_PROGRAM = address("11111111111111111111111111111111");
 const USER_SEED = new TextEncoder().encode("user");
 const equal = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-/** The swap context with the lend program and its keeper in place of the swap program. */
-export type LendContext = SwapContext & { keeper: Address };
+/** The swap context with the lend program in place of the swap program, and the pool viewing key (33 bytes) compiled into the site. */
+export type LendContext = SwapContext & { poolViewing: Uint8Array };
 
 const w = (a: Address) => ({ address: a, role: AccountRole.WRITABLE });
 const ws = (a: Address) => ({ address: a, role: AccountRole.WRITABLE_SIGNER });
@@ -91,20 +90,10 @@ function pdaUtxo(ctx: LendContext, owner: ProgramOwner, n: { hash: Uint8Array; m
 }
 
 export function createLendSeams(ctx: () => Promise<LendContext>) {
-  let keeperReg: Promise<NonNullable<Awaited<ReturnType<typeof resolveRegisteredAddress>>>> | undefined;
-  /** The keeper's registered shielded address: intents and notes are encrypted to its viewing key. */
-  const keeperAddress = (c: LendContext) =>
-    (keeperReg ??= resolveRegisteredAddress({ rpc: c.client, owner: c.keeper }).then((k) => {
-      if (!k) throw new Error(`the keeper ${c.keeper} is not in the user registry`);
-      return k;
-    })).catch((e) => {
-      keeperReg = undefined;
-      throw e;
-    });
-
+  /** Intents are encrypted to the pool viewing key the program pins (`POOL_VIEWING`), which every keeper shares. */
   const pdaOf = async (c: LendContext) => {
     const u = await userPda(c.payer, c.programId);
-    const viewing = (await keeperAddress(c)).address.viewingPublicKey;
+    const viewing = X25519PublicKey.fromBytes(c.poolViewing);
     return { ...u, viewing, shielded: u.owner.address(viewing).toBytes() };
   };
 
