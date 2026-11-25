@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 # Part 1 of docs/plan-lend.md section 0: proves the toolkit can do what the
-# lend program needs. Results in ../SPIKE.md. Not deployed anywhere.
+# lend program needs. Results in ../../docs/notes-for-xark-builders.md. Not deployed anywhere.
 [lib]
 name = "lend_spike"
 crate-type = ["cdylib", "lib"]

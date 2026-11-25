@@ -1,6 +1,6 @@
 # Keeler Lend: notes for agents
 
-The plan is `docs/plan-lend.md`; the spike results are `SPIKE.md`. `lend/` is
+The plan is `docs/plan-lend.md`; the spike results are `../docs/notes-for-xark-builders.md`. `lend/` is
 its own Cargo workspace (members `program`, `sdk`, `spike`), outside the root
 one. Never touch `.tools/` or the main checkout's `target/`; read
 `.tools/env` only.
@@ -22,7 +22,7 @@ Each later instruction already has a tag (`tag::*`), a module that returns its
 shared files (`mod.rs`, `error.rs`, `proof.rs`) are one line each; keep them
 to that so pieces merge cleanly. Vault may split `deposit` into
 `deposit_open` and `deposit_add` (an optional data input does not compile,
-see `SPIKE.md`); take tag 11 for the second one.
+see `../docs/notes-for-xark-builders.md`); take tag 11 for the second one.
 
 ## Reuse
 

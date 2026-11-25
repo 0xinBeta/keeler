@@ -1,226 +1,315 @@
 # Keeler
 
-A private quote router on a local network. A trader wants to sell an amount
-of one asset for another without showing size or price on-chain. Keeler asks
-several dealers for a quote, drops quotes far from a reference price, and
-settles the best one through the Helius Privacy Rings swap example program
-(Xark). The design is in [`docs/plan.md`](docs/plan.md).
+A lending pool with private amounts on Helius Privacy Rings (custom Xark circuits verified with
+Groth16 in a Pinocchio program that moves notes through the shielded pool), with private swaps as
+a second, smaller part.
 
-## What is private and what is public
+![Supply, borrow, a price drop and a liquidation, then the explorer showing only encrypted notes](docs/demo.gif)
 
-- Private: the amounts and the price. They live inside shielded notes and the
-  order terms, encrypted to the trader and the chosen dealer.
-- Public at settlement: both wallets (the trader's and the dealer's Solana
-  keys) and both asset ids, and that a swap was made and later taken or
-  cancelled.
-- Every dealer that is asked learns the pair, the size and the trader's
-  public key, because the request for quote carries them in plain text.
+- Devnet lend program: [`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`](https://explorer.solana.com/address/CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL?cluster=devnet)
+- Live page (devnet): https://keeler.xterminbeta.workers.dev
 
-## Setup
+| | Public chain | Keeper | Other pool users | A liquidated owner |
+| --- | --- | --- | --- | --- |
+| Wallets that supply, borrow, repay, withdraw, are liquidated | seen | seen | seen | seen |
+| Which pool or vault, which instruction, `now`, the price bound, an intent's expiry at fill or cancel | seen | seen | seen | seen |
+| Borrow versus collateral withdrawal (`draw`) | hidden | seen | hidden | hidden |
+| Full versus partial redeem or repay | hidden | seen | hidden | hidden |
+| New position versus top-up (separate instructions) | seen | seen | seen | seen |
+| That a wallet was liquidated, and that it was then past the threshold at a public price | seen | seen | seen | seen |
+| Every amount: supply, collateral, debt, repay, liquidation size | hidden | seen | hidden | its own only |
+| Health and liquidation price of a position | hidden | seen | hidden | its own only |
+| Pool size and utilisation | coarse figures only (two significant figures, `/lend/pools`) | seen | estimable from the price indices at their own operations | as other users |
+| The liquidator's other funds | hidden | seen | hidden | hidden, if the keeper liquidates from a note of exactly the repay (it does; not enforced) |
+| Anything a user later unshields to a public account | seen | seen | seen | seen |
 
-> **Local network only.** Keeler settles through the Helius Privacy Rings
-> swap example (Xark). That program uses insecure test proving keys from a
-> fixed public seed, so anyone can forge its proofs. Never deploy it or use it
-> with real funds.
+The Worker that serves the page also sees each wallet's account view in clear
+(`docs/threat-model.md`).
 
-Needs macOS on Apple silicon or Linux x86-64, git, curl, Python 3.11+, rustup
-and the Solana/Agave CLI (`cargo build-sbf`).
+**Status: devnet only, not for real funds.** The proving keys are test keys from a public seed, so
+anyone can forge a proof; the circuits are unaudited and Xark is experimental; on devnet the
+keeper posts the collateral price itself (a mainnet build cannot have that account and reads Pyth);
+the keepers are a trusted set that sees every amount and can halt the pool. Before mainnet:
+an external audit of the circuits, program, keeper and page; a multi-party key ceremony for the 11
+lend circuits; the upgrade authority handed to a Squads multisig; two always-on keeper hosts; and
+the fixes the internal audit decided (`docs/audit-2026-11-25.md`, `docs/mainnet-runbook.md`).
 
-```bash
-scripts/setup.sh      # idempotent; the first run takes a while
-source .tools/env
-cargo check -p keeler
+Built with Claude Code.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph Browser
+    page[Page and wallet]
+    wasm[Lend WASM prover:<br/>intent, cancel_intent, close]
+  end
+  worker[Cloudflare Worker<br/>serves the page, proxies,<br/>rate limits, checks sessions]
+  subgraph Keepers[Keeper set, 1 to 4 keys, one pool key]
+    primary[Primary keeper]
+    standby[Standby keeper]
+  end
+  rpc[RPC]
+  indexer[Indexer: Photon]
+  prover[Shielded-pool prover<br/>Helius, attested TEE]
+  lend[Lend program<br/>Pinocchio, Groth16 verifiers]
+  spp[Shielded pool program]
+  price[Price account<br/>Pyth PriceUpdateV2,<br/>or test price on devnet]
+
+  page --> wasm
+  page -- /api/rpc, /v1/spr --> worker
+  page -- /api/lend/* --> worker
+  worker --> rpc
+  worker --> indexer
+  worker --> prover
+  worker -- tickets, builds, account --> primary
+  worker -. failover .-> standby
+  primary --> prover
+  primary --> rpc
+  primary --> indexer
+  rpc --> lend
+  lend -- reads --> price
+  lend -- CPI transact --> spp
 ```
 
-`scripts/setup.sh`:
+- **Page** (`web/src/keeler/`). Derives the user's shielded keys from one wallet signature, asks
+  a keeper for a signed ticket, proves and sends the intent itself, and proves `close` and
+  `cancel_intent` itself. Before a wallet signs a keeper-built `redeem` or `draw` it checks the
+  exact transaction (`lend-check.ts`): no lookup tables or durable nonce, only the lend
+  instruction and compute-budget instructions, the keeper as fee payer, the owner as one read-only
+  signer, `now`, expiry and price bound within limits, and every note the owner should receive
+  at its slot, with payouts that open under the owner's key. The keeper set and pool viewing key
+  are compiled into the site.
+- **Worker** (`worker/src/index.ts`). The page's only network peer. Holds the Helius API key and
+  the keeper HTTP key, proxies RPC, indexer and prover calls, checks the shape of every lend
+  request and reply, verifies the session signatures before charging a global limit, and forwards
+  to the first keeper in `LEND_KEEPERS`, the next one only when there is no keeper reply.
+  `LEND_PAUSED` stops new supply, new positions and borrowing, never repayment or withdrawal.
+- **Keeper set** (`cli/src/keeper.rs`, `cli/src/lend_chain.rs`, `docs/lend-keeper.md`). Up to four
+  compiled keeper keys share one pool key, whose viewing key every reserve is encrypted to. A
+  keeper holds the openings of the reserve, receipts and positions, issues tickets, fills only
+  ticketed intents, builds owner-signed operations, watches positions against the price and
+  liquidates from its own funds. One lane per pool: liquidations first, then repays and deposits,
+  then supplies. Every build is recorded before it is sent; the chain decides which landed. A
+  standby follows the others' transactions and takes over tickets and liquidations when the
+  primary stops.
+- **Lend program** (`lend/program/`). Pinocchio. Each instruction checks its signers (a keeper on
+  every reserve spend and every fill), canonical PDAs, the pinned pool viewing key, a public `now`
+  within 120 s of the clock, and for `draw` and `liquidate` the price bound against the price
+  account; then verifies the Groth16 proof against public inputs it computes itself, and signs the
+  shielded-pool CPI for the pool and user PDAs.
+- **Shielded pool program** (Privacy Rings, Default Ring). Holds every note; verifies its own
+  transact proof; nullifiers stop double spends and the reserve's unique address.
+- **Indexer** (Photon). Serves notes and proof data to the page and the keeper; the keeper reads
+  its peers' outputs from it and checks each against the hash on chain.
+- **Prover**. The shielded pool's transact proofs come from Helius' prover under the network's
+  signed TEE policy (the local `zolana` prover on a local network). The lend circuits are never
+  proved there: the browser proves its three, the keeper proves the rest natively.
+- **Price account**. A mainnet build reads only the vault's pinned Pyth `PriceUpdateV2` account
+  (receiver-owned, fully verified, pinned feed id, at most 90 s old). A `test-price` build, which
+  devnet uses, also accepts a program-owned test price account that keepers write.
 
-- clones `helius-labs/privacy-ring-examples` at the pinned commit into
-  `.tools/privacy-ring-examples` (git-ignored; that repository has no licence,
-  so none of its code is copied into this one);
-- runs the example's own `swap/xark` steps: installs the `zolana` CLI
-  (`cli-v0.10.0`) into `swap/xark/.tools/`, compiles the circuits and test
-  keys into `swap/xark/target/zk/`, checks them against the pinned checksums,
-  builds `swap_program.so` with SBF platform tools v1.54, and fetches the
-  localnet artifacts (shielded-pool program, prover, Photon, surfpool) into
-  `~/.config/zolana/cache` and the user-registry program into
-  `swap/xark/.tools/`. The upstream scripts check each of these release
-  downloads against a pinned SHA-256. The SBF platform tools are whatever
-  Agave's `cargo build-sbf` fetches; Keeler adds no check of its own;
-- applies `patches/swap.patch` (a `wasm` feature and its `Cargo.lock` lines),
-  sets the program's `declare_id!` to `KEELER_SWAP_PROGRAM_ID` (default: the
-  example's ID), and builds the single-threaded web package into
-  `web/public/swap` with the make and cancel `pk.bin`, `vk.bin` and
-  `circuit.xbc` beside it;
-- writes `.tools/env` with `ZOLANA_CLI_BIN`, `SHIELDED_POOL_PROGRAM_PATH`,
-  `PROVER_BIN`, `ZOLANA_PHOTON_BIN`, `SURFPOOL_BIN`,
-  `USER_REGISTRY_PROGRAM_PATH`, `SWAP_KEYS_DIR` and `KEELER_SWAP_PROGRAM_SO`.
+## Circuits
 
-Outside the repository it also uses rustup (Rust 1.98.1), the Solana platform
-tools cache (`~/.cache/solana`) and `~/.config/zolana/`. Expect several GB in
-`.tools/` and `target/`.
+Eleven circuits, one verifying key each (`lend/program/src/circuits/`, `lend/sdk/src/proof.rs`,
+`lend/lend-keys.CHECKSUM`).
 
-The `cli` crate depends on `swap-sdk` and `swap-program` by path from
-`.tools/`, so run `scripts/setup.sh` before any cargo command, and keep
-`.tools/` in place: the binary reads the proving keys from it at run time.
-Format with `cargo fmt -p keeler-core -p keeler`, never `cargo fmt --all`.
+| Circuit | Proved by | Spends | Creates | Rule it enforces |
+| --- | --- | --- | --- | --- |
+| `init_reserve` | keeper (admin co-signs) | nothing | the reserve | The reserve sits at the address derived from the mint, both price indices at 1e12, the curve's rate at zero utilisation |
+| `intent` | browser | the maker's note | intent, change | The maker is the signer; the intent commits maker, purpose, target and expiry; amount non-zero; mint pinned |
+| `cancel_intent` | browser | an intent | refund | Only the maker; all of it back to the maker; the public expiry is the intent's (the program allows it only after) |
+| `supply` | keeper | reserve, intent | reserve, receipt | Accrue first; the whole intent into the reserve; the receipt to the maker for `floor(amount × 1e12 / supply price)` shares; at least 1 tUSD |
+| `redeem` | keeper, owner signs | reserve, receipt | receipt, reserve, payout | Only the receipt's owner; burns `ceil(amount × 1e12 / supply price)` shares; paid from idle liquidity only; the payout to the owner |
+| `deposit_open` | keeper | intent | position | A position for the maker with the intent's id, all of the collateral, no debt, at least the vault minimum |
+| `deposit_add` | keeper | position, intent | position | Only into the maker's own position, the one the intent names |
+| `draw` | keeper, owner signs | position, reserve | position, reserve, debt payout, collateral payout | Only the owner; afterwards debt at most the collateral factor (80%) of the collateral at the bound; utilisation at most 95%; vault minimums; both payouts always present |
+| `repay` | keeper | position, reserve, intent | position, reserve, change | Only the maker's own position; debt shares removed by the repay rule; the rest back to the maker |
+| `liquidate` | keeper | position, reserve, the keeper's note | position, reserve, change, collateral payout | Past the threshold (85%) at the bound; `0 < x <= debt`; at least one debt share removed; payout `floor((x + 1% of x) × 1e12 / bound)` capped at the collateral; not left healthier than the threshold unless above the max limit (90%) |
+| `close` | browser | a position with no debt | payout | Only the owner; zero debt shares; all the collateral back |
 
-## Commands
+Every circuit that spends a reserve accrues it to the public `now` first, rebuilds its address from
+the mint, and takes the keeper's fresh salt. Every keeper-proved circuit that serves a user seeds
+its output blindings from a note that user holds (the intent, receipt or position), so the user
+can recompute its own outputs. The maths is
+`core/src/lend.rs`, with shared vectors (`web/tests/fixtures/lend-vectors.json`) that the Rust
+reference, the circuits (natively) and the page's TypeScript twin all pass. Why these shapes:
+`docs/design-decisions.md`.
 
-All times are chain time, read from the Clock sysvar. On the local network
-chain time runs at about 0.87 of wall time, so a 30 s quote lasts about 35 s
-on the wall clock.
+## Measured
 
-- `keeler swap <config> <sell_mint> <buy_mint> <amount>`: checks that one
-  note covers `amount`, asks every dealer (2 s timeout each), keeps quotes
-  within `band_bps` of the reference price whose time to live is within
-  `[min_ttl_secs, max_ttl_secs]`, locks the largest, and waits on the order's
-  nullifier. It prints `settled: received <n>`, or after expiry cancels and
-  prints `not settled before expiry: refunded`.
-- `keeler dealer <config>`: registers, serves quotes on `listen`
-  (loopback only) at the reference price less `spread_bps`, and settles only
-  orders that exactly match a quote it gave, while `now + settle_margin_secs`
-  is before the expiry and, at the last look, the quoted amount is at most
-  the fair amount at the current price plus `settle_tolerance_bps`. It signs
-  every quote, keeps its quotes in a state file across restarts, and splits
-  off a note of exactly the quoted amount first when it has none. The trader
-  drops a quote not signed by the dealer's configured `pubkey`.
-- `keeler refund <config>` (trader config): cancels every unspent order of
-  this trader whose expiry has passed. Running it again is a no-op.
-  It only sees orders in the assets the config lists: an order in any other
-  mint is skipped by the SDK and needs a config that lists that mint.
+Only figures that come from a file in this repository, with their source. Everything else is
+"not measured yet".
 
-Amounts are in base units. Mints are base58; SOL is
-`11111111111111111111111111111111`. Run with `source .tools/env` so the
-binary finds the proving keys (`SWAP_KEYS_DIR`).
+Per shipped instruction. Transaction size is the v1 wire size against the 4,096-byte v1 limit the
+SDK and page use (`docs/lend-api.md`, "build").
 
-## Web app support
+| Instruction | Program proof bytes | Compute units | v1 tx bytes (of 4,096) | Browser proof time |
+| --- | --- | --- | --- | --- |
+| `init_reserve` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `intent` | not measured yet | not measured yet | not measured yet | not measured yet |
+| `cancel_intent` | not measured yet | not measured yet | not measured yet | not measured yet |
+| `supply` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `redeem` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `deposit_open` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `deposit_add` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `draw` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `repay` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `liquidate` | not measured yet | not measured yet | not measured yet | keeper-proved |
+| `close` | not measured yet | not measured yet | not measured yet | not measured yet |
 
-- `scripts/dev.sh [offset] [port]` (defaults 900, 8787): the whole web app
-  on a local network in one command. Starts `scripts/localnet.sh start
-  <offset>`, builds `web/dist` with `VITE_DEALERS` from the stack's
-  `keeler-web-<offset>.json`, writes `worker/.dev.vars` from it, and runs the
-  real Worker under `wrangler dev` at `http://127.0.0.1:<port>`. Ctrl-C (or
-  SIGTERM) stops everything it started. `cd web && pnpm e2e` starts it (or
-  reuses a running one) and drives the built page through the Worker.
-- `scripts/localnet.sh start|stop <offset>` (offset 100 to 4900, a multiple of
-  100): a local stack for the web app. Network on RPC `8899+offset`, Photon
-  `8784+offset`, prover `3001+offset/100`; tUSD (6 decimals) and tSOL (9);
-  a dealer with one private note of each, TCP quotes on `47000+offset`, HTTP
-  on `47500+offset` with `x-keeler-key: keeler-localnet-dealer-key`, faucet
-  on. Prints and writes `target/localnet/keeler-web.json` (and
-  `keeler-web-<offset>.json`). Fixture test keys only.
-- `scripts/deploy-devnet.sh`, `scripts/run-dealer.sh` and
-  `scripts/set-upgrade-authority.sh <program> <new-authority> [plan]`: devnet
-  deployment, the dealer behind a quick tunnel, and the authority handoff.
-  Not run until the owner approves publishing the example's code. All three
-  pass their output through a filter that replaces `api-key=<value>`.
-  - `deploy-devnet.sh` creates the missing Keychain items, rebuilds `.tools`
-    for the devnet program ID (then prints the command that restores the
-    example's ID for local tests), writes `target/devnet/deploy-plan.json`
-    (Keychain names only) and runs the deploy tool, `cargo run --release -p
-    keeler --example deploy -- setup <plan>`. The tool reads every key from
-    the Keychain, refuses a cluster whose genesis hash is not the plan's, and
-    checks chain state before each step: funds the dealer and faucet to their
-    targets, deploys with the upgradeable loader through a buffer whose
-    keypair is the Keychain item `keeler-devnet-buffer` (a rerun after a
-    failure skips the chunks already written and checks the deployed bytes),
-    creates the mints and their pool interfaces, mints only the inventory
-    shortfall and deposits it. After any failure, run the script again. It
-    writes `target/devnet/deploy-summary.json` and `dealer-config.json`, and
-    keeps the first build's `swap_program.so` there to deploy on reruns. The
-    faucet pays 0.01 SOL and the test tokens per claim, one claim per wallet
-    and 60 in all per UTC day: about 0.85 SOL a day with rent and fees, so
-    the faucet's 2.5 SOL lasts about three days at the cap.
-  - `run-dealer.sh` refuses unless `.tools` is built for the config's
-    `program_id`, restarts the dealer and the tunnel with backoff, and
-    rewrites the Worker's `DEALERS` (backing off on failure) when the
-    `*-*.trycloudflare.com` URL changes.
-  - `set-upgrade-authority.sh` hands the authority to an existing
-    system-owned account after you type its address again (refused for a
-    mainnet plan: there only a checked Squads vault takes it). With
-    `--squads <multisig> <vault-index> <program> [plan]` it hands it to that
-    Squads v4 vault instead, after checking the multisig (threshold 2 or more,
-    no config authority) and a typed confirmation.
-- `scripts/deploy-lend-devnet.sh [--estimate] [name]`: the lend program on
-  devnet, with the dealer (and an optional standby) as keepers and a pool key
-  of its own (`docs/lend-deploy.md`). `--estimate` sends nothing and creates
-  no Keychain items.
-- `scripts/deploy-mainnet.sh swap|lend [--estimate] ...`: the mainnet deploy
-  (`docs/mainnet-runbook.md`). Every parameter is given explicitly; it
-  refuses a dirty tree, a non-mainnet RPC, a test-price build, verifying keys
-  that are not the ceremony manifest's, and a Squads multisig that one key
-  controls. For lend it builds its own `keeler` with the program's build
-  parameters and checks, before the deploy, everything the reserve's
-  creation needs (`keeler deploy reserve check`); the last step creates the
-  reserve unless it exists, so a rerun after any failure finishes.
-  `build.json` records the commit and its tag. `--build-only` builds and
-  checks for an upgrade through the multisig; `--check-so` checks an
-  existing `.so`. Until the key ceremony's verifying keys are committed it
-  stops with `no key ceremony yet`; `--estimate` works before that. Its
-  refusals are tested without a network by
-  `cargo test -p keeler --test deploy_mainnet_refusals` (stub `security`
-  and `cargo`); `-- --ignored` adds a read-only devnet RPC refusal.
-- Dealer HTTP (loopback only, every request carries `x-keeler-key`, 4 KiB
-  body cap), amounts as decimal strings:
-  `POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` ->
-  `{"quote":{"buy_amount","expiry","signature"}}` or `{"error":"no quote"}`;
-  `POST /faucet` `{"wallet"}` -> `{"ok":true}` or `{"error"}` (404 off,
-  429 over a limit, 409 the faucet is out of SOL, 502 transfer failed);
-  `GET /health` -> `{"ok":true,"now":<chain time>}`. 401 bad key, 403 not
-  loopback, 413 body too large (refused from `Content-Length` before
-  reading), 400 bad request or chunked body, 408 when the request takes
-  over 3 s. One request per connection (`Connection: close`).
-- Quote signature: Ed25519 by the dealer's key over 167 bytes,
-  `"keeler-quote-v1"`, then program ID, sell mint, buy mint, trader (32
-  bytes each), then sell amount, buy amount, expiry (u64 little-endian);
-  128 hex characters on the wire.
-- `web/tests/fixtures/{make,cancel}-ix.json`: golden instruction bytes for
-  the web client, and `quote-sig.json`, a signed quote test vector;
-  `KEELER_WRITE_FIXTURES=1 cargo test -p keeler --test fixtures`
-  regenerates them (needed after a program ID change).
+The local-network tests print compute units and sizes for the shipped instructions:
+`LEND_CHAIN_TESTS=earn_chain lend/scripts/run-chain-test.sh` and
+`LEND_CHAIN_TESTS=vault_chain lend/scripts/run-chain-test.sh` (lines starting `EARN` and the vault
+equivalents). Their output is not committed yet.
 
-## Configuration
+The toolkit spike, on prototype circuits that are not the shipped ones (source:
+`docs/notes-for-xark-builders.md`, from `lend/scripts/run-spike.sh`):
 
-`network.prover` is `"local"` (the local prover at `ZOLANA_PROVER_URL`, proof
-data from our indexer) or `{"helius": {"keychain": "<name>"}}`: Helius's
-attested prover at `indexer_url`, with the API key read from that Keychain
-item (a bare key, or a Helius URL with an `api-key` parameter) and added to
-the RPC and indexer URLs at run time. Logs and errors redact `api-key`
-values.
+| Spike instruction | CU | v1 tx bytes (of 4,096) | ix data bytes | Accounts |
+| --- | --- | --- | --- | --- |
+| init (address reservation) | 242,298 | 1,139 | 789 | 8 |
+| accrue (2 in) | 250,577 | 1,206 | 822 | 10 |
+| fund (1 in, 3 out) | 246,813 | 1,461 | 1,110 | 9 |
+| touch, dummy top-up (3 in, 4 out) | 264,753 | 1,725 | 1,146 | 13 |
+| touch, real top-up (4 in, 4 out) | 269,015 | 2,106 | 1,493 | 15 |
 
-The dealer also takes, all optional: `"http": {"listen", "key": <key
-source>}` for the HTTP API; `"poll_secs"` (default 1 with the local prover,
-else 5); and `"faucet": {"key", "tokens": [{"mint", "amount"}], "lamports",
-"per_wallet_daily", "daily_cap"}`, where `key` is the tokens' mint authority
-and pays the fee SOL, and the limits count claims per UTC day. Also:
-`"state_file"` (default `~/.local/state/keeler/dealer-<pubkey>.json`, mode
-0600; unexpired quotes reload on start); `"pause_file"` (while it exists, no
-new quotes; bound orders still settle); `"settle_tolerance_bps"` (default 0;
-a failed price fetch settles nothing that poll); and `"limits": [{"mint",
-"max_sell_amount", "hourly_sell_cap"}]` on what traders sell the dealer per
-order and per rolling hour of bound orders. The state file also keeps the
-faucet counts and the hourly sell window; on reload, quotes not signed by
-this dealer's key are dropped. Required: `"program_id"`, the swap program the
-binary was built for (the dealer refuses to start on a mismatch). Optional:
-`"pubkey"` (checked against `key`), `"auto_pause_after"` (default 3
-consecutive failed settles write `<state_file>.autopaused`, which stops new
-quotes until a settle succeeds or you delete it) and `"min_fee_lamports"` (no
-quotes while the dealer has less fee SOL; default 0.01 SOL). With the Helius
-prover, `rpc_url` and `indexer_url` must be Helius hosts. A panic in any
-dealer thread ends the process so the supervisor restarts it.
+| Spike circuit | Constraints | Native proof (Apple M-series, release) |
+| --- | --- | --- |
+| `SpikeInit` | 16,731 | 0.83 s |
+| `SpikeAccrue` (accrue, shares, refresh) | 30,431 | 1.47 s |
+| `SpikeFund` | 9,847 | 1.0 s |
+| `SpikeTouch` (accrue, repay, health, refresh) | 45,174 | 2.8 s |
 
-`key` is `{"file": "<keypair.json>"}` for local test keys or
-`{"keychain": "<name>"}`, read with `security find-generic-password -s <name>
--w`; the secret is a Solana keypair JSON array. A price is fixed
-(`{"price": 15, "expo": -2}` is 0.15 USD) or `{"pyth": {"account": "<price
-feed account>", "feed_id": "<64 hex>"}}`, which needs a `pyth` section
-(`max_age_secs`, `max_conf_bps`). Pyth prices are read on chain, all in one
-`getMultipleAccounts` with the Clock: the account must be owned by Pyth's
-receiver `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`, fully verified, carry
-that feed id, be at most `max_age_secs` from chain time either way, and have a
-positive price with confidence within `max_conf_bps`; otherwise there is no
-price, so no quote and no settlement. Every
-mint you trade needs a price.
+Shielded-pool proofs from the local prover took 0.13 to 0.5 s for 1 to 2 inputs and 0.7 to 2.2 s
+for 3 to 4. Three of the five spike transactions are over the 1,232-byte legacy packet, so Keeler
+sends v1 transactions.
+
+## Build and run
+
+Needs macOS on Apple silicon or Linux x86-64, git, curl, Python 3.11 or newer, rustup, the
+Solana/Agave CLI (`cargo build-sbf`), Node and pnpm. Pinned in the repository: Rust 1.98.1
+(`rust-toolchain.toml`, `lend/rust-toolchain.toml`); `helius-labs/privacy-ring-examples` at
+`9e5d69ade7e0c107a2929306d3b758a8969e1089` and SBF platform tools v1.54 (`scripts/setup.sh`,
+`scripts/setup-lend.sh`); `xark` 0.3.1 and the `spr-*` crates 0.10.0, built with the `zolana` CLI
+`cli-v0.10.0` (`lend/Cargo.toml`); `@heliuslabs/spr` 0.9.0-alpha (`web/package.json`).
+
+```sh
+scripts/setup.sh        # the pinned swap example into .tools/, .tools/env; idempotent, slow the first time
+source .tools/env
+scripts/setup-lend.sh   # lend circuits and test keys (checked against lend/lend-keys.CHECKSUM), WASM, .so
+```
+
+Tests:
+
+```sh
+cargo test -p keeler-core
+cargo test -p keeler --lib --test fixtures --test deploy_mainnet_refusals
+cd lend
+cargo test --release -p keeler-lend --features build-circuits --lib   # maths and the shared vectors
+cargo test -p keeler-lend --test program                              # Mollusk, on lend/target/deploy/keeler_lend.so
+cargo test --release -p keeler-lend-sdk                               # builders, compiled-circuit refusals
+scripts/run-chain-test.sh                                             # local network, port offset 2100
+cd ..
+scripts/run-lend-e2e.sh                                               # the keeper end to end, two keepers, port offset 2500
+(cd web && pnpm install && pnpm test)
+(cd worker && pnpm install && pnpm test)
+source .tools/env && cargo test --release -p keeler --test e2e -- --nocapture   # swaps end to end
+```
+
+The page against a real local keeper: `scripts/lend-web-stack.sh start` (local network, keeper,
+Worker), then `cd web && pnpm e2e:lend`. Local networks use a port offset and stop what they start.
+Every worktree needs its own `.tools/` and `target/`, several GB each.
+
+Devnet and mainnet deploys: `docs/lend-deploy.md` (`scripts/deploy-lend-devnet.sh`) and
+`docs/mainnet-runbook.md` (`scripts/deploy-mainnet.sh`, which refuses test keys, the test price, a
+dirty tree and a single-key upgrade authority).
+
+## Repository layout
+
+| Path | What |
+| --- | --- |
+| `lend/program/` | The lend program: instructions, circuits, generated verifiers, build parameters |
+| `lend/sdk/` | Rust builders and provers for every instruction, chain and refusal tests |
+| `lend/spike/` | The toolkit spike (prototype circuits, local network only) |
+| `core/` | Shared maths: `lend.rs` (the reference for circuits, keeper and page), `rfq.rs`, `price.rs` |
+| `cli/` | The `keeler` binary: keeper, swap dealer and trader, deploy tool |
+| `web/` | The page: wallet, lend and swap clients, the signing check, tests |
+| `worker/` | The Cloudflare Worker |
+| `scripts/` | Setup, local stacks, deploys, end-to-end runners |
+| `patches/swap.patch` | The `wasm` feature added to the swap example |
+| `docs/` | Design, threat model, audit, runbooks, API |
+
+## Documents
+
+- `docs/threat-model.md`: who can do what, what enforces it, and a Nitro Enclave proposal for the
+  keeper.
+- `docs/design-decisions.md`: the reasons behind the reserve note, fixed outputs, the keeper
+  signature, the price bound, keeper-built transactions and liquidation sizing.
+- `docs/notes-for-xark-builders.md`: Xark pitfalls hit here and the spike's measurements.
+- `docs/audit-2026-11-25.md`: the internal audit and its decisions.
+- `docs/plan-lend.md`, `docs/plan-mainnet.md`: the design and the keeper set.
+- `docs/lend-keeper.md`, `docs/lend-api.md`: running the keeper; the page-keeper contract.
+- `docs/mainnet-runbook.md`, `docs/lend-deploy.md`: deploys.
+- `docs/plan.md`, `docs/plan-web.md`: the swap and the web app.
+
+## Known limits
+
+- Test proving keys on devnet: any proof can be forged, so the circuit rules do not hold there.
+- The keepers see every amount, order every operation, and can halt the pool; with every pool-key
+  holder gone, Earn deposits and indebted positions cannot move (intents refund after expiry and
+  debt-free positions close without a keeper).
+- On devnet a keeper sets the price, so it can trigger any liquidation.
+- Wallets are public on every operation until custom rings are live.
+- One operation at a time per pool.
+- An intent's expiry has no upper bound in the circuit; the page uses the ticket's.
+- The liquidated owner can derive the blinding of the liquidator's change note; the keeper
+  liquidates from a note of exactly the repay so that change is zero.
+- The accepted audit findings P-1, K-2 and W-3, and the rest of `docs/threat-model.md`.
+
+## Swaps
+
+The second part: a private quote router. A trader asks several dealers for a quote, drops quotes
+far from a reference price, and settles the best one through the Helius Privacy Rings swap example
+program (`helius-labs/privacy-ring-examples`, `swap/xark`), built from `.tools/` by
+`scripts/setup.sh` with its own test keys. Amounts and the price stay inside shielded notes and
+order terms encrypted to the trader and the chosen dealer; both wallets, both asset ids, and that
+a swap was made and later taken or cancelled are public; every dealer asked learns the pair, the
+size and the trader's public key. Design: `docs/plan.md`.
+
+<details>
+<summary>Swap commands and configuration</summary>
+
+All times are chain time. On the local network chain time runs at about 0.87 of wall time, so a
+30 s quote lasts about 35 s on the wall clock.
+
+- `keeler swap <config> <sell_mint> <buy_mint> <amount>`: checks that one note covers `amount`,
+  asks every dealer (2 s timeout each), keeps quotes within `band_bps` of the reference price whose
+  time to live is within `[min_ttl_secs, max_ttl_secs]`, locks the largest, and waits on the
+  order's nullifier. It prints `settled: received <n>`, or after expiry cancels and prints
+  `not settled before expiry: refunded`.
+- `keeler dealer <config>`: registers, serves quotes on `listen` (loopback only) at the reference
+  price less `spread_bps`, and settles only orders that exactly match a quote it gave, while
+  `now + settle_margin_secs` is before the expiry and the quoted amount is at most the fair amount
+  at the current price plus `settle_tolerance_bps`. It signs every quote and keeps its quotes in a
+  state file across restarts. The trader drops a quote not signed by the dealer's `pubkey`.
+- `keeler refund <config>` (trader config): cancels every unspent order of this trader whose
+  expiry has passed, in the assets the config lists.
+- `scripts/dev.sh [offset] [port]`: the whole swap web app on a local network, the real Worker
+  under `wrangler dev`; `cd web && pnpm e2e` drives it. `scripts/localnet.sh start|stop <offset>`
+  starts just the stack.
+- `scripts/deploy-devnet.sh`, `scripts/run-dealer.sh` (the dealer, and the keeper when its config
+  has a `lend` section, behind a tunnel), `scripts/set-upgrade-authority.sh`.
+
+Amounts are base units; mints are base58; SOL is `11111111111111111111111111111111`. Run with
+`source .tools/env` so the binary finds the proving keys (`SWAP_KEYS_DIR`).
+
+`network.prover` is `"local"` or `{"helius": {"keychain": "<name>"}}` (Helius' attested prover,
+the API key read from that Keychain item). `key` is `{"file": "<keypair.json>"}` for local test
+keys or `{"keychain": "<name>"}`. A price is fixed (`{"price": 15, "expo": -2}` is 0.15 USD) or
+`{"pyth": {"account", "feed_id"}}` with a `pyth` section (`max_age_secs`, `max_conf_bps`), read on
+chain and checked for owner (`rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`), full verification,
+feed id, age, sign and confidence.
 
 Trader:
 
@@ -230,15 +319,9 @@ Trader:
   "key": {"keychain": "keeler-trader"},
   "assets": [
     {"mint": "<spl mint>", "price": {"price": 2, "expo": 0}},
-    {"mint": "11111111111111111111111111111111", "price": {"pyth": {
-      "account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
-      "feed_id": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
-    }}}
+    {"mint": "11111111111111111111111111111111", "price": {"price": 100, "expo": 0}}
   ],
-  "pyth": {"max_age_secs": 60, "max_conf_bps": 100},
-  "dealers": [
-    {"address": "127.0.0.1:47001", "pubkey": "<dealer Solana public key>"}
-  ],
+  "dealers": [{"address": "127.0.0.1:47001", "pubkey": "<dealer Solana public key>"}],
   "band_bps": 50,
   "min_ttl_secs": 10,
   "max_ttl_secs": 120
@@ -263,38 +346,25 @@ Dealer:
 }
 ```
 
-## Tests
+Optional dealer fields: `http` (`listen`, `key`) for the HTTP API; `poll_secs`; `faucet`;
+`state_file` (mode 0600); `pause_file`; `settle_tolerance_bps`; `limits` per mint
+(`max_sell_amount`, `hourly_sell_cap`); `pubkey`; `auto_pause_after`; `min_fee_lamports`.
 
-```bash
-cargo test -p keeler-core
-cargo test -p keeler --lib --test fixtures --test deploy_mainnet_refusals
-source .tools/env && cargo test --release -p keeler --test e2e -- --nocapture
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt -p keeler-core -p keeler -- --check
-```
+Dealer HTTP (loopback only, `x-keeler-key` on every request, 4 KiB body cap):
+`POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` -> `{"quote":{"buy_amount","expiry","signature"}}`;
+`POST /faucet` `{"wallet"}`; `GET /health`. Quote signatures are Ed25519 by the dealer's key over
+`"keeler-quote-v2"`, a network byte, then program, mints, trader, amounts and expiry
+(`core/src/rfq.rs`, vector in `web/tests/fixtures/quote-sig.json`).
 
-The end-to-end tests start their own local network per test, the way the
-example's tests do, and fund one trader and three dealers; one runs the
-deploy tool twice (after a deploy stopped mid-buffer) and checks the rerun
-sends nothing. The fixtures test skips, with a note, on a build for another
-program ID. `cargo test -p keeler --test devnet_probe -- --ignored` is a
-read-only devnet simulation (no transaction is sent).
+Swap limits: the example's test keys make every devnet order takeable by anyone; the upstream
+prover listens on every interface; the quote protocol is plain text on loopback; a winning dealer
+that never settles locks the trader's funds until expiry; quotes reserve nothing; dealer discovery
+rescans the order history on every poll.
 
-## Known limits
+</details>
 
-- The swap program's test proving keys come from a fixed public seed, so
-  anyone can forge its proofs. On devnet, assume any open order can be taken
-  by anyone: devnet test tokens only, never real value.
-- The upstream prover listens on `0.0.0.0:3001`, every interface, not just
-  loopback. Keeler does not change it.
-- The quote protocol is plain text on loopback, with no TLS.
-- A dealer inside the band can win and never settle: the trader's funds stay
-  locked until expiry, then `refund` returns them. Short TTLs limit this.
-- Quotes reserve nothing: a dealer can quote more than it can settle across
-  concurrent requests.
-- Pyth accounts are parsed from hand-built buffers in tests; one ignored test
-  (`cargo test -p keeler --lib -- --ignored mainnet_pyth`) reads mainnet
-  SOL/USD through Helius. The mainnet account above is a mainnet price: the
-  local network and devnet use fixed prices.
-- Dealer discovery rescans the whole order history on every poll.
-- Each worktree needs its own `.tools/` and `target/`, several GB each.
+## Licence and credits
+
+Apache-2.0 (`LICENSE`). The swap side runs Helius' `privacy-ring-examples` swap program, fetched
+at a pinned commit and patched (`patches/swap.patch`), not copied into this repository. Built on Helius Privacy Rings (`spr-*`,
+`@heliuslabs/spr`), Blueshift's Xark, and Pinocchio. Built with Claude Code.
