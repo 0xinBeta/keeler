@@ -439,7 +439,16 @@ pub const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 /// "vault", vault_index u8]. The program is deployed at the same address on
 /// mainnet and devnet.
 pub const SQUADS_V4: &str = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf";
+const SQUADS_INITIATE: u8 = 1 << 0;
 const SQUADS_VOTE: u8 = 1 << 1;
+const SQUADS_EXECUTE: u8 = 1 << 2;
+/// The longest Squads time lock a hand-over accepts unless the plan says
+/// otherwise: two days.
+pub const MAX_TIME_LOCK_SECS: u32 = 172_800;
+
+fn max_time_lock_secs() -> u32 {
+    MAX_TIME_LOCK_SECS
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Multisig {
@@ -499,13 +508,13 @@ pub fn squads_vault(multisig: &Address, index: u8) -> Address {
 }
 
 /// Refuses unless `vault` is vault `index` of `multisig`, a Squads v4
-/// multisig read from chain with threshold at least 2, no config authority
-/// and enough voters to reach the threshold.
+/// multisig read from chain that passes [`squads_policy`].
 pub fn check_squads_vault(
     rpc: &SolanaRpc,
     vault: &Address,
     multisig: &Address,
     index: u8,
+    max_time_lock: u32,
 ) -> Result<Multisig> {
     let derived = squads_vault(multisig, index);
     ensure!(
@@ -522,11 +531,16 @@ pub fn check_squads_vault(
         a.owner
     );
     let m = parse_multisig(&a.data)?;
-    squads_policy(&m).map_err(|e| anyhow!("Squads multisig {multisig} {e}; refusing"))?;
+    squads_policy(&m, max_time_lock)
+        .map_err(|e| anyhow!("Squads multisig {multisig} {e}; refusing"))?;
     Ok(m)
 }
 
-fn squads_policy(m: &Multisig) -> Result<()> {
+/// Threshold at least 2, no config authority, enough voters for the
+/// threshold, two members or more who can initiate and two who can execute
+/// (one alone, lost, would stop every upgrade), and a time lock of at most
+/// `max_time_lock` seconds.
+fn squads_policy(m: &Multisig, max_time_lock: u32) -> Result<()> {
     ensure!(
         m.threshold >= 2,
         "has threshold {}; at least 2 required",
@@ -547,6 +561,15 @@ fn squads_policy(m: &Multisig) -> Result<()> {
         voters >= m.threshold as usize,
         "has {voters} voters for threshold {}",
         m.threshold
+    );
+    for (bit, can) in [(SQUADS_INITIATE, "initiate"), (SQUADS_EXECUTE, "execute")] {
+        let n = m.members.iter().filter(|(_, p)| p & bit != 0).count();
+        ensure!(n >= 2, "has {n} members who can {can}; at least 2 required");
+    }
+    ensure!(
+        m.time_lock <= max_time_lock,
+        "has a time lock of {} s; at most {max_time_lock} s accepted",
+        m.time_lock
     );
     Ok(())
 }
@@ -588,6 +611,8 @@ pub struct MainnetPlan {
     pub multisig: Option<String>,
     #[serde(default)]
     pub vault_index: u8,
+    #[serde(default = "max_time_lock_secs")]
+    pub max_time_lock_secs: u32,
 }
 
 /// Any plan's network and current upgrade authority.
@@ -596,6 +621,8 @@ pub struct AuthorityPlan {
     pub network: Network,
     pub genesis_hash: String,
     pub deploy_key: KeySource,
+    #[serde(default = "max_time_lock_secs")]
+    pub max_time_lock_secs: u32,
 }
 
 impl AuthorityPlan {
@@ -640,7 +667,8 @@ impl MainnetPlan {
         if let Some(m) = &self.multisig {
             let m = address_arg(m)?;
             let vault = squads_vault(&m, self.vault_index);
-            let ms = check_squads_vault(&rpc, &vault, &m, self.vault_index)?;
+            let ms =
+                check_squads_vault(&rpc, &vault, &m, self.vault_index, self.max_time_lock_secs)?;
             log!(
                 "squads: vault {vault} of multisig {m}: threshold {} of {} members, time lock {} s",
                 ms.threshold,
@@ -711,6 +739,9 @@ fn reserve_parts(
         keeler_lend::ADMIN
     );
     let p = crate::keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
+    crate::keeper::Ledger::quote(&p.chain, keeler_lend::vaults::TSOL_TUSD.id).context(
+        "the compiled price account is not a verified Pyth update for the compiled feed id",
+    )?;
     let have = checked_rpc(&cfg.network, MAINNET_GENESIS)?
         .get_balance(p.signer.pubkey())
         .map_err(err)?;
@@ -778,11 +809,12 @@ pub fn cli(args: &[String]) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         ["hand-over", path, program, multisig, index] => {
-            let (rpc, current) = load::<AuthorityPlan>(path)?.open()?;
+            let plan: AuthorityPlan = load(path)?;
+            let (rpc, current) = plan.open()?;
             let (program, multisig) = (address_arg(program)?, address_arg(multisig)?);
             let index: u8 = index.parse().context("vault index")?;
             let vault = squads_vault(&multisig, index);
-            let m = check_squads_vault(&rpc, &vault, &multisig, index)?;
+            let m = check_squads_vault(&rpc, &vault, &multisig, index, plan.max_time_lock_secs)?;
             match upgrade_authority(&rpc, &program)? {
                 Some(a) if a == vault => log!("{program}'s upgrade authority is already {vault}"),
                 Some(a) if a == current.pubkey() => hand_over(&rpc, &current, &program, &vault)?,
@@ -1314,21 +1346,29 @@ mod tests {
 
     #[test]
     fn squads_multisig_parses_and_the_policy_holds() {
-        let m = parse_multisig(&multisig_bytes([0; 32], 2, true, &[7, 2, 1])).unwrap();
+        let m = parse_multisig(&multisig_bytes([0; 32], 2, true, &[7, 2, 5])).unwrap();
         assert_eq!(m.threshold, 2);
         assert_eq!(m.time_lock, 30);
         assert_eq!(m.members.len(), 3);
-        assert_eq!(m.members[2], (Address::new_from_array([3; 32]), 1));
-        squads_policy(&m).unwrap();
+        assert_eq!(m.members[2], (Address::new_from_array([3; 32]), 5));
+        squads_policy(&m, MAX_TIME_LOCK_SECS).unwrap();
         let none = parse_multisig(&multisig_bytes([0; 32], 2, false, &[7, 7])).unwrap();
         assert_eq!(none.members[1].0, Address::new_from_array([2; 32]));
-        squads_policy(&none).unwrap();
+        squads_policy(&none, 30).unwrap();
+        assert!(squads_policy(&none, 29)
+            .unwrap_err()
+            .to_string()
+            .contains("time lock of 30 s"));
 
         let refused = |b: Vec<u8>| {
-            squads_policy(&parse_multisig(&b).unwrap())
+            squads_policy(&parse_multisig(&b).unwrap(), MAX_TIME_LOCK_SECS)
                 .unwrap_err()
                 .to_string()
         };
+        assert!(refused(multisig_bytes([0; 32], 2, false, &[7, 6]))
+            .contains("1 members who can initiate"));
+        assert!(refused(multisig_bytes([0; 32], 2, false, &[7, 3, 3]))
+            .contains("1 members who can execute"));
         assert!(refused(multisig_bytes([0; 32], 1, false, &[7, 7])).contains("threshold 1"));
         assert!(refused(multisig_bytes([5; 32], 2, false, &[7, 7])).contains("config authority"));
         // Only one member may vote.

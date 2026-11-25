@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Builds and deploys the swap or the lend program to mainnet. NOT TO BE RUN
-# without the owner: it spends real SOL and hands the upgrade authority to a
-# multisig, which the deploy key cannot take back. It cannot run before the
-# key ceremony (docs/mainnet-runbook.md); --estimate works today and sends
+# Builds and deploys the swap or the lend program to mainnet. Run it with
+# care: it spends real SOL and hands the upgrade authority to a multisig,
+# which the deploy key cannot take back. It cannot run before the key
+# ceremony (docs/mainnet-runbook.md); --estimate works today and sends
 # nothing.
 #
 #   scripts/deploy-mainnet.sh swap|lend [--estimate] --program-id <a> --payer <a>
-#       [--multisig <a> [--vault-index <n>]] [--manifest <file>] [--rpc-url <url>]
+#       [--multisig <a> [--vault-index <n>] [--max-time-lock-secs <n>]]
+#       [--manifest <file>] [--rpc-url <url>]
 #     lend also: --admin <a> --keepers <a,b> --pool-viewing <66 hex>
 #       --collateral-mint <a> --debt-mint <a> --price-account <a> --feed-id <64 hex>
+#       (vault 1 is SOL/USDC: these four must be the values in
+#       docs/mainnet-runbook.md, or it refuses)
 #       and, without --estimate, --keeper-config <file> --keys-dir <dir>
 #   scripts/deploy-mainnet.sh swap|lend --build-only <the build parameters> --manifest <file>
 #     the mainnet build and its marker checks, nothing on chain: the .so for
@@ -18,12 +21,16 @@
 #     `solana program dump`); reads no chain
 #
 # It refuses unless: the git tree is clean; the RPC's genesis hash is
-# mainnet's; every build parameter is given; the .so's embedded verifying-key
-# markers are all from a real setup and its own keys are exactly the ones in
-# the ceremony manifest (sha256sum lines of the ceremony's pk.bin files); the
-# .so has no test-price marker; the new upgrade authority is vault
-# <vault-index> of an autonomous Squads v4 multisig with threshold at least 2,
-# read from chain. In order: build, checks, cost, deploy (typed
+# mainnet's; every build parameter is given, and lend's vault is SOL/USDC
+# priced by Pyth's SOL/USD account; each committed <circuit>.vk.rs names the
+# proving key the manifest lists for that circuit, and no other circuit has
+# one; the .so's embedded verifying-key markers are all from a real setup and
+# its own keys are exactly the ones in the ceremony manifest (sha256sum lines
+# of the ceremony's pk.bin files); the .so has no test-price marker; the new
+# upgrade authority is vault <vault-index> of an autonomous Squads v4
+# multisig with threshold at least 2, at least two members who can initiate
+# and two who can execute, and a time lock of at most --max-time-lock-secs
+# (default 172800, two days), read from chain. In order: build, checks, cost, deploy (typed
 # confirmation), the same marker checks on the deployed program data, hand
 # the upgrade authority to the vault (typed confirmation) and read it back,
 # then (lend) create the reserve with `keeler deploy reserve create`, unless
@@ -31,7 +38,7 @@
 # deploy and the hand-over are checked, not repeated). It creates
 # no token, runs no faucet and moves no inventory.
 #
-# Keychain items (Solana keypair JSON arrays), made by the owner before a real
+# Keychain items (Solana keypair JSON arrays), made before a real
 # run: keeler-mainnet-deploy (pays, the first upgrade authority, and the lend
 # admin: --admin and --payer are its address), keeler-mainnet-<program>-program
 # (its address is --program-id), keeler-mainnet-<program>-buffer; and the
@@ -61,7 +68,7 @@ opt() { local v=arg_${1//-/_}; printf '%s' "${!v:-}"; }
 # Cleared first, so nothing comes in from the environment.
 arg_program_id="" arg_payer="" arg_multisig="" arg_vault_index="" arg_manifest="" arg_rpc_url="" arg_admin=""
 arg_keepers="" arg_pool_viewing="" arg_collateral_mint="" arg_debt_mint="" arg_price_account=""
-arg_feed_id="" arg_keeper_config="" arg_keys_dir=""
+arg_feed_id="" arg_keeper_config="" arg_keys_dir="" arg_max_time_lock_secs=""
 while (($#)); do
     case $1 in
     --estimate) estimate=true; shift ;;
@@ -69,7 +76,7 @@ while (($#)); do
     --check-so) [[ $# -ge 2 ]] || usage; check_so=$2; shift 2 ;;
     --program-id | --payer | --multisig | --vault-index | --manifest | --rpc-url | --admin | \
         --keepers | --pool-viewing | --collateral-mint | --debt-mint | --price-account | \
-        --feed-id | --keeper-config | --keys-dir)
+        --feed-id | --keeper-config | --keys-dir | --max-time-lock-secs)
         [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value"
         n=${1#--}
         printf -v "arg_${n//-/_}" '%s' "$2"
@@ -134,6 +141,24 @@ if bad or own != want:
     echo "markers: $so: real setups, its $circuits keys match $manifest, no test price" >&2
 }
 
+check_vk_sources() {
+    python3 - "$1" "$2" <<'EOF' || exit 1
+import os, sys
+src, manifest = sys.argv[1], sys.argv[2]
+want = {}
+for line in open(manifest):
+    parts = line.split()
+    if len(parts) == 2 and parts[1].endswith("/pk.bin"):
+        want[parts[1].removesuffix("/pk.bin")] = parts[0]
+have = {f.removesuffix(".vk.rs") for f in os.listdir(src) if f.endswith(".vk.rs")} if os.path.isdir(src) else set()
+if have != set(want):
+    sys.exit(f"refusing: the verifying keys in {src} ({sorted(have)}) are not the manifest's circuits ({sorted(want)})")
+for circuit, sha in sorted(want.items()):
+    if f"proving_key_sha256\\x00{sha}" not in open(os.path.join(src, circuit + ".vk.rs")).read():
+        sys.exit(f"refusing: {src}/{circuit}.vk.rs is not the verifying key of the manifest's {circuit}/pk.bin")
+EOF
+}
+
 if [[ -n $check_so ]]; then
     [[ -n ${arg_manifest:-} ]] || die "--check-so needs --manifest"
     check_markers "$check_so" "${arg_manifest}"
@@ -159,11 +184,21 @@ if [[ $program == lend ]]; then
     for k in "${keepers[@]}"; do is_address "$k" || die "--keepers: '$k' is not a base58 address"; done
     [[ ${arg_pool_viewing} =~ ^04[0-9a-f]{64}$ ]] || die "--pool-viewing is not 66 hex starting 04"
     [[ ${arg_feed_id} =~ ^[0-9a-f]{64}$ ]] || die "--feed-id is not 64 hex"
+    sol_vault=(collateral-mint 11111111111111111111111111111111
+        debt-mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+        price-account 7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE
+        feed-id ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d)
+    for ((i = 0; i < ${#sol_vault[@]}; i += 2)); do
+        [[ $(opt "${sol_vault[i]}") == "${sol_vault[i + 1]}" ]] ||
+            die "--${sol_vault[i]} must be ${sol_vault[i + 1]}: vault 1 is SOL/USDC priced by Pyth's SOL/USD account (docs/mainnet-runbook.md)"
+    done
     # The admin only co-signs the reserve's creation, below, with the deploy key.
     [[ ${arg_admin} == "${arg_payer}" ]] || die "--admin must be the deploy key, --payer"
 fi
 vault_index=${arg_vault_index:-0}
 if ! [[ $vault_index =~ ^[0-9]{1,3}$ ]] || ((vault_index > 255)); then die "--vault-index is 0 to 255"; fi
+max_time_lock=${arg_max_time_lock_secs:-172800}
+[[ $max_time_lock =~ ^[0-9]{1,7}$ ]] || die "--max-time-lock-secs is a number of seconds"
 rpc_url=${arg_rpc_url:-https://mainnet.helius-rpc.com}
 [[ $rpc_url =~ ^https://[a-z0-9.-]+\.helius-rpc\.com/?$ ]] || die "--rpc-url is a Helius https host (the key comes from the Keychain)"
 rpc_url=${rpc_url%/}
@@ -199,6 +234,7 @@ if ! $estimate; then
         if grep -l 'insecure_test_setup\\x00true' "$root"/lend/program/src/verifier/*.vk.rs >/dev/null; then
             no_ceremony "lend/program/src/verifier/*.vk.rs are test setups"
         fi
+        vk_sources=$root/lend/program/src/verifier
     else
         for c in make take cancel; do
             [[ -f $root/ceremony/swap/$c.vk.rs ]] || no_ceremony "no ceremony/swap/$c.vk.rs"
@@ -206,8 +242,10 @@ if ! $estimate; then
         if grep -l 'insecure_test_setup\\x00true' "$root"/ceremony/swap/*.vk.rs >/dev/null; then
             no_ceremony "ceremony/swap/*.vk.rs are test setups"
         fi
+        vk_sources=$root/ceremony/swap
     fi
     check_manifest "$arg_manifest"
+    check_vk_sources "$vk_sources" "$arg_manifest"
 fi
 if ! $estimate && ! $build_only; then
     if [[ $program == lend ]]; then
@@ -280,6 +318,14 @@ swap)
         git -C "$src" apply "$root/patches/swap.patch"
         sed -E -i '' "s/(declare_id!\(\")[^\"]*(\"\))/\1${arg_program_id}\2/" "$src/swap/xark/program/src/lib.rs"
         grep -q "declare_id!(\"${arg_program_id}\")" "$src/swap/xark/program/src/lib.rs" || die "no declare_id! in the swap program"
+        test_key_gate='#[cfg(all(not(feature = "build-circuits"), not(feature = "insecure-test-setup")))]'
+        grep -qxF "$test_key_gate" "$src/swap/xark/program/src/lib.rs" ||
+            die "the swap program's test-key gate is not the line patches/swap.patch leaves"
+        GATE=$test_key_gate perl -i -pe 's/^\Q$ENV{GATE}\E$/#[cfg(any())]/' "$src/swap/xark/program/src/lib.rs"
+        if grep -qxF "$test_key_gate" "$src/swap/xark/program/src/lib.rs" ||
+            ! grep -qxF '#[cfg(any())]' "$src/swap/xark/program/src/lib.rs"; then
+            die "the swap program's test-key gate was not lifted"
+        fi
         cp "$root"/ceremony/swap/{make,take,cancel}.vk.rs "$src/swap/xark/program/src/verifier/"
         (cd "$src/swap/xark" && unset CARGO_TARGET_DIR && cargo build-sbf --manifest-path program/Cargo.toml \
             --tools-version v1.54 -- --locked --no-default-features --features bpf-entrypoint)
@@ -305,9 +351,9 @@ if $build_only; then
 fi
 
 python3 - "$out/plan.json" "$program" "$rpc_url" "$so" "${arg_payer}" "${arg_program_id}" \
-    "${arg_multisig:-}" "$vault_index" <<'EOF'
+    "${arg_multisig:-}" "$vault_index" "$max_time_lock" <<'EOF'
 import json, sys
-path, name, rpc, so, payer, program_id, multisig, index = sys.argv[1:]
+path, name, rpc, so, payer, program_id, multisig, index, max_time_lock = sys.argv[1:]
 plan = {
     "name": name,
     "network": {
@@ -324,6 +370,7 @@ plan = {
     "program_id": program_id,
     "multisig": multisig or None,
     "vault_index": int(index),
+    "max_time_lock_secs": int(max_time_lock),
 }
 open(path, "w").write(json.dumps(plan, indent=2) + "\n")
 EOF
