@@ -300,12 +300,14 @@ export function createKeeler(): Keeler {
     }
   };
 
+  let lastConfirmedSlot: bigint | undefined;
+
   /** Sends a signed transaction and waits for confirmation; returns the slot. */
   const send = async (signed: Transaction): Promise<bigint> => {
     const c = await client();
     return as("network", "Sending the transaction", async () => {
       await c.solanaRpc.sendTransaction(getBase64EncodedWireTransaction(signed), { encoding: "base64" }).send();
-      return c.confirmTransaction(getSignatureFromTransaction(signed));
+      return (lastConfirmedSlot = await c.confirmTransaction(getSignatureFromTransaction(signed)));
     });
   };
 
@@ -317,7 +319,7 @@ export function createKeeler(): Keeler {
     return { client: await client(), wallet: k.spr, keys: k.keys, payer: owner(), programId: address(c.programId), network: c.network };
   };
 
-  const sync = async (requireSlot?: bigint) => {
+  const sync = async (requireSlot = lastConfirmedSlot) => {
     const k = keys();
     await as("network", "Reading your private balance", async () =>
       syncWallet({ client: await client(), wallet: k.spr, keys: k.keys, ...(requireSlot ? { config: { requireSlot } } : {}) }),

@@ -53,10 +53,10 @@ export function Orders({ keeler, orders, chainOffset, refresh, refreshBalances, 
   };
 
   return (
-    <section className="section" aria-labelledby="orders-title">
-      <div className="section-head">
+    <section className="activity" aria-labelledby="orders-title">
+      <div className="panel-header">
         <h2 id="orders-title">Your orders</h2>
-        <button className="btn btn-ghost btn-small" onClick={find} disabled={scan === "busy"} aria-busy={scan === "busy"}>
+        <button className="button button-secondary button-small" onClick={find} disabled={scan === "busy"} aria-busy={scan === "busy"}>
           {scan === "busy" ? "Reading the chain…" : "Find my orders"}
         </button>
       </div>
@@ -64,10 +64,10 @@ export function Orders({ keeler, orders, chainOffset, refresh, refreshBalances, 
         {scan === "busy" ? "Looking for this wallet's orders on the chain. This can take a little while." : ""}
       </p>
       {orders.length === 0 ? (
-        <p className="muted">
+        <p className="activity-empty">
           {scan === "done"
             ? "No orders found for this wallet."
-            : "No orders yet. Get quotes above to make your first private swap, or find orders made from another browser."}
+            : "No orders yet. Get quotes in the Swap view to make your first private swap, or find orders made from another browser."}
         </p>
       ) : (
         <ul className="orders">
@@ -97,7 +97,7 @@ export function Orders({ keeler, orders, chainOffset, refresh, refreshBalances, 
                   </span>
                 )}
                 {o.status === "refundable" && (
-                  <button className="btn btn-primary btn-small" onClick={() => refund(o.id)} disabled={!!busy} aria-busy={busy === o.id}>
+                  <button className="button button-primary button-small" onClick={() => refund(o.id)} disabled={!!busy} aria-busy={busy === o.id}>
                     {busy === o.id ? "Taking funds back…" : "Take funds back"}
                   </button>
                 )}

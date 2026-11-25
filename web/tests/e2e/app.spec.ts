@@ -5,7 +5,12 @@ import { readFileSync } from "node:fs";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { STACK } from "../playwright.config";
 
-const panel = (page: Page) => page.getByRole("region", { name: "Private swap" });
+const panel = (page: Page) => page.getByRole("region", { name: "Keeler app" });
+async function view(page: Page, name: string) {
+  const link = page.getByRole("navigation", { name: "Application" }).getByRole("link", { name: new RegExp(`^${name}`) });
+  await link.click();
+  await expect(link).toHaveAttribute("aria-current", "page");
+}
 const ordersSection = (page: Page) => page.locator("section[aria-labelledby=orders-title]");
 
 /** Base units from the page's formatted amount ("1,234.5"). */
@@ -17,8 +22,8 @@ function units(text: string, decimals: number): bigint {
 const DECIMALS: Record<string, number> = { tUSD: 6, tSOL: 9 };
 
 async function balances(page: Page) {
-  await panel(page).getByRole("button", { name: "Balances", exact: true }).click();
-  const table = panel(page).getByRole("table");
+  await view(page, "Balances");
+  const table = panel(page).locator("table.bal");
   await expect(table.getByText("Reading balances…")).toHaveCount(0);
   const out: Record<string, { public: bigint; private: bigint }> = {};
   for (const row of await table.locator("tbody tr").all()) {
@@ -31,7 +36,7 @@ async function balances(page: Page) {
 
 async function move(page: Page, mode: "Deposit" | "Withdraw", amount: string, symbol: string) {
   const p = panel(page);
-  await p.getByRole("button", { name: "Balances", exact: true }).click();
+  await view(page, "Balances");
   await p.getByRole("group", { name: "Direction" }).getByRole("button", { name: mode }).click();
   await p.getByRole("combobox", { name: "Asset", exact: true }).selectOption({ label: symbol });
   await p.locator("#move-amt").fill(amount);
@@ -42,7 +47,7 @@ async function move(page: Page, mode: "Deposit" | "Withdraw", amount: string, sy
 /** Sells `amount` tUSD for tSOL with the selected quote; resolves once the order is locked or settled. */
 async function startSwap(page: Page, amount: string, onProving?: () => void) {
   const p = panel(page);
-  await p.getByRole("button", { name: "Swap", exact: true }).click();
+  await view(page, "Swap");
   await p.locator("#sell-amt").fill(amount);
   await p.getByRole("button", { name: "Get quotes" }).click();
   await expect(p.getByText("Signature verified")).toBeVisible({ timeout: 30_000 });
@@ -82,7 +87,7 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
     document.addEventListener("securitypolicyviolation", (e) => console.error(`CSP blocked ${e.violatedDirective}: ${e.blockedURI}`));
   });
 
-  const main = await page.goto("/");
+  const main = await page.goto("/#swap");
   expect(main?.headers()["content-security-policy"]).toContain("'wasm-unsafe-eval'");
 
   // Wallet, unlock, test tokens (a new wallet has no SOL for the fee), register.
@@ -90,7 +95,7 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
   await panel(page).getByRole("button", { name: "Get test tokens" }).click();
   await expect(panel(page).getByText("Test tokens sent to your public balance.")).toBeVisible({ timeout: 60_000 });
   await panel(page).getByRole("button", { name: "Register" }).click();
-  await expect(panel(page).getByRole("heading", { name: "Swap privately" })).toBeVisible({ timeout: 120_000 });
+  await expect(page.locator("#sell-amt")).toBeVisible({ timeout: 120_000 });
 
   // 500 tUSD into the private balance.
   const funded = await balances(page);
@@ -121,7 +126,7 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
     });
     await startSwap(page, "100");
     await page.unroute("**/api/quotes");
-    expect((await balances(page)).tUSD!.private).toBe(250_000_000n);
+    await expect.poll(async () => (await balances(page)).tUSD!.private, { timeout: 30_000 }).toBe(250_000_000n);
 
     // Lose this browser's order records (the in-page wallet key stays), reload, find the order on chain.
     const removed = await page.evaluate(() => {
@@ -132,7 +137,9 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
     expect(removed).toBeGreaterThan(0);
     await page.reload();
     await connectAndUnlock(page);
-    await expect(panel(page).getByRole("heading", { name: "Swap privately" })).toBeVisible({ timeout: 60_000 });
+    await view(page, "Swap");
+    await expect(page.locator("#sell-amt")).toBeVisible({ timeout: 60_000 });
+    await view(page, "Activity");
     const orders = ordersSection(page);
     await orders.getByRole("button", { name: "Find my orders" }).click();
     await expect(orders.getByRole("button", { name: "Find my orders" })).toBeEnabled({ timeout: 120_000 });

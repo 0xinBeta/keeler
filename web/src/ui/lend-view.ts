@@ -1,7 +1,7 @@
 // What the lending screens show, on top of the shared maths (keeler/lend-math.ts, which matches the program): the
 // interface's units (bps as numbers, Infinity for debt against nothing) and price text. No formula of its own
 // beyond the limits the program's `canDraw` implies.
-import type { Vault } from "../keeler/index";
+import type { Asset, Balance, Pool, Receipt, Vault } from "../keeler/index";
 import * as L from "../keeler/lend-math";
 import { formatUnits } from "./format";
 
@@ -12,6 +12,9 @@ export function healthBps(collateral: bigint, debt: bigint, price: bigint): numb
 }
 
 /** Past the threshold: `isLiquidatable`, read from the rounded-up health (equivalent for whole basis points). */
+/** Whether the page presents lending: the client decides once the config is read; before that the build does, so the first paint does not change. */
+export const lendingShown = (configRead: boolean, lend: boolean, compiled: boolean) => (configRead ? lend : lend || compiled);
+
 export const liquidatable = (health: number, vault: Vault) => health > vault.liquidationThresholdBps;
 
 /** The highest price at which the position is liquidatable; null without debt or collateral. */
@@ -40,6 +43,30 @@ export function maxWithdraw(collateral: bigint, debt: bigint, price: bigint, fac
   const value = (debt * L.BPS + BigInt(factorBps) - 1n) / BigInt(factorBps);
   const needed = (value * L.PRICE_SCALE + price - 1n) / price;
   return collateral > needed ? collateral - needed : 0n;
+}
+
+/** The largest private note of `asset`: what one spend can use. Null while the balances are unread. */
+export const largestNote = (balances: readonly Balance[] | null, asset: Asset) => balances?.find((b) => b.asset.mint === asset.mint)?.largestNote ?? null;
+
+/**
+ * Earn's limits: one deposit spends one private note (`note`); one withdrawal spends one deposit receipt, so the
+ * largest receipt of this pool caps it (`largestReceipt`). `mine`: this pool's receipts that still hold shares.
+ */
+export function earnLimits(pool: Pool, receipts: readonly Receipt[] | null, balances: readonly Balance[] | null) {
+  const mine = receipts?.filter((r) => r.pool === pool.id && r.shares > 0n) ?? [];
+  const largestReceipt = mine.reduce((m, r) => (r.value > m ? r.value : m), 0n);
+  return { mine, largestReceipt, note: largestNote(balances, pool.asset) };
+}
+
+/** Borrow's limit for each action: one note for adding collateral or repaying, `canDraw` for borrowing or withdrawing. */
+export function borrowLimits(vault: Vault, collateral: bigint, debt: bigint, balances: readonly Balance[] | null) {
+  const cf = vault.collateralFactorBps;
+  return {
+    add: largestNote(balances, vault.collateral),
+    borrow: maxBorrow(collateral, debt, drawPrice(vault), cf),
+    repay: largestNote(balances, vault.debt),
+    withdraw: maxWithdraw(collateral, debt, drawPrice(vault), cf),
+  };
 }
 
 /** `amount` grown at `rateBps` a year for `secs` seconds, simple interest, rounded down: a display estimate between reads. */
