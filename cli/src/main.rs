@@ -11,7 +11,8 @@ const USAGE: &str = "usage: keeler swap <config> <sell_mint> <buy_mint> <amount>
        keeler refund <config>
        keeler keeper <keeper config>
        keeler lend-init-reserve <keeper config>
-       keeler lend-set-price <keeper config> <vault> <price x1e12> <confidence x1e12>";
+       keeler lend-set-price <keeper config> <vault> <price x1e12> <confidence x1e12>
+       keeler deploy viewing-key <item> | check <plan> | program <plan> <out> | hand-over <plan> <program> <multisig> <index>";
 
 fn main() -> ExitCode {
     // A panic in any thread ends the process, so the supervisor restarts the
@@ -80,6 +81,7 @@ fn run(args: &[String]) -> Result<()> {
                 lend_chain::set_test_price(&p.chain, want.vault, want.price, want.confidence)?;
             println!("test price set: {sig}");
         }
+        [cmd, rest @ ..] if cmd == "deploy" => keeler::deploy::cli(rest)?,
         [cmd, cfg] if cmd == "refund" => {
             let done = trader::refund(&TraderConfig::load(cfg)?.common)?;
             if done.found == 0 {

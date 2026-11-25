@@ -9,19 +9,26 @@ nothing.
 - The swap is on devnet: `target/devnet/deploy-summary.json` from `scripts/deploy-devnet.sh`. Its
   dealer is the lend keeper, and its tSOL and tUSD are vault 1's collateral and debt.
 - Keychain: `keeler-devnet-deploy` (funded; it pays, is the upgrade authority and is the program's
-  admin), `keeler-devnet-dealer` (the keeper; the script refuses if it is not the summary's dealer),
-  `keeler-helius-api-key`.
+  admin), `keeler-devnet-dealer` (the first keeper; the script refuses if it is not the summary's
+  dealer), `keeler-helius-api-key`. Optional: `keeler-devnet-<name>-standby`, a second keeper
+  compiled in after the dealer (it must not be the dealer's key).
 - `.tools/env` in the main checkout (`scripts/setup.sh`).
 
 ## What it does
 
-1. Creates `keeler-devnet-<name>-program` and `keeler-devnet-<name>-buffer` in the Keychain if absent.
+1. Creates `keeler-devnet-<name>-pool`, `keeler-devnet-<name>-program` and
+   `keeler-devnet-<name>-buffer` in the Keychain if absent. The pool key is its own key (not a
+   keeper's, not the deploy key): its viewing key is compiled in as the pool viewing key, and
+   whoever holds it reads every pool amount, so a keeper can be removed without holding it.
+   `--estimate` creates none of them: with one missing it builds with stand-in addresses under
+   `target/devnet-<name>/estimate/`, prints the cost and records nothing.
 2. Builds the program once (`scripts/setup-lend.sh` with `KEELER_LEND_OUT`) with the program ID,
-   admin, keeper and mints compiled in, and keeps `target/devnet-<name>/keeler_lend.so`. Reruns
+   admin, keeper list (dealer first, then the standby if any), pool viewing key and mints compiled in, and keeps `target/devnet-<name>/keeler_lend.so`. Reruns
    deploy those bytes; `program-id` records what they were built for. It refuses if the build
    changes a tracked file. The circuits and verifying keys do not depend on these parameters: the
    build checks them against `lend/lend-keys.CHECKSUM`, so the browser package is the local one.
-   `build-params.json` records the program ID, admin, keeper and mints; a rerun refuses if they
+   `build-params.json` records `program_id`, `admin`, `keepers` (a list), `pool_viewing` and the
+   mints; a rerun refuses if they
    have changed since (another Keychain item or swap deploy), and `scripts/run-dealer.sh` builds
    the keeper from this file, not from the Keychain.
 3. Copies the proving keys from `lend/target/zk/keeler-lend` to `target/devnet-<name>/keys/`
@@ -72,7 +79,9 @@ others see or use. Nothing here is done by the deploy script.
    `program_id` from `target/devnet-<name>/summary.json`, `network` equal to the Worker's
    `NETWORK` (`devnet`), `key` the dealer's Keychain item, `admin_key` the `keeler-devnet-deploy`
    item, `state_file`, `pause_file`, `price: "test"`, `price_refresh_secs` (45), `limits`. Check
-   that `limits.min_*` are not below the vault's minimums in `LEND_VAULTS`.
+   that `limits.min_*` are not below the vault's minimums in `LEND_VAULTS`. A standby keeper gets
+   its own config with `key` its Keychain item, `role: "standby"`, and its own `state_file` and
+   `pause_file`.
 2. **Reserve** (**SOL**, once): `keeler lend-init-reserve <keeper config>`. This command and
    `lend-set-price` take a keeper config, not the dealer config (which they refuse): a file with
    only the dealer config's `network`, `key`, `http` and `lend`, and the same `state_file`, run with
@@ -92,11 +101,13 @@ others see or use. Nothing here is done by the deploy script.
    something to borrow.
 7. **Worker variables** (**public**): set `LEND_PROGRAM_ID`, `LEND_POOLS` and `LEND_VAULTS`
    (`worker/README.md`; the pool's curve, fee, max utilisation and minimum, and the vault's
-   factors and minimums exactly as compiled into the program), keep the keeper as the first
-   `DEALERS` entry, and `REFERENCE` or `PYTH_ACCOUNTS` for the page's fallback price. Optionally
+   factors and minimums exactly as compiled into the program), `LEND_KEEPERS` (a JSON list of
+   `{"url","pubkey"}`, in the compiled order; the script prints its shape), keep the keeper as the
+   first `DEALERS` entry, and `REFERENCE` or `PYTH_ACCOUNTS` for the page's fallback price. Optionally
    the `LEND_*_LIMIT` rate limits. Deploy the Worker.
 8. **Site build** (**public**): `VITE_NETWORK=devnet`, `VITE_DEALERS`, `VITE_LEND_PROGRAM_ID` (the
-   program ID) and `VITE_LEND_KEEPER` (the keeper's pubkey), then `pnpm build` in `web/` and
+   program ID), `VITE_LEND_KEEPERS` (the JSON list of keeper pubkeys from `build-params.json`) and
+   `VITE_LEND_POOL_VIEWING` (its `pool_viewing`); the script prints all three at the end. Then `pnpm build` in `web/` and
    deploy. The page reads the pools and vaults from `/api/config`.
 9. **Check**: open the Earn tab (the pool shows its figures and the price), make a small deposit,
    borrow, repay all and close from a second wallet.
