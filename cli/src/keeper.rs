@@ -559,7 +559,9 @@ pub struct Book {
 /// it.
 const OWN_MARK: &str = "";
 
-fn scan_marks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+fn scan_marks<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Marks {
@@ -791,8 +793,7 @@ pub trait Ledger: Sync {
     /// recovered from the chain with the pool viewing key and the writer
     /// key; spent ones included. With the newest signature read, to pass
     /// next time.
-    fn history(&self, payer: &Address, after: Option<&str>)
-        -> Result<(Vec<Note>, Option<String>)>;
+    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)>;
 }
 
 // ---- the keeper ----
@@ -1783,7 +1784,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             origins: &self.cfg.origins,
         };
         let wallet = lend_auth::authenticate(fields, method, path, now, &site, &mut nonces)
-        .map_err(|m| (401, m.to_owned()))?;
+            .map_err(|m| (401, m.to_owned()))?;
         drop(nonces);
         if !self.ledger.registered(&wallet).map_err(internal)? {
             return refuse(
@@ -2123,7 +2124,10 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                     })
                     .map(u128::from)
                     .sum();
-                if !within(l.max_supply_per_wallet, held + tickets(&|t| t.wallet == w) + a) {
+                if !within(
+                    l.max_supply_per_wallet,
+                    held + tickets(&|t| t.wallet == w) + a,
+                ) {
                     return refuse(422, "this wallet has supplied the most allowed");
                 }
             }
@@ -2279,7 +2283,10 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             return refuse(403, "lending is paused: no new borrowing");
         }
         if borrow > 0 && self.halted() {
-            return refuse(403, "borrowing is halted while the pool's bad debt exceeds its surplus");
+            return refuse(
+                403,
+                "borrowing is halted while the pool's bad debt exceeds its surplus",
+            );
         }
         let w = wallet.to_string();
         let is_named = |n: &Note| named.is_none_or(|h| n.hash().is_ok_and(|m| m == h));
@@ -2660,7 +2667,9 @@ pub fn connect(
         !lend.mainnet() || !keeler_lend::KEEPERS.contains(&pool.pubkey()),
         "on mainnet the pool key must not be a keeper key"
     );
-    let liquidation_fee = lend.liquidation_priority_fee.unwrap_or(network.priority_fee);
+    let liquidation_fee = lend
+        .liquidation_priority_fee
+        .unwrap_or(network.priority_fee);
     let chain =
         crate::lend_chain::LendChain::connect(network, &signer, kp, lend.price, liquidation_fee)?;
     check_cluster(lend, chain.chain.cluster)?;

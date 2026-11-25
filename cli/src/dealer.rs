@@ -1406,7 +1406,11 @@ mod tests {
             let (r, _) = exchange(at, post("/lend/ticket", KEY, 16_384).as_bytes(), None);
             assert!(r.ends_with(r#"{"len":16384,"paused":false}"#), "{r}");
             // The Worker's pause reaches the keeper.
-            let paused = post("/lend/ticket", KEY, 1).replacen("\r\n\r\n", "\r\nx-keeler-paused: 1\r\n\r\n", 1);
+            let paused = post("/lend/ticket", KEY, 1).replacen(
+                "\r\n\r\n",
+                "\r\nx-keeler-paused: 1\r\n\r\n",
+                1,
+            );
             let (r, _) = exchange(at, paused.as_bytes(), None);
             assert!(r.ends_with(r#"{"len":1,"paused":true}"#), "{r}");
             let (r, _) = exchange(at, post("/lend/ticket", KEY, 16_385).as_bytes(), None);
@@ -1565,7 +1569,10 @@ mod tests {
         let o = order(trader, addr(1), 200, addr(2), 90, 1_000);
         assert!(loaded.quotes.iter().any(|(r, q)| matches(r, q, &o)));
         // Another dealer's key verifies none of them.
-        assert!(load_state(&path, 600, &addr(3), L).unwrap().quotes.is_empty());
+        assert!(load_state(&path, 600, &addr(3), L)
+            .unwrap()
+            .quotes
+            .is_empty());
         // The hourly window and the faucet's day survive; the live bound
         // quote's sell is left to be counted when its order binds again.
         assert_eq!(
@@ -1622,7 +1629,10 @@ mod tests {
         let q = admit(&c, &mut cache, &state, (&d, L), rfq.clone(), 500, 10).unwrap();
         assert_eq!(q.expiry, 70);
         assert!(signed_by(&d.pubkey(), L, &rfq, &q));
-        assert_eq!(load_state(&state, 10, &d.pubkey(), L).unwrap().quotes.len(), 1);
+        assert_eq!(
+            load_state(&state, 10, &d.pubkey(), L).unwrap().quotes.len(),
+            1
+        );
 
         let refused = |cache: &mut Cache, rfq: Rfq, buy: u64| {
             admit(&c, cache, &state, (&d, L), rfq, buy, 10)

@@ -305,23 +305,41 @@ mod tests {
         let dealer = Keypair::new_from_array([1; 32]);
         let q = sign_quote(&dealer, Cluster::Devnet, &rfq(), 999, 1_000).unwrap();
         assert!(signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &q));
-        assert!(!signed_by(&dealer.pubkey(), Cluster::Mainnet, &rfq(), &q), "another network");
+        assert!(
+            !signed_by(&dealer.pubkey(), Cluster::Mainnet, &rfq(), &q),
+            "another network"
+        );
         let other = Keypair::new_from_array([9; 32]).pubkey();
-        assert!(!signed_by(&other, Cluster::Devnet, &rfq(), &q), "another dealer's key");
+        assert!(
+            !signed_by(&other, Cluster::Devnet, &rfq(), &q),
+            "another dealer's key"
+        );
         let more = Quote {
             buy_amount: 1_000,
             ..q
         };
-        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &more), "buy amount");
+        assert!(
+            !signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &more),
+            "buy amount"
+        );
         let later = Quote { expiry: 1_001, ..q };
-        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &later), "expiry");
+        assert!(
+            !signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &later),
+            "expiry"
+        );
         let bigger = Rfq {
             sell_amount: 1,
             ..rfq()
         };
-        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &bigger, &q), "request");
+        assert!(
+            !signed_by(&dealer.pubkey(), Cluster::Devnet, &bigger, &q),
+            "request"
+        );
         let mut bad = q;
         bad.signature[0] ^= 1;
-        assert!(!signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &bad), "signature bit");
+        assert!(
+            !signed_by(&dealer.pubkey(), Cluster::Devnet, &rfq(), &bad),
+            "signature bit"
+        );
     }
 }

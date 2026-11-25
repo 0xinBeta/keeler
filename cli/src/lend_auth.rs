@@ -192,7 +192,14 @@ pub fn authenticate(
     if expiry <= now || expiry > now.saturating_add(SESSION_MAX_SECS) {
         return Err("the session has expired or runs too long");
     }
-    let text = authorisation_text(site.network, origin, site.program, &wallet, &session, expiry);
+    let text = authorisation_text(
+        site.network,
+        origin,
+        site.program,
+        &wallet,
+        &session,
+        expiry,
+    );
     if !verify(&wallet, text.as_bytes(), &auth) {
         return Err("the session is not authorised by this wallet");
     }
@@ -375,7 +382,14 @@ mod tests {
             origins: &other,
         };
         let check = |fl: &BTreeMap<String, String>| {
-            authenticate(fl, "POST", "/lend/account", f.now, &site, &mut Nonces::default())
+            authenticate(
+                fl,
+                "POST",
+                "/lend/account",
+                f.now,
+                &site,
+                &mut Nonces::default(),
+            )
         };
         assert_eq!(
             check(&fields(&r["fields"])),
@@ -430,7 +444,14 @@ mod tests {
                 network,
                 ..f.site()
             };
-            authenticate(fl, "POST", "/lend/ticket", f.now, &site, &mut Nonces::default())
+            authenticate(
+                fl,
+                "POST",
+                "/lend/ticket",
+                f.now,
+                &site,
+                &mut Nonces::default(),
+            )
         };
         assert_eq!(
             run(&changed, "devnet"),

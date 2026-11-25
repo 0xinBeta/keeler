@@ -27,9 +27,7 @@ use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
-use spr_client::{
-    compile_message, user_registry, HistoryFilters, PaginationToken, Rpc,
-};
+use spr_client::{compile_message, user_registry, HistoryFilters, PaginationToken, Rpc};
 use spr_interface::event::OutputDataEncoding;
 use spr_keypair::{ShieldedAddress, ShieldedKeypair};
 use spr_program::ProgramOwner;
@@ -80,7 +78,10 @@ impl LendChain {
         price: LendPrice,
         liquidation_fee: u64,
     ) -> Result<Self> {
-        ensure!(kp.pubkey() == key.pubkey(), "the lend keypair is not the keeper key's");
+        ensure!(
+            kp.pubkey() == key.pubkey(),
+            "the lend keypair is not the keeper key's"
+        );
         let chain = Chain::connect(network, &[TSOL_TUSD.debt_mint, TSOL_TUSD.collateral_mint])?;
         let debt = chain.mint(TSOL_TUSD.debt_mint)?;
         Ok(Self {
@@ -995,10 +996,8 @@ impl Ledger for LendChain {
             if let Some(a) = after {
                 opts["until"] = json!(a);
             }
-            let page = self.rpc_call(
-                "getSignaturesForAddress",
-                json!([payer.to_string(), opts]),
-            )?;
+            let page =
+                self.rpc_call("getSignaturesForAddress", json!([payer.to_string(), opts]))?;
             let page = page.as_array().context("no signatures")?.clone();
             for s in &page {
                 if newest.is_none() && s["confirmationStatus"] == "finalized" {

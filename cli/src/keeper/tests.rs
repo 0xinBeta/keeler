@@ -12,6 +12,7 @@ const USD: u64 = 1_000_000;
 const SOL: u64 = 1_000_000_000;
 const DOLLAR: u64 = 1_000_000_000;
 const NET: &str = "localnet";
+const ORIGIN: &str = "http://127.0.0.1:5300";
 
 #[derive(Default)]
 struct World {
@@ -29,6 +30,8 @@ struct World {
     /// Sends land unless this is set.
     hold: bool,
     history: Vec<Note>,
+    /// What other keepers paid for, by keeper.
+    peer_history: HashMap<Address, Vec<Note>>,
     next: u64,
     /// Checked at each send: the state file must already hold the build.
     state: Option<PathBuf>,
@@ -390,8 +393,18 @@ impl Ledger for Fake {
         }
         Ok("sig".into())
     }
-    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
         let mut w = self.w();
+        if let Some(list) = w.peer_history.get(payer) {
+            // A peer's mark moves with each note it adds.
+            let mark = format!("peer-{}", list.len());
+            let new = if after == Some(mark.as_str()) {
+                Vec::new()
+            } else {
+                list.clone()
+            };
+            return Ok((new, Some(mark)));
+        }
         w.history_after.push(after.map(str::to_owned));
         Ok((w.history.clone(), Some("mark".into())))
     }
@@ -399,7 +412,7 @@ impl Ledger for Fake {
 
 fn lend_cfg(extra: &str) -> Lend {
     serde_json::from_str(&format!(
-        r#"{{"program_id":"{}","network":"{NET}"{extra}}}"#,
+        r#"{{"program_id":"{}","network":"{NET}","origins":["{ORIGIN}"]{extra}}}"#,
         keeler_lend::ID
     ))
     .unwrap()
@@ -442,8 +455,10 @@ impl User {
         f.insert("wallet".into(), self.addr().to_string());
         f.insert("sessionKey".into(), self.session.pubkey().to_string());
         f.insert("sessionExpiry".into(), self.expiry.to_string());
+        f.insert("origin".into(), ORIGIN.into());
         let text = lend_auth::authorisation_text(
             NET,
+            ORIGIN,
             &keeler_lend::ID,
             &self.addr(),
             &self.session.pubkey(),
@@ -472,9 +487,21 @@ fn body(f: &BTreeMap<String, String>) -> Vec<u8> {
     serde_json::to_vec(f).unwrap()
 }
 
-fn query(f: &BTreeMap<String, String>) -> String {
-    let q: Vec<String> = f.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    format!("/lend/account?{}", q.join("&"))
+/// An account read, as the page posts it, with the tickets it holds.
+fn account_with(k: &Keeper<Fake>, u: &User, tickets: Value) -> (u16, Value) {
+    let f = u.signed("POST", "/lend/account", &[], now_of(k));
+    let mut b = serde_json::to_value(&f).unwrap();
+    b["tickets"] = tickets;
+    k.http(
+        "POST",
+        "/lend/account",
+        &serde_json::to_vec(&b).unwrap(),
+        false,
+    )
+}
+
+fn account(k: &Keeper<Fake>, u: &User) -> (u16, Value) {
+    account_with(k, u, json!([]))
 }
 
 struct Setup {
@@ -483,6 +510,8 @@ struct Setup {
     signer: Keypair,
     state: PathBuf,
     dir: PathBuf,
+    /// The other keepers of the set.
+    set: Vec<Address>,
 }
 
 impl Setup {
@@ -507,11 +536,19 @@ impl Setup {
             signer: Keypair::new(),
             state,
             dir,
+            set: Vec::new(),
         }
     }
 
     fn keeper(&self) -> Keeper<'_, Fake> {
-        Keeper::open(&self.cfg, &self.fake, &self.signer, self.state.clone()).unwrap()
+        Keeper::open_in(
+            &self.cfg,
+            &self.fake,
+            &self.signer,
+            self.state.clone(),
+            &self.set,
+        )
+        .unwrap()
     }
 
     fn user(&self) -> User {
@@ -536,7 +573,7 @@ fn now_of(k: &Keeper<Fake>) -> u64 {
 
 fn ticket(k: &Keeper<Fake>, u: &User, extra: &[(&str, String)]) -> (u16, Value) {
     let f = u.signed("POST", "/lend/ticket", extra, now_of(k));
-    k.http("POST", "/lend/ticket", &body(&f))
+    k.http("POST", "/lend/ticket", &body(&f), false)
 }
 
 fn supply_ticket(k: &Keeper<Fake>, u: &User, amount: u64) -> (u16, Value) {
@@ -579,7 +616,7 @@ fn repay_ticket(k: &Keeper<Fake>, u: &User, position: u64, amount: u64) -> (u16,
 
 fn build_req(k: &Keeper<Fake>, u: &User, extra: &[(&str, String)]) -> (u16, Value) {
     let f = u.signed("POST", "/lend/build", extra, now_of(k));
-    k.http("POST", "/lend/build", &body(&f))
+    k.http("POST", "/lend/build", &body(&f), false)
 }
 
 fn draw(k: &Keeper<Fake>, u: &User, position: u64, borrow: u64) -> (u16, Value) {
@@ -682,7 +719,7 @@ fn tickets_are_signed_saved_and_limited() {
     );
     let sig: [u8; 64] = hex_bytes(v["signature"].as_str().unwrap()).unwrap();
     assert!(lend_auth::ticket_signed_by(&s.signer.pubkey(), &m, &sig));
-    let saved = load_book(&s.state, &s.signer.pubkey(), &keeler_lend::ID).unwrap();
+    let saved = load_book(&s.state, &[s.signer.pubkey()], &keeler_lend::ID).unwrap();
     assert_eq!(saved.tickets.len(), 1);
     // Two open at a time per wallet, three an hour; the 422 above did not
     // count.
@@ -734,20 +771,23 @@ fn signed_requests_refuse_replay_stale_expired_forged_and_unknown_fields() {
         ("amount", (2 * USD).to_string()),
     ];
     let f = u.signed("POST", "/lend/ticket", &extra, T0);
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&f)).0, 200);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&f), false).0, 200);
     assert_eq!(
-        k.http("POST", "/lend/ticket", &body(&f)).0,
+        k.http("POST", "/lend/ticket", &body(&f), false).0,
         401,
         "replayed nonce"
     );
     let stale = u.signed("POST", "/lend/ticket", &extra, T0 - 121);
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&stale)).0, 401);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&stale), false).0, 401);
     // A request signed for another path does not verify here.
     let other_path = u.signed("POST", "/lend/build", &extra, T0);
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&other_path)).0, 401);
+    assert_eq!(
+        k.http("POST", "/lend/ticket", &body(&other_path), false).0,
+        401
+    );
     let mut forged = u.signed("POST", "/lend/ticket", &extra, T0);
     forged.insert("amount".into(), (3 * USD).to_string());
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&forged)).0, 401);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&forged), false).0, 401);
     let mut expired = User::new(T0);
     expired.expiry = T0;
     s.fake.w().registered.insert(expired.addr());
@@ -755,7 +795,8 @@ fn signed_requests_refuse_replay_stale_expired_forged_and_unknown_fields() {
         k.http(
             "POST",
             "/lend/ticket",
-            &body(&expired.signed("POST", "/lend/ticket", &extra, T0))
+            &body(&expired.signed("POST", "/lend/ticket", &extra, T0)),
+            false
         )
         .0,
         401
@@ -764,20 +805,21 @@ fn signed_requests_refuse_replay_stale_expired_forged_and_unknown_fields() {
     let mut stolen = u.signed("POST", "/lend/ticket", &extra, T0);
     let thief = User::new(T0);
     stolen.insert("wallet".into(), thief.addr().to_string());
-    assert_eq!(k.http("POST", "/lend/ticket", &body(&stolen)).0, 401);
+    assert_eq!(k.http("POST", "/lend/ticket", &body(&stolen), false).0, 401);
     let mut extra2 = extra.to_vec();
     extra2.push(("memo", "x".into()));
     assert_eq!(
         k.http(
             "POST",
             "/lend/ticket",
-            &body(&u.signed("POST", "/lend/ticket", &extra2, T0))
+            &body(&u.signed("POST", "/lend/ticket", &extra2, T0)),
+            false
         )
         .0,
         400
     );
-    assert_eq!(k.http("POST", "/lend/ticket", b"not json").0, 400);
-    assert_eq!(k.http("GET", "/lend/nothing", b"").0, 404);
+    assert_eq!(k.http("POST", "/lend/ticket", b"not json", false).0, 400);
+    assert_eq!(k.http("GET", "/lend/nothing", b"", false).0, 404);
 }
 
 #[test]
@@ -944,8 +986,8 @@ fn owner_builds_check_ownership_health_and_reserve_the_pool() {
     assert_eq!(draw(&k, &a, 1, 8 * USD).0, 423);
     assert_eq!(draw(&k, &a, 1, USD / 2).0, 422);
     assert_eq!(redeem(&k, &lender, 101 * USD).0, 422);
-    // Stale price.
-    s.fake.w().quote.as_mut().unwrap().published = (T0 - 61) as i64;
+    // Stale price: draws allow 65 s.
+    s.fake.w().quote.as_mut().unwrap().published = (T0 - 66) as i64;
     assert_eq!(draw(&k, &a, 1, USD).0, 412);
     s.fake.w().quote.as_mut().unwrap().published = T0 as i64;
     // A good draw: the reply carries what the page checks.
@@ -1100,8 +1142,7 @@ fn redeem_spends_the_receipt_the_page_names() {
     assert_eq!(st, 200, "{v}");
     assert_eq!(k.snapshot().unwrap().pending[0].inputs[1], big.nullifier);
     // The account view states the pool's indices at chain time.
-    let f = lender.signed("GET", "/lend/account", &[], now_of(&k));
-    let (st, v) = k.http("GET", &query(&f), b"");
+    let (st, v) = account(&k, &lender);
     assert_eq!(st, 200, "{v}");
     assert_eq!(v["index"]["supply"], json!("1000000000000"));
     assert_eq!(v["index"]["at"], json!(now_of(&k)));
@@ -1163,7 +1204,7 @@ fn restarts_recover_from_the_file_and_the_chain() {
         assert_eq!(k.snapshot().unwrap().pending.len(), 1);
     }
     // It landed while the keeper was down.
-    let p = load_book(&s.state, &s.signer.pubkey(), &keeler_lend::ID)
+    let p = load_book(&s.state, &[s.signer.pubkey()], &keeler_lend::ID)
         .unwrap()
         .pending[0]
         .clone();
@@ -1183,7 +1224,7 @@ fn restarts_recover_from_the_file_and_the_chain() {
     drop(k);
     // Killed between recording and sending: the build never lands and is
     // dropped after its window; the ticket is filled on a retry.
-    let mut book = load_book(&s.state, &s.signer.pubkey(), &keeler_lend::ID).unwrap();
+    let mut book = load_book(&s.state, &[s.signer.pubkey()], &keeler_lend::ID).unwrap();
     let mut ghost = p.clone();
     ghost.inputs = vec![book.reserve.as_ref().unwrap().nullifier.clone()];
     ghost.spends = ghost.inputs.first().cloned();
@@ -1229,7 +1270,7 @@ fn restarts_recover_from_the_file_and_the_chain() {
         .w()
         .history
         .push(reserve_note(&fresh_reserve(0, 0), 0, 99_999));
-    assert!(Keeper::open(&s.cfg, &s.fake, &s.signer, s.state.clone()).is_err());
+    assert!(Keeper::open_in(&s.cfg, &s.fake, &s.signer, s.state.clone(), &s.set).is_err());
 }
 
 #[test]
@@ -1242,8 +1283,7 @@ fn account_and_pools_views() {
     drain(&k);
     let (_, v) = repay_ticket(&k, &a, 7, USD);
     assert!(v["error"].is_string(), "no debt to repay");
-    let f = a.signed("GET", "/lend/account", &[], now_of(&k));
-    let (st, v) = k.http("GET", &query(&f), b"");
+    let (st, v) = account(&k, &a);
     assert_eq!(st, 200, "{v}");
     assert_eq!(v["receipts"], json!([]));
     assert_eq!(v["positions"][0]["position"], json!("7"));
@@ -1253,15 +1293,13 @@ fn account_and_pools_views() {
         .unwrap();
     assert_eq!(&m[..8], &SOL.to_le_bytes());
     assert_eq!(v["intents"][0]["status"], json!("filled"));
-    let f = lender.signed("GET", "/lend/account", &[], now_of(&k));
-    let (_, v) = k.http("GET", &query(&f), b"");
+    let (_, v) = account(&k, &lender);
     assert_eq!(v["positions"], json!([]));
     assert_eq!(v["receipts"][0]["shares"], json!((100 * USD).to_string()));
     // A ticket never used turns refundable after its expiry.
     let (_, t) = supply_ticket(&k, &lender, 2 * USD);
     s.fake.advance(601);
-    let f = lender.signed("GET", "/lend/account", &[], now_of(&k));
-    let (_, v) = k.http("GET", &query(&f), b"");
+    let (_, v) = account(&k, &lender);
     let i = v["intents"]
         .as_array()
         .unwrap()
@@ -1271,7 +1309,7 @@ fn account_and_pools_views() {
         .clone();
     assert_eq!(i["status"], json!("refundable"));
     // Pools: coarse and bucketed.
-    let (st, v) = k.http("GET", "/lend/pools", b"");
+    let (st, v) = k.http("GET", "/lend/pools", b"", false);
     assert_eq!(st, 200);
     let p = &v["pools"][0];
     assert_eq!(p["size"], json!("100000000"));
@@ -1279,7 +1317,7 @@ fn account_and_pools_views() {
     let first = v.clone();
     s.fake.advance(1);
     assert_eq!(
-        k.http("GET", "/lend/pools", b"").1,
+        k.http("GET", "/lend/pools", b"", false).1,
         first,
         "same bucket, same figures"
     );
@@ -1651,7 +1689,14 @@ fn one_keeper_per_state_file() {
 fn history_and_intent_scans_go_on_from_their_marks() {
     let s = Setup::new("marks", "");
     let k = s.keeper();
-    assert_eq!(k.snapshot().unwrap().scanned.as_deref(), Some("mark"));
+    assert_eq!(
+        k.snapshot()
+            .unwrap()
+            .scanned
+            .get(&s.signer.pubkey().to_string())
+            .map(String::as_str),
+        Some("mark")
+    );
     drop(k);
     let k = s.keeper();
     assert_eq!(s.fake.w().history_after, vec![None, Some("mark".into())]);
@@ -1667,9 +1712,9 @@ fn the_slot_answers_503_until_the_keeper_is_up() {
     let s = Setup::new("slot", "");
     let cell = OnceLock::new();
     let slot = Slot(&cell);
-    assert_eq!(slot.lend("GET", "/lend/pools", b"").0, 503);
+    assert_eq!(slot.lend("GET", "/lend/pools", b"", false).0, 503);
     assert!(cell.set(s.keeper()).is_ok());
-    assert_eq!(slot.lend("GET", "/lend/pools", b"").0, 200);
+    assert_eq!(slot.lend("GET", "/lend/pools", b"", false).0, 200);
 }
 
 #[test]
