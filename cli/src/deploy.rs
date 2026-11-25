@@ -538,7 +538,11 @@ fn squads_policy(m: &Multisig) -> Result<()> {
          use an autonomous multisig",
         m.config_authority
     );
-    let voters = m.members.iter().filter(|(_, p)| p & SQUADS_VOTE != 0).count();
+    let voters = m
+        .members
+        .iter()
+        .filter(|(_, p)| p & SQUADS_VOTE != 0)
+        .count();
     ensure!(
         voters >= m.threshold as usize,
         "has {voters} voters for threshold {}",
@@ -654,7 +658,12 @@ pub const DEPLOY_USAGE: &str = "usage: keeler deploy viewing-key <keychain item>
 /// `scripts/deploy-lend-devnet.sh` and `scripts/set-upgrade-authority.sh`.
 /// Prints results on stdout, never a secret.
 pub fn cli(args: &[String]) -> Result<()> {
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["viewing-key", item] => {
             println!(
                 "{}",
@@ -1185,7 +1194,11 @@ mod tests {
         assert_eq!(none.members[1].0, Address::new_from_array([2; 32]));
         squads_policy(&none).unwrap();
 
-        let refused = |b: Vec<u8>| squads_policy(&parse_multisig(&b).unwrap()).unwrap_err().to_string();
+        let refused = |b: Vec<u8>| {
+            squads_policy(&parse_multisig(&b).unwrap())
+                .unwrap_err()
+                .to_string()
+        };
         assert!(refused(multisig_bytes([0; 32], 1, false, &[7, 7])).contains("threshold 1"));
         assert!(refused(multisig_bytes([5; 32], 2, false, &[7, 7])).contains("config authority"));
         // Only one member may vote.
