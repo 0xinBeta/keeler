@@ -206,11 +206,12 @@ pub struct Lend {
     /// The admin key, only for `keeler lend-init-reserve`.
     #[serde(default)]
     pub admin_key: Option<KeySource>,
-    /// Default `~/.local/state/keeler/keeper-<pubkey>.json`.
-    #[serde(default)]
+    /// Default `~/.local/state/keeler/keeper-<pubkey>.json`. A leading
+    /// `~/` is the home directory, here and in `pause_file`.
+    #[serde(default, deserialize_with = "home_path")]
     pub state_file: Option<PathBuf>,
     /// While it exists: no supply, no new positions, no borrowing.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "home_path")]
     pub pause_file: Option<PathBuf>,
     #[serde(default)]
     pub price: LendPrice,
@@ -621,6 +622,15 @@ impl Book {
         let id = id.as_deref()?;
         self.tickets.iter_mut().find(|t| t.id == id)
     }
+}
+
+fn home_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+    Ok(Option::<PathBuf>::deserialize(d)?.map(|p| {
+        match (p.strip_prefix("~"), std::env::var_os("HOME")) {
+            (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+            _ => p,
+        }
+    }))
 }
 
 /// Writes `bytes` to `path` atomically, readable by this user only.
@@ -2355,25 +2365,30 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                     if amount < l.min_repay {
                         return refuse(422, "below the minimum repayment");
                     }
+                    let r = book
+                        .reserve
+                        .as_ref()
+                        .map(|n| accrued(n, now))
+                        .transpose()
+                        .map_err(internal)?
+                        .ok_or((503, "the pool is not open yet".to_owned()))?;
+                    let shares = book
+                        .positions
+                        .iter()
+                        .find(|p| {
+                            p.owned_by(&wallet)
+                                && p.state::<PositionState>()
+                                    .is_ok_and(|s| s.position_id == id)
+                        })
+                        .and_then(|p| p.state::<PositionState>().ok())
+                        .map_or(0, |s| s.debt_shares);
+                    if !core::repay_shares(shares, amount, r.borrow_price)
+                        .is_ok_and(|left| left.shares < shares)
+                    {
+                        return refuse(422, "this repayment is worth less than one debt share");
+                    }
                     // A part repayment leaves no dust debt under the limit.
                     if l.min_position_debt > 0 {
-                        let r = book
-                            .reserve
-                            .as_ref()
-                            .map(|n| accrued(n, now))
-                            .transpose()
-                            .map_err(internal)?
-                            .ok_or((503, "the pool is not open yet".to_owned()))?;
-                        let shares = book
-                            .positions
-                            .iter()
-                            .find(|p| {
-                                p.owned_by(&wallet)
-                                    && p.state::<PositionState>()
-                                        .is_ok_and(|s| s.position_id == id)
-                            })
-                            .and_then(|p| p.state::<PositionState>().ok())
-                            .map_or(0, |s| s.debt_shares);
                         let debt = core::debt_of(shares, r.borrow_price)
                             .map_err(|e| internal(anyhow!("{e}")))?;
                         if amount < debt && debt - amount < l.min_position_debt {

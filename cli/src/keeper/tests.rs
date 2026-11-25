@@ -1653,6 +1653,37 @@ fn builds_per_wallet_are_limited() {
 }
 
 #[test]
+fn a_repay_worth_less_than_one_debt_share_is_refused() {
+    let s = Setup::new("dust-repay", r#","limits":{"min_repay":1}"#);
+    s.fake.w().history = vec![reserve_note(
+        &ReserveState {
+            borrow_price: 2_000_000_000_000,
+            ..fresh_reserve(0, 0)
+        },
+        0,
+        1,
+    )];
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    let a = borrower(&s, &k, SOL, 5 * USD);
+    let (st, v) = repay_ticket(&k, &a, 1, 1);
+    assert_eq!(st, 422, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("one debt share"));
+    assert_eq!(repay_ticket(&k, &a, 1, 2).0, 200);
+}
+
+#[test]
+fn state_and_pause_paths_may_start_at_home() {
+    let cfg = lend_cfg(r#","state_file":"~/.local/state/keeler/k.json","pause_file":"/p/~/x""#);
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    assert_eq!(
+        cfg.state_file.unwrap(),
+        home.join(".local/state/keeler/k.json")
+    );
+    assert_eq!(cfg.pause_file.unwrap(), PathBuf::from("/p/~/x"));
+}
+
+#[test]
 fn each_unused_reservation_doubles_the_wait() {
     let s = Setup::new("strikes", "");
     let k = s.keeper();
