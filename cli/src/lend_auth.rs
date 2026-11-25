@@ -21,8 +21,9 @@ pub const NONCE_SECS: u64 = 2 * FRESH_SECS;
 const MAX_NONCES: usize = 100_000;
 
 /// The fields every signed request carries.
-pub const SIGNED_FIELDS: [&str; 7] = [
+pub const SIGNED_FIELDS: [&str; 8] = [
     "wallet",
+    "origin",
     "sessionKey",
     "sessionExpiry",
     "sessionAuth",
@@ -38,6 +39,11 @@ pub fn fields_from_json(body: &[u8]) -> Option<BTreeMap<String, String>> {
     let Value::Object(map) = serde_json::from_slice::<Value>(body).ok()? else {
         return None;
     };
+    fields_from_map(map)
+}
+
+/// [`fields_from_json`] of an object already parsed.
+pub fn fields_from_map(map: serde_json::Map<String, Value>) -> Option<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for (k, v) in map {
         let v = match v {
@@ -50,22 +56,6 @@ pub fn fields_from_json(body: &[u8]) -> Option<BTreeMap<String, String>> {
     canonical_ok(&out).then_some(out)
 }
 
-/// The fields of a GET query. Values are base58, hex or digits, so any
-/// percent or plus escape is refused rather than decoded.
-pub fn fields_from_query(url: &str) -> Option<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    let Some((_, query)) = url.split_once('?') else {
-        return Some(out);
-    };
-    for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (k, v) = pair.split_once('=')?;
-        if v.contains(['%', '+']) || out.insert(k.to_owned(), v.to_owned()).is_some() {
-            return None;
-        }
-    }
-    canonical_ok(&out).then_some(out)
-}
-
 fn canonical_ok(fields: &BTreeMap<String, String>) -> bool {
     fields.iter().all(|(k, v)| {
         !k.is_empty()
@@ -74,7 +64,8 @@ fn canonical_ok(fields: &BTreeMap<String, String>) -> bool {
     })
 }
 
-/// Every field but `signature`, `nonce` and `timestamp`, sorted by key bytes
+/// Every field but `signature`, `nonce` and `timestamp` (an account read's
+/// `tickets` never gets here: each carries its keeper's signature), sorted by key bytes
 /// (a `BTreeMap` of `String` sorts so), each `key=value\n`.
 pub fn canonical(fields: &BTreeMap<String, String>) -> String {
     fields
@@ -122,13 +113,14 @@ pub fn iso8601(secs: u64) -> String {
 
 pub fn authorisation_text(
     network: &str,
+    origin: &str,
     program: &Address,
     wallet: &Address,
     session: &Address,
     expiry: u64,
 ) -> String {
     format!(
-        "Keeler Lend: allow this browser session\n\nThis lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.\n\nNetwork: {network}\nProgram: {program}\nWallet: {wallet}\nSession key: {session}\nExpires: {expiry} ({})",
+        "Keeler Lend: allow this browser session\n\nThis lets this browser send lending requests for this wallet to the Keeler keeper until the time below, without asking you each time. It cannot move funds: every transaction still needs your wallet's approval.\n\nNetwork: {network}\nOrigin: {origin}\nThe keeper can see your lending amounts.\nProgram: {program}\nWallet: {wallet}\nSession key: {session}\nExpires: {expiry} ({})",
         iso8601(expiry)
     )
 }
@@ -162,6 +154,14 @@ fn verify(key: &Address, message: &[u8], sig: &[u8; 64]) -> bool {
 #[derive(Default)]
 pub struct Nonces(HashMap<(Address, [u8; 16]), u64>);
 
+/// Where requests are checked: the keeper's network and program, and the
+/// page origins it serves (`lend.origins`).
+pub struct Site<'a> {
+    pub network: &'a str,
+    pub program: &'a Address,
+    pub origins: &'a [String],
+}
+
 /// Checks a signed request in the contract's order and returns its wallet,
 /// or the reason (every failure is a 401).
 pub fn authenticate(
@@ -169,8 +169,7 @@ pub fn authenticate(
     method: &str,
     path: &str,
     now: u64,
-    network: &str,
-    program: &Address,
+    site: &Site,
     nonces: &mut Nonces,
 ) -> Result<Address, &'static str> {
     let get = |k: &str| {
@@ -180,6 +179,10 @@ pub fn authenticate(
             .ok_or("missing signed fields")
     };
     let wallet = parse_address(get("wallet")?).map_err(|_| "bad wallet")?;
+    let origin = get("origin")?;
+    if !site.origins.iter().any(|o| o == origin) {
+        return Err("this lending session was authorised for another site");
+    }
     let session = parse_address(get("sessionKey")?).map_err(|_| "bad session key")?;
     let expiry = decimal(get("sessionExpiry")?).ok_or("bad session expiry")?;
     let auth = hex_bytes::<64>(get("sessionAuth")?).ok_or("bad session authorisation")?;
@@ -189,7 +192,14 @@ pub fn authenticate(
     if expiry <= now || expiry > now.saturating_add(SESSION_MAX_SECS) {
         return Err("the session has expired or runs too long");
     }
-    let text = authorisation_text(network, program, &wallet, &session, expiry);
+    let text = authorisation_text(
+        site.network,
+        origin,
+        site.program,
+        &wallet,
+        &session,
+        expiry,
+    );
     if !verify(&wallet, text.as_bytes(), &auth) {
         return Err("the session is not authorised by this wallet");
     }
@@ -254,8 +264,11 @@ mod tests {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
+    /// A request body's signed fields: an account read's `tickets` aside.
     fn fields(v: &Value) -> BTreeMap<String, String> {
-        fields_from_json(v.to_string().as_bytes()).unwrap()
+        let mut m = v.as_object().unwrap().clone();
+        m.remove("tickets");
+        fields_from_map(m).unwrap()
     }
 
     struct Fx {
@@ -263,6 +276,7 @@ mod tests {
         now: u64,
         network: String,
         program: Address,
+        origins: Vec<String>,
     }
 
     fn fx() -> Fx {
@@ -271,11 +285,20 @@ mod tests {
             now: v["now"].as_u64().unwrap(),
             network: v["network"].as_str().unwrap().into(),
             program: parse_address(v["program_id"].as_str().unwrap()).unwrap(),
+            origins: vec![v["origin"].as_str().unwrap().into()],
             v,
         }
     }
 
     impl Fx {
+        fn site(&self) -> Site<'_> {
+            Site {
+                network: &self.network,
+                program: &self.program,
+                origins: &self.origins,
+            }
+        }
+
         fn check(&self, i: usize, now: u64, nonces: &mut Nonces) -> Result<Address, &'static str> {
             let r = &self.v["requests"][i];
             authenticate(
@@ -283,8 +306,7 @@ mod tests {
                 r["method"].as_str().unwrap(),
                 r["path"].as_str().unwrap(),
                 now,
-                &self.network,
-                &self.program,
+                &self.site(),
                 nonces,
             )
         }
@@ -298,6 +320,7 @@ mod tests {
         let session = parse_address(s["key"].as_str().unwrap()).unwrap();
         let text = authorisation_text(
             &f.network,
+            &f.origins[0],
             &f.program,
             &wallet,
             &session,
@@ -346,19 +369,40 @@ mod tests {
     }
 
     #[test]
-    fn the_query_form_verifies_too() {
+    fn origin_must_be_listed_and_tickets_are_not_signed() {
         let f = fx();
+        // The account read carries tickets, outside the canonical string.
         let r = &f.v["requests"][0];
-        let q: Vec<String> = r["fields"]
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| format!("{k}={}", v.as_str().map_or(v.to_string(), str::to_owned)))
-            .collect();
-        let got = fields_from_query(&format!("/lend/account?{}", q.join("&"))).unwrap();
-        assert_eq!(got, fields(&r["fields"]));
-        assert!(fields_from_query("/lend/account?a=1%3D").is_none());
-        assert!(fields_from_query("/lend/account?a=1&a=2").is_none());
+        assert!(r["fields"]["tickets"].is_array());
+        assert!(!r["canonical"].as_str().unwrap().contains("tickets"));
+        let other = vec!["https://evil.example".to_owned()];
+        let site = Site {
+            network: &f.network,
+            program: &f.program,
+            origins: &other,
+        };
+        let check = |fl: &BTreeMap<String, String>| {
+            authenticate(
+                fl,
+                "POST",
+                "/lend/account",
+                f.now,
+                &site,
+                &mut Nonces::default(),
+            )
+        };
+        assert_eq!(
+            check(&fields(&r["fields"])),
+            Err("this lending session was authorised for another site")
+        );
+        // A listed origin the session was not authorised for breaks the
+        // authorisation.
+        let mut moved = fields(&r["fields"]);
+        moved.insert("origin".into(), "https://evil.example".into());
+        assert_eq!(
+            check(&moved),
+            Err("the session is not authorised by this wallet")
+        );
     }
 
     #[test]
@@ -396,13 +440,16 @@ mod tests {
         let mut changed = fields(&r["fields"]);
         changed.insert("amount".into(), "250000001".into());
         let run = |fl: &BTreeMap<String, String>, network: &str| {
+            let site = Site {
+                network,
+                ..f.site()
+            };
             authenticate(
                 fl,
                 "POST",
                 "/lend/ticket",
                 f.now,
-                network,
-                &f.program,
+                &site,
                 &mut Nonces::default(),
             )
         };
@@ -426,8 +473,7 @@ mod tests {
             "POST",
             "/lend/build",
             f.now,
-            "devnet",
-            &f.program,
+            &f.site(),
             &mut Nonces::default()
         )
         .is_err());

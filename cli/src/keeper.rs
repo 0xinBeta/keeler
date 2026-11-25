@@ -52,10 +52,11 @@ const LANE_WAIT: Duration = Duration::from_secs(5);
 /// A build done later than this after its request is not handed out: the
 /// Worker stopped waiting at 30 s.
 const BUILD_DEADLINE: Duration = Duration::from_secs(25);
-/// A price older than this is not used for a draw (the program allows 90 s).
-const PRICE_FRESH: u64 = 60;
+/// A price older than this is not used for a draw (the program allows 90 s;
+/// the Pyth push account updates about once a minute).
+const PRICE_FRESH: u64 = 65;
 /// Nor for a liquidation, which must land before the price turns 90 s old.
-const PRICE_LIQUIDATE: u64 = 75;
+const PRICE_LIQUIDATE: u64 = 80;
 /// A liquidation that could not be built or sent waits this long.
 const LIQUIDATION_BACKOFF: u64 = 60;
 /// Indexer pages of one wallet's intents read per pass.
@@ -112,6 +113,17 @@ pub struct LendLimits {
     /// The draw bound sits this far under `price - confidence`, the
     /// liquidation bound this far over `price + confidence`.
     pub bound_margin_bps: u64,
+    /// Caps, 0 for none (mainnet refuses 0). The pool's supplied total,
+    /// open supply tickets included, at ticket time; the total alone at fill.
+    pub max_pool_size: u64,
+    /// Collateral across every position, open deposit tickets included.
+    pub max_total_collateral: u64,
+    pub max_position_collateral: u64,
+    pub max_position_debt: u64,
+    /// One wallet's receipts' worth plus its open supply tickets.
+    pub max_supply_per_wallet: u64,
+    /// A draw leaves no debt or at least this.
+    pub min_position_debt: u64,
 }
 
 impl Default for LendLimits {
@@ -132,8 +144,30 @@ impl Default for LendLimits {
             ticket_secs: 600,
             bucket_secs: 600,
             bound_margin_bps: 50,
+            max_pool_size: 0,
+            max_total_collateral: 0,
+            max_position_collateral: 0,
+            max_position_debt: 0,
+            max_supply_per_wallet: 0,
+            min_position_debt: 0,
         }
     }
+}
+
+/// Whether `total` passes the cap `max` (0: none).
+fn within(max: u64, total: u128) -> bool {
+    max == 0 || total <= u128::from(max)
+}
+
+/// A keeper's part in a set of keepers.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    #[default]
+    Primary,
+    /// Liquidates only after `standby_grace_secs`, and re-posts the test
+    /// price only well after the primary would have.
+    Standby,
 }
 
 /// The `lend` section of a dealer config, or of a keeper config.
@@ -144,9 +178,25 @@ pub struct Lend {
     pub program_id: String,
     /// The name in the session text the wallet signs: `devnet`, `localnet`.
     pub network: String,
-    /// The keeper key (the program's KEEPER); default: the config's key.
+    /// The keeper key (one of the program's KEEPERS); default: the config's key.
     #[serde(default)]
     pub key: Option<KeySource>,
+    /// The pool key: the pool viewing key derives from it and must be the
+    /// program's POOL_VIEWING. Default: the keeper key.
+    #[serde(default)]
+    pub pool_key: Option<KeySource>,
+    #[serde(default)]
+    pub role: Role,
+    /// A standby liquidates a position past the threshold this long; default 45.
+    #[serde(default)]
+    pub standby_grace_secs: Option<u64>,
+    /// The page origins a session may name (`Origin:` in its text).
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// Micro-lamports per compute unit on liquidations; default
+    /// `network.priority_fee`.
+    #[serde(default)]
+    pub liquidation_priority_fee: Option<u64>,
     /// The admin key, only for `keeler lend-init-reserve`.
     #[serde(default)]
     pub admin_key: Option<KeySource>,
@@ -215,7 +265,32 @@ impl Lend {
             (5..=80).contains(&self.price_refresh()),
             "lend.price_refresh_secs must be within 5..=80"
         );
+        ensure!(
+            self.grace() <= 600,
+            "lend.standby_grace_secs must be at most 600"
+        );
+        ensure!(
+            !self.origins.is_empty() && self.origins.iter().all(|o| origin_ok(o)),
+            "lend.origins must list the page origins, each like https://host or http://127.0.0.1:5300"
+        );
+        if self.mainnet() {
+            let caps = [
+                l.max_pool_size,
+                l.max_total_collateral,
+                l.max_position_collateral,
+                l.max_position_debt,
+                l.max_supply_per_wallet,
+            ];
+            ensure!(
+                caps.iter().all(|c| *c > 0),
+                "on mainnet every lend.limits.max_* cap must be set"
+            );
+        }
         Ok(())
+    }
+
+    fn grace(&self) -> u64 {
+        self.standby_grace_secs.unwrap_or(45)
     }
 
     /// Any label naming mainnet (`mainnet-beta` too).
@@ -238,6 +313,12 @@ impl Lend {
 
     fn paused(&self) -> bool {
         self.pause_file.as_deref().is_some_and(Path::exists)
+    }
+
+    /// The pause for one request: the pause file, or the Worker's
+    /// `x-keeler-paused` header.
+    fn paused_for(&self, header: bool) -> bool {
+        header || self.paused()
     }
 
     fn min_supply(&self) -> u64 {
@@ -412,6 +493,10 @@ pub struct Ticket {
     /// Its intent was seen on chain.
     #[serde(default)]
     pub seen: bool,
+    /// The keeper that signed it, when not this one: a ticket adopted from
+    /// an account read.
+    #[serde(default)]
+    pub keeper: Option<String>,
 }
 
 impl Ticket {
@@ -463,9 +548,31 @@ pub struct Book {
     pub tickets: Vec<Ticket>,
     pub pending: Vec<Pending>,
     pub reservation: Option<Reservation>,
-    /// The newest keeper transaction the history scan has read.
-    #[serde(default)]
-    pub scanned: Option<String>,
+    /// Per keeper address, the newest transaction it paid for that the
+    /// history scan has read. A file from before the keeper set holds one
+    /// mark: this keeper's.
+    #[serde(default, deserialize_with = "scan_marks")]
+    pub scanned: BTreeMap<String, String>,
+}
+
+/// The key an old single scan mark loads under, until [`load_book`] names
+/// it.
+const OWN_MARK: &str = "";
+
+fn scan_marks<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Marks {
+        One(String),
+        Many(BTreeMap<String, String>),
+    }
+    Ok(match Option::<Marks>::deserialize(d)? {
+        None => BTreeMap::new(),
+        Some(Marks::One(s)) => BTreeMap::from([(OWN_MARK.to_owned(), s)]),
+        Some(Marks::Many(m)) => m,
+    })
 }
 
 impl Book {
@@ -529,8 +636,9 @@ pub fn read_price_file(path: &Path) -> Result<Option<TestPrice>> {
     }
 }
 
-/// The state file, with tickets this keeper did not sign dropped.
-pub fn load_book(path: &Path, keeper: &Address, program: &Address) -> Result<Book> {
+/// The state file, with tickets no keeper of `keepers` signed dropped
+/// (`keepers[0]` is this keeper).
+pub fn load_book(path: &Path, keepers: &[Address], program: &Address) -> Result<Book> {
     let text = match std::fs::read(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Book::default()),
@@ -538,19 +646,28 @@ pub fn load_book(path: &Path, keeper: &Address, program: &Address) -> Result<Boo
     };
     let mut book: Book = serde_json::from_slice(&text)
         .map_err(|_| anyhow!("keeper state file {} is not valid", path.display()))?;
+    if let Some(m) = book.scanned.remove(OWN_MARK) {
+        book.scanned.insert(keepers[0].to_string(), m);
+    }
     let before = book.tickets.len();
-    book.tickets.retain(|t| ticket_valid(t, keeper, program));
+    book.tickets.retain(|t| ticket_valid(t, keepers, program));
     if book.tickets.len() < before {
         log!(
-            "lend: dropped {} tickets not signed by this keeper",
+            "lend: dropped {} tickets no keeper of the set signed",
             before - book.tickets.len()
         );
     }
     Ok(book)
 }
 
-fn ticket_valid(t: &Ticket, keeper: &Address, program: &Address) -> bool {
-    let (Ok(wallet), Some(id), Some(sig)) = (
+/// Signed by its keeper (`keepers[0]` when it names none), one of `keepers`.
+fn ticket_valid(t: &Ticket, keepers: &[Address], program: &Address) -> bool {
+    let signer = match &t.keeper {
+        None => Some(keepers[0]),
+        Some(k) => parse_address(k).ok().filter(|k| keepers.contains(k)),
+    };
+    let (Some(signer), Ok(wallet), Some(id), Some(sig)) = (
+        signer,
         parse_address(&t.wallet),
         hex_bytes::<16>(&t.id),
         hex_bytes::<64>(&t.signature),
@@ -560,7 +677,7 @@ fn ticket_valid(t: &Ticket, keeper: &Address, program: &Address) -> bool {
     let m = lend_auth::ticket_bytes(
         program, &wallet, &id, t.purpose, t.target, t.amount, t.expiry,
     );
-    lend_auth::ticket_signed_by(keeper, &m, &sig)
+    lend_auth::ticket_signed_by(&signer, &m, &sig)
 }
 
 // ---- the chain seam ----
@@ -671,11 +788,12 @@ pub trait Ledger: Sync {
     /// Sends a keeper-built transaction; the signature. A [`Rejected`] error
     /// means it can never land; any other may still.
     fn send(&self, tx: &[u8]) -> Result<String>;
-    /// Every reserve, receipt and position the keeper's own transactions
-    /// (keeper-paid, newer than signature `after`) created, recovered from
-    /// the chain with the pool viewing key and the writer key; spent ones
-    /// included. With the newest signature read, to pass next time.
-    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)>;
+    /// Every reserve, receipt and position the transactions `payer` (a
+    /// keeper of the set) paid for, newer than signature `after`, created,
+    /// recovered from the chain with the pool viewing key and the writer
+    /// key; spent ones included. With the newest signature read, to pass
+    /// next time.
+    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)>;
 }
 
 // ---- the keeper ----
@@ -703,8 +821,32 @@ pub struct Keeper<'a, L> {
     /// Per wallet: the intent scan's cursor and the unspent intents seen
     /// that an open ticket matches.
     seen: Mutex<HashMap<String, Scan>>,
+    /// The keeper set, this keeper first: tickets any of them signed are
+    /// valid, and their transactions are followed.
+    keepers: Vec<Address>,
+    /// Standby: positions (wallet and id) past the threshold, since when.
+    past: Mutex<HashMap<(String, u64), u64>>,
+    /// Chain time of the last "no price" log of the liquidation watch.
+    price_logged: Mutex<u64>,
+    /// The last (surplus, bad debt) logged, and whether borrowing halts.
+    solvency: Mutex<Option<Solvency>>,
     /// Held while the keeper runs: one keeper per state file.
     _lock: std::fs::File,
+}
+
+/// The pool's cover, each pass: `surplus` is idle plus debt less what
+/// suppliers are owed (0 when short), `bad_debt` the debt of positions whose
+/// collateral is worth less than it at `price - confidence`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Solvency {
+    pub surplus: u64,
+    pub bad_debt: u64,
+}
+
+impl Solvency {
+    fn halts(&self) -> bool {
+        self.bad_debt > self.surplus
+    }
 }
 
 type Refusal = (u16, String);
@@ -766,6 +908,31 @@ pub fn coarse_up(x: u64) -> u64 {
     x.div_ceil(unit).saturating_mul(unit)
 }
 
+/// The pool's [`Solvency`] with `idle` in the reserve, the reserve `r`
+/// accrued, and collateral valued at `low` (x 1e12).
+pub fn solvency(book: &Book, idle: u64, r: &core::Reserve, low: u64) -> Result<Solvency> {
+    let e = |e: core::LendError| anyhow!("{e}");
+    let debt = core::total_debt(r).map_err(e)?;
+    let owed = core::total_supply(r).map_err(e)?;
+    let surplus = (u128::from(idle) + u128::from(debt)).saturating_sub(u128::from(owed));
+    let mut bad = 0u128;
+    for p in &book.positions {
+        let s: PositionState = p.state()?;
+        if s.debt_shares == 0 {
+            continue;
+        }
+        let d = core::debt_of(s.debt_shares, r.borrow_price).map_err(e)?;
+        if core::collateral_value(p.amount, low).map_err(e)? < d {
+            bad += u128::from(d);
+        }
+    }
+    let cut = |x: u128| u64::try_from(x).unwrap_or(u64::MAX);
+    Ok(Solvency {
+        surplus: cut(surplus),
+        bad_debt: cut(bad),
+    })
+}
+
 fn purpose_name(p: u8) -> &'static str {
     match p {
         purpose::SUPPLY => "supply",
@@ -781,6 +948,34 @@ fn decimal(s: Option<&String>) -> Option<u64> {
         .flatten()
 }
 
+/// An account read's body: its signed fields, and the tickets the page holds
+/// (at most 8; not signed, each carries its keeper's signature).
+fn account_body(body: &[u8]) -> Option<(BTreeMap<String, String>, Vec<Value>)> {
+    let Value::Object(mut map) = serde_json::from_slice::<Value>(body).ok()? else {
+        return None;
+    };
+    let held = match map.remove("tickets") {
+        None => Vec::new(),
+        Some(Value::Array(a)) if a.len() <= 8 && a.iter().all(Value::is_object) => a,
+        Some(_) => return None,
+    };
+    Some((lend_auth::fields_from_map(map)?, held))
+}
+
+/// The Worker's form of a page origin: `http(s)://` and a host, at most 200
+/// characters.
+fn origin_ok(o: &str) -> bool {
+    let host = o
+        .strip_prefix("https://")
+        .or_else(|| o.strip_prefix("http://"));
+    o.len() <= 200
+        && host.is_some_and(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".:[]-".contains(&b))
+        })
+}
+
 fn vault1() -> &'static keeler_lend::vaults::Vault {
     &keeler_lend::vaults::TSOL_TUSD
 }
@@ -788,6 +983,18 @@ fn vault1() -> &'static keeler_lend::vaults::Vault {
 impl<'a, L: Ledger> Keeper<'a, L> {
     /// Loads the state file and reconciles it with the chain.
     pub fn open(cfg: &'a Lend, ledger: &'a L, signer: &'a Keypair, state: PathBuf) -> Result<Self> {
+        // `connect` checked the key is one of KEEPERS; the unit tests' is not.
+        Self::open_in(cfg, ledger, signer, state, keeler_lend::KEEPERS)
+    }
+
+    /// [`Keeper::open`] in the keeper set `set` (this keeper need not be in it).
+    pub fn open_in(
+        cfg: &'a Lend,
+        ledger: &'a L,
+        signer: &'a Keypair,
+        state: PathBuf,
+        set: &[Address],
+    ) -> Result<Self> {
         let program = keeler_lend::ID;
         let lock = std::fs::OpenOptions::new()
             .create(true)
@@ -796,7 +1003,9 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             .open(state.with_extension("lock"))?;
         lock.try_lock()
             .map_err(|_| anyhow!("another keeper is using {}", state.display()))?;
-        let book = load_book(&state, &signer.pubkey(), &program)?;
+        let mut keepers = vec![signer.pubkey()];
+        keepers.extend(set.iter().filter(|k| **k != signer.pubkey()));
+        let book = load_book(&state, &keepers, &program)?;
         let k = Self {
             cfg,
             ledger,
@@ -812,10 +1021,19 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             cooldown: Mutex::default(),
             builds: Mutex::default(),
             seen: Mutex::default(),
+            keepers,
+            past: Mutex::default(),
+            price_logged: Mutex::new(0),
+            solvency: Mutex::new(None),
             _lock: lock,
         };
         k.recover()?;
         Ok(k)
+    }
+
+    /// The other keepers of the set.
+    fn peers(&self) -> &[Address] {
+        &self.keepers[1..]
     }
 
     fn book(&self) -> Result<MutexGuard<'_, Book>> {
@@ -839,7 +1057,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
     /// never initialised.
     pub fn recover(&self) -> Result<()> {
         self.resolve()?;
-        self.merge_history()?;
+        self.merge_history(&self.keepers, true)?;
         let book = self.snapshot()?;
         if book.reserve.is_none() {
             log!("lend: no reserve found; run `keeler lend-init-reserve` once");
@@ -858,14 +1076,27 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         Ok(())
     }
 
-    /// Adds what the keeper's transactions since the last scan made, keeps
-    /// the unspent notes, and saves with the new scan mark.
-    fn merge_history(&self) -> Result<()> {
-        let after = self.snapshot()?.scanned;
-        let (found, newest) = self
-            .ledger
-            .history(after.as_deref())
-            .context("rebuild from the chain")?;
+    /// Adds what the transactions of the keepers `who` paid for since their
+    /// last scan made, keeps the unspent notes, and saves with the new scan
+    /// marks. Unless `force`, a scan that found nothing new changes nothing.
+    fn merge_history(&self, who: &[Address], force: bool) -> Result<()> {
+        let marks = self.snapshot()?.scanned;
+        let mut found = Vec::new();
+        let mut next = marks.clone();
+        for k in who {
+            let key = k.to_string();
+            let (notes, newest) = self
+                .ledger
+                .history(k, marks.get(&key).map(String::as_str))
+                .context("rebuild from the chain")?;
+            found.extend(notes);
+            if let Some(n) = newest {
+                next.insert(key, n);
+            }
+        }
+        if !force && found.is_empty() && next == marks {
+            return Ok(());
+        }
         let mut book = self.book()?;
         let mut all: Vec<Note> = book
             .reserve
@@ -905,7 +1136,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             .filter(|n| n.kind == KIND_POSITION)
             .cloned()
             .collect();
-        book.scanned = newest.or(after);
+        book.scanned = next;
         self.save(&book)
     }
 
@@ -1036,7 +1267,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         drop(book);
         if lost_reserve {
             log!("lend: the reserve was spent outside any record; rebuilding from the chain");
-            self.merge_history()?;
+            self.merge_history(&self.keepers, true)?;
         }
         Ok(())
     }
@@ -1045,19 +1276,41 @@ impl<'a, L: Ledger> Keeper<'a, L> {
     /// job ran.
     pub fn step(&self) -> Result<bool> {
         self.resolve()?;
+        // The peers' new transactions, every pass: a deposit by one of them
+        // spends no reserve, so nothing else would show it.
+        if !self.peers().is_empty() {
+            self.merge_history(self.peers(), false)?;
+        }
         let now = self.ledger.now()?;
         let book = self.snapshot()?;
         let Some(reserve) = book.reserve.clone() else {
             // Not initialised yet, or lost: look again (cheap past the mark).
-            self.merge_history()?;
+            self.merge_history(&self.keepers, false)?;
             return Ok(false);
         };
         if book.in_flight() {
             return Ok(false);
         }
         let r = accrued(&reserve, now)?;
+        let indebted = book
+            .positions
+            .iter()
+            .any(|p| p.state::<PositionState>().is_ok_and(|s| s.debt_shares > 0));
+        let quote = if indebted {
+            self.watched_quote(now)
+        } else {
+            None
+        };
+        // Without a price the last figures stand.
+        if !indebted || quote.is_some() {
+            self.check_solvency(&book, &reserve, &r, quote.map_or(0, |q| q.low))?;
+        }
         // 1. Liquidations, even while a wallet holds the reservation.
-        if let Some(job) = self.liquidation(&book, &r, now)? {
+        let job = match &quote {
+            Some(q) => self.liquidation(&book, &r, q, now)?,
+            None => None,
+        };
+        if let Some(job) = job {
             let position = match &job {
                 Job::Liquidate { position, .. } => position.nullifier.clone(),
                 _ => String::new(),
@@ -1101,9 +1354,70 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         Ok(false)
     }
 
+    /// The price for this pass's liquidation watch and figures: none when
+    /// the account is missing, unverified or older than `PRICE_LIQUIDATE`
+    /// (no other source is used), logged at most once a minute.
+    fn watched_quote(&self, now: u64) -> Option<Quote> {
+        let why = match self.ledger.quote(vault1().id) {
+            Ok(q) if (now as i64).abs_diff(q.published) <= PRICE_LIQUIDATE => return Some(q),
+            Ok(q) => format!(
+                "the price is {} s old; no liquidation is possible",
+                (now as i64).abs_diff(q.published)
+            ),
+            Err(e) => format!("no price for the liquidation watch: {e:#}"),
+        };
+        if let Ok(mut at) = self.price_logged.lock() {
+            if now >= *at + 60 {
+                *at = now;
+                log!("lend: {why}");
+            }
+        }
+        None
+    }
+
+    /// Surplus and bad debt at `q`, logged when they change; while the bad
+    /// debt exceeds the surplus, new borrowing is refused.
+    fn check_solvency(
+        &self,
+        book: &Book,
+        reserve: &Note,
+        r: &core::Reserve,
+        low: u64,
+    ) -> Result<()> {
+        let s = solvency(book, reserve.amount, r, low)?;
+        let mut last = self.solvency.lock().map_err(|_| anyhow!("poisoned"))?;
+        if *last != Some(s) {
+            log!(
+                "lend: surplus {} and bad debt {} (debt token base units){}",
+                s.surplus,
+                s.bad_debt,
+                if s.halts() {
+                    "; new borrowing is refused"
+                } else {
+                    ""
+                }
+            );
+            *last = Some(s);
+        }
+        Ok(())
+    }
+
+    fn halted(&self) -> bool {
+        self.solvency
+            .lock()
+            .is_ok_and(|s| s.is_some_and(|s| s.halts()))
+    }
+
     /// The first position past the liquidation threshold at `price +
-    /// confidence` plus the margin, not waiting out a failed attempt.
-    fn liquidation(&self, book: &Book, r: &core::Reserve, now: u64) -> Result<Option<Job>> {
+    /// confidence` plus the margin, not waiting out a failed attempt; for a
+    /// standby, past it for `standby_grace_secs`.
+    fn liquidation(
+        &self,
+        book: &Book,
+        r: &core::Reserve,
+        q: &Quote,
+        now: u64,
+    ) -> Result<Option<Job>> {
         let skip = self.skip.lock().map_err(|_| anyhow!("poisoned"))?.clone();
         let indebted: Vec<&Note> = book
             .positions
@@ -1111,22 +1425,11 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             .filter(|p| p.state::<PositionState>().is_ok_and(|s| s.debt_shares > 0))
             .filter(|p| skip.get(&p.nullifier).is_none_or(|until| *until <= now))
             .collect();
-        if indebted.is_empty() {
-            return Ok(None);
-        }
-        let q = match self.ledger.quote(vault1().id) {
-            Ok(q) => q,
-            Err(e) => {
-                log!("lend: no price for the liquidation watch: {e:#}");
-                return Ok(None);
-            }
-        };
-        if (now as i64).abs_diff(q.published) > PRICE_LIQUIDATE {
-            log!("lend: the price is stale; no liquidation is possible");
-            return Ok(None);
-        }
+        let mut past = self.past.lock().map_err(|_| anyhow!("poisoned"))?;
+        let mut still = Vec::new();
         let m = u128::from(self.cfg.limits.bound_margin_bps);
         let bound = u64::try_from((u128::from(q.high) * (10_000 + m)).div_ceil(10_000))?;
+        let mut job = None;
         for p in indebted {
             let s: PositionState = p.state()?;
             // Sized as the builder will size it; a position left just past
@@ -1144,14 +1447,23 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 l.repay >= self.cfg.limits.min_repay
                     || core::above_max_limit(debt, value, &core::TSOL_TUSD_VAULT)
             });
-            if worth {
-                return Ok(Some(Job::Liquidate {
+            if !worth {
+                continue;
+            }
+            let key = (p.wallet.clone().unwrap_or_default(), s.position_id);
+            let since = *past.entry(key.clone()).or_insert(now);
+            still.push(key);
+            let waited = self.cfg.role == Role::Primary || now >= since + self.cfg.grace();
+            if waited && job.is_none() {
+                job = Some(Job::Liquidate {
                     position: p.clone(),
                     bound,
-                }));
+                });
             }
         }
-        Ok(None)
+        // A position back above the threshold starts its grace again.
+        past.retain(|k, _| still.contains(k));
+        Ok(job)
     }
 
     /// The unspent intents of `wallet` an open ticket matches: the scan
@@ -1189,6 +1501,29 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 .map(|i| i.note.nullifier())
                 .collect::<Result<_>>()?;
             let spent = self.ledger.spent(&nullifiers)?;
+            // A ticket whose intent went with no build of this keeper on it
+            // was filled by a peer (or the intent cancelled): it is closed.
+            let gone: Vec<String> = known
+                .iter()
+                .zip(&spent)
+                .filter(|(_, s)| **s)
+                .filter_map(|(i, _)| tickets.iter().find(|t| t.matches(i)))
+                .map(|t| t.id.clone())
+                .collect();
+            if !gone.is_empty() {
+                let mut b = self.book()?;
+                let before = b.clone();
+                let ids: Vec<String> = gone
+                    .into_iter()
+                    .filter(|id| !b.pending.iter().any(|p| p.ticket.as_ref() == Some(id)))
+                    .collect();
+                for t in b.tickets.iter_mut().filter(|t| ids.contains(&t.id)) {
+                    t.status = TicketStatus::Filled;
+                }
+                if *b != before {
+                    self.save(&b)?;
+                }
+            }
             let mut s = spent.into_iter();
             known.retain(|_| s.next() == Some(false));
         }
@@ -1212,6 +1547,15 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         wallets.sort_unstable();
         wallets.dedup();
         let paused = self.cfg.paused();
+        // The size cap again at fill: a supply that no longer fits waits out
+        // its expiry and is refunded.
+        let pool = book
+            .reserve
+            .as_ref()
+            .and_then(|n| accrued(n, now).ok())
+            .and_then(|r| core::total_supply(&r).ok())
+            .map_or(0, u128::from);
+        let fits = |amount: u64| within(self.cfg.limits.max_pool_size, pool + u128::from(amount));
         let mut jobs = Vec::new();
         let mut seen = Vec::new();
         for w in wallets {
@@ -1244,7 +1588,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                     (purpose::REPAY, Some(position)) => Job::Repay { position, intent },
                     (purpose::DEPOSIT, Some(position)) => Job::DepositAdd { position, intent },
                     (purpose::DEPOSIT, None) if !paused => Job::DepositOpen { intent },
-                    (purpose::SUPPLY, _) if !paused => Job::Supply { intent },
+                    (purpose::SUPPLY, _) if !paused && fits(t.amount) => Job::Supply { intent },
                     _ => continue,
                 };
                 jobs.push((t.id.clone(), t.issued, job));
@@ -1352,10 +1696,17 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             }
             (None, None) => return Ok(false),
         };
+        // A standby posts only when the primary has not, 15 s late.
+        let refresh = self.cfg.price_refresh()
+            + if self.cfg.role == Role::Standby {
+                15
+            } else {
+                0
+            };
         let current = have.is_some_and(|q| {
             q.low == price.saturating_sub(confidence)
                 && q.high == price.saturating_add(confidence)
-                && (now as i64).saturating_sub(q.published) < self.cfg.price_refresh() as i64
+                && (now as i64).saturating_sub(q.published) < refresh as i64
         });
         if current {
             return Ok(false);
@@ -1386,20 +1737,22 @@ impl<'a, L: Ledger> Keeper<'a, L> {
 
     // ---- HTTP ----
 
-    /// One `/lend/*` request whose `x-keeler-key` and size already passed.
-    pub fn http(&self, method: &str, url: &str, body: &[u8]) -> (u16, Value) {
+    /// One `/lend/*` request whose `x-keeler-key` and size already passed;
+    /// `paused` is the Worker's `x-keeler-paused: 1`.
+    pub fn http(&self, method: &str, url: &str, body: &[u8], paused: bool) -> (u16, Value) {
         let path = url.split('?').next().unwrap_or_default();
+        let bad = || (400, "bad request".to_owned());
         let out = match (method, path) {
             ("GET", "/lend/pools") => self.pools().map_err(internal),
-            ("GET", "/lend/account") => lend_auth::fields_from_query(url)
-                .ok_or((400, "bad request".to_owned()))
-                .and_then(|f| self.account(f)),
+            ("POST", "/lend/account") => account_body(body)
+                .ok_or_else(bad)
+                .and_then(|(f, held)| self.account(f, &held)),
             ("POST", "/lend/ticket") => lend_auth::fields_from_json(body)
-                .ok_or((400, "bad request".to_owned()))
-                .and_then(|f| self.ticket(f)),
+                .ok_or_else(bad)
+                .and_then(|f| self.ticket(f, paused)),
             ("POST", "/lend/build") => lend_auth::fields_from_json(body)
-                .ok_or((400, "bad request".to_owned()))
-                .and_then(|f| self.build(f)),
+                .ok_or_else(bad)
+                .and_then(|f| self.build(f, paused)),
             _ => refuse(404, "not found"),
         };
         match out {
@@ -1425,16 +1778,13 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             .nonces
             .lock()
             .map_err(|_| (500, "poisoned".to_owned()))?;
-        let wallet = lend_auth::authenticate(
-            fields,
-            method,
-            path,
-            now,
-            &self.cfg.network,
-            &self.program,
-            &mut nonces,
-        )
-        .map_err(|m| (401, m.to_owned()))?;
+        let site = lend_auth::Site {
+            network: &self.cfg.network,
+            program: &self.program,
+            origins: &self.cfg.origins,
+        };
+        let wallet = lend_auth::authenticate(fields, method, path, now, &site, &mut nonces)
+            .map_err(|m| (401, m.to_owned()))?;
         drop(nonces);
         if !self.ledger.registered(&wallet).map_err(internal)? {
             return refuse(
@@ -1462,7 +1812,15 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 let e = |e: core::LendError| anyhow!("{e}");
                 let util = core::utilisation_bps(&r).map_err(e)?;
                 let apr = core::apr_bps(r.rate_bps, util, core::TUSD_POOL.fee_bps).map_err(e)?;
+                // The last pass's figures (none yet: zero).
+                let s = self
+                    .solvency
+                    .lock()
+                    .map_err(|_| anyhow!("poisoned"))?
+                    .unwrap_or_default();
                 vec![json!({
+                    "surplus": coarse(s.surplus).to_string(),
+                    "badDebt": coarse(s.bad_debt).to_string(),
                     "mint": vault1().debt_mint.to_string(),
                     "at": bucket,
                     "size": coarse(core::total_supply(&r).map_err(e)?).to_string(),
@@ -1477,8 +1835,78 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         Ok(v)
     }
 
-    fn account(&self, fields: BTreeMap<String, String>) -> Result<Value, Refusal> {
-        let (wallet, now) = self.authenticate(&fields, "GET", "/lend/account", &[])?;
+    /// Peer tickets the page holds that this keeper does not know: each one
+    /// valid and live is taken on, so its intent fills with its keeper gone.
+    fn adopt(&self, wallet: &Address, held: &[Value], now: u64) -> Result<()> {
+        let w = wallet.to_string();
+        let mut b = self.book()?;
+        let before = b.tickets.len();
+        for h in held {
+            if let Some(t) = self.held_ticket(&w, h, now) {
+                if !b.tickets.iter().any(|k| k.id == t.id) {
+                    log!(
+                        "lend: took on ticket {} of {w} from keeper {}",
+                        t.id,
+                        t.keeper.as_deref().unwrap_or("self")
+                    );
+                    b.tickets.push(t);
+                }
+            }
+        }
+        if b.tickets.len() > before {
+            if let Err(e) = self.save(&b) {
+                b.tickets.truncate(before);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// A ticket as the page holds it, when a keeper of the set signed it for
+    /// `wallet` and it can still be filled.
+    fn held_ticket(&self, wallet: &str, h: &Value, now: u64) -> Option<Ticket> {
+        let s = |k: &str| h.get(k).and_then(Value::as_str);
+        let num = |k: &str| decimal(s(k).map(str::to_owned).as_ref());
+        let keeper = parse_address(s("keeper")?).ok()?;
+        let (purpose, target) = match s("purpose")? {
+            "supply" if s("pool") == Some(&vault1().debt_mint.to_string()) => {
+                (purpose::SUPPLY, keeler_lend::pool::TUSD)
+            }
+            p @ ("deposit" | "repay") if h.get("vault").and_then(Value::as_u64) == Some(1) => (
+                if p == "deposit" {
+                    purpose::DEPOSIT
+                } else {
+                    purpose::REPAY
+                },
+                num("position").filter(|p| *p < 1 << 63)?,
+            ),
+            _ => return None,
+        };
+        let expiry = h.get("expiry").and_then(Value::as_u64)?;
+        if expiry <= now + FILL_MARGIN || expiry > now + 900 {
+            return None;
+        }
+        let t = Ticket {
+            id: s("id")?.to_owned(),
+            wallet: wallet.to_owned(),
+            purpose,
+            target,
+            amount: num("amount")?,
+            expiry,
+            issued: now,
+            signature: s("signature")?.to_owned(),
+            status: TicketStatus::Open,
+            attempts: 0,
+            retry_at: 0,
+            seen: false,
+            keeper: (keeper != self.keepers[0]).then(|| keeper.to_string()),
+        };
+        ticket_valid(&t, &self.keepers, &self.program).then_some(t)
+    }
+
+    fn account(&self, fields: BTreeMap<String, String>, held: &[Value]) -> Result<Value, Refusal> {
+        let (wallet, now) = self.authenticate(&fields, "POST", "/lend/account", &[])?;
+        self.adopt(&wallet, held, now).map_err(internal)?;
         let book = self.snapshot().map_err(internal)?;
         let mine = |list: &[Note]| -> Vec<Note> {
             let mut v: Vec<Note> = list
@@ -1553,7 +1981,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         Ok(out)
     }
 
-    fn ticket(&self, fields: BTreeMap<String, String>) -> Result<Value, Refusal> {
+    fn ticket(&self, fields: BTreeMap<String, String>, header: bool) -> Result<Value, Refusal> {
         let (wallet, now) = self.authenticate(
             &fields,
             "POST",
@@ -1561,7 +1989,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             &["purpose", "amount", "pool", "vault", "position"],
         )?;
         let amount = decimal(fields.get("amount")).ok_or((400, "bad amount".to_owned()))?;
-        let paused = self.cfg.paused();
+        let paused = self.cfg.paused_for(header);
         let l = &self.cfg.limits;
         let w = wallet.to_string();
         // Checked and issued under the book lock: racing requests cannot
@@ -1659,7 +2087,75 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 }
                 _ => return refuse(400, "bad purpose"),
             };
-            if mine.iter().filter(|t| t.issued + HOUR > now).count()
+            // Caps count the open tickets too: each may still fill.
+            let open: Vec<&Ticket> = book
+                .tickets
+                .iter()
+                .filter(|t| t.open(now) && t.purpose == purpose)
+                .collect();
+            let tickets = |f: &dyn Fn(&Ticket) -> bool| -> u128 {
+                open.iter()
+                    .filter(|t| f(t))
+                    .map(|t| u128::from(t.amount))
+                    .sum()
+            };
+            let a = u128::from(amount);
+            if purpose == purpose::SUPPLY {
+                let r = book
+                    .reserve
+                    .as_ref()
+                    .map(|n| accrued(n, now))
+                    .transpose()
+                    .map_err(internal)?;
+                let pool = r
+                    .as_ref()
+                    .map_or(Ok(0), core::total_supply)
+                    .map_err(|e| internal(anyhow!("{e}")))?;
+                if !within(l.max_pool_size, u128::from(pool) + tickets(&|_| true) + a) {
+                    return refuse(422, "the pool is at its size limit");
+                }
+                let held: u128 = book
+                    .receipts
+                    .iter()
+                    .filter(|n| n.owned_by(&wallet))
+                    .filter_map(|n| {
+                        let s: ReceiptState = n.state().ok()?;
+                        core::assets_of(s.supply_shares, r.as_ref()?.supply_price).ok()
+                    })
+                    .map(u128::from)
+                    .sum();
+                if !within(
+                    l.max_supply_per_wallet,
+                    held + tickets(&|t| t.wallet == w) + a,
+                ) {
+                    return refuse(422, "this wallet has supplied the most allowed");
+                }
+            }
+            if purpose == purpose::DEPOSIT {
+                let total: u128 = book.positions.iter().map(|p| u128::from(p.amount)).sum();
+                if !within(l.max_total_collateral, total + tickets(&|_| true) + a) {
+                    return refuse(422, "the vault is at its collateral limit");
+                }
+                let this: u128 = book
+                    .positions
+                    .iter()
+                    .filter(|p| {
+                        p.owned_by(&wallet)
+                            && p.state::<PositionState>()
+                                .is_ok_and(|s| s.position_id == target)
+                    })
+                    .map(|p| u128::from(p.amount))
+                    .sum();
+                let more = tickets(&|t| t.wallet == w && t.target == target);
+                if !within(l.max_position_collateral, this + more + a) {
+                    return refuse(422, "more collateral than one position may hold");
+                }
+            }
+            // Only this keeper's own tickets count against its rate.
+            if mine
+                .iter()
+                .filter(|t| t.keeper.is_none() && t.issued + HOUR > now)
+                .count()
                 >= l.tickets_per_wallet_hour as usize
             {
                 return refuse(429, "too many requests from this wallet this hour");
@@ -1698,13 +2194,19 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             attempts: 0,
             retry_at: 0,
             seen: false,
+            keeper: None,
         };
         b.tickets.push(t.clone());
         if let Err(e) = self.save(&b) {
             b.tickets.pop();
             return Err(internal(e));
         }
-        Ok(json!({ "id": t.id, "expiry": expiry, "signature": signature }))
+        Ok(json!({
+            "id": t.id,
+            "expiry": expiry,
+            "signature": signature,
+            "keeper": self.keepers[0].to_string(),
+        }))
     }
 
     /// Whether `wallet`'s last reservation lapsed unused so recently that it
@@ -1724,7 +2226,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         Ok(lapsed || listed)
     }
 
-    fn build(&self, fields: BTreeMap<String, String>) -> Result<Value, Refusal> {
+    fn build(&self, fields: BTreeMap<String, String>, header: bool) -> Result<Value, Refusal> {
         let started = Instant::now();
         let (wallet, asked) = self.authenticate(
             &fields,
@@ -1777,8 +2279,14 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             Some("draw") => Some(num("position")?),
             _ => None,
         };
-        if borrow > 0 && self.cfg.paused() {
+        if borrow > 0 && self.cfg.paused_for(header) {
             return refuse(403, "lending is paused: no new borrowing");
+        }
+        if borrow > 0 && self.halted() {
+            return refuse(
+                403,
+                "borrowing is halted while the pool's bad debt exceeds its surplus",
+            );
         }
         let w = wallet.to_string();
         let is_named = |n: &Note| named.is_none_or(|h| n.hash().is_ok_and(|m| m == h));
@@ -1933,7 +2441,12 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             if withdraw > 0 && withdraw < l.min_withdraw && left != 0 {
                 return refuse(422, "below the minimum withdrawal");
             }
-            let q = self.ledger.quote(vault1().id).map_err(internal)?;
+            // A missing or unverified price account is the oracle's state,
+            // not the keeper's fault.
+            let q = self.ledger.quote(vault1().id).map_err(|e| {
+                log!("lend: no price for a draw: {e:#}");
+                (412, "the oracle price is unavailable".to_owned())
+            })?;
             if (now as i64).abs_diff(q.published) > PRICE_FRESH {
                 return refuse(412, "the oracle price is too old");
             }
@@ -1950,8 +2463,11 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             if left != 0 && left < v.min_collateral {
                 return refuse(422, "below the vault's minimum collateral");
             }
-            if debt != 0 && debt < v.min_debt {
+            if debt != 0 && debt < v.min_debt.max(l.min_position_debt) {
                 return refuse(422, "below the vault's minimum debt");
+            }
+            if borrow > 0 && !within(l.max_position_debt, u128::from(debt)) {
+                return refuse(422, "more debt than one position may hold");
             }
             let value = core::collateral_value(left, bound).map_err(cerr)?;
             if !core::can_draw(debt, value, &core::TSOL_TUSD_VAULT) {
@@ -2013,6 +2529,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             "outputs": pending.outputs,
             "now": pending.now,
             "index": built.index.unwrap_or(index).to_string(),
+            "keeper": self.keepers[0].to_string(),
         });
         if let Some(bound) = bound {
             reply["bound"] = json!(bound.to_string());
@@ -2116,27 +2633,64 @@ pub struct Parts {
     pub state: PathBuf,
 }
 
-/// Loads the keeper key (`lend.key`, else `default`), checks it is the
-/// program's KEEPER and connects.
+/// Loads the keeper key (`lend.key`, else `default`) and the pool key
+/// (`lend.pool_key`, else the keeper key), checks them against the program's
+/// KEEPERS and POOL_VIEWING and the chain against `lend.network`, and
+/// connects.
 pub fn connect(
     lend: &Lend,
     network: &crate::config::Network,
     default: &KeySource,
 ) -> Result<Parts> {
-    let signer = lend.key.as_ref().unwrap_or(default).keypair()?;
+    let key_source = lend.key.as_ref().unwrap_or(default);
+    let pool_source = lend.pool_key.as_ref().unwrap_or(key_source);
+    if lend.mainnet() {
+        let files = [Some(key_source), Some(pool_source), lend.admin_key.as_ref()];
+        ensure!(
+            !files.iter().flatten().any(|k| k.is_file()),
+            "on mainnet the keeper, pool and admin keys come from the Keychain, not a file"
+        );
+    }
+    let signer = key_source.keypair()?;
     ensure!(
-        signer.pubkey() == keeler_lend::KEEPER,
-        "the keeper key is {}, the program's keeper is {}",
-        signer.pubkey(),
-        keeler_lend::KEEPER
+        keeler_lend::KEEPERS.contains(&signer.pubkey()),
+        "the keeper key {} is not one of the program's KEEPERS",
+        signer.pubkey()
     );
-    let chain = crate::lend_chain::LendChain::connect(network, &signer, lend.price)?;
+    let pool = pool_source.keypair()?;
+    let kp = keeler_lend_sdk::keeper_keypair(&signer, &pool)?;
+    ensure!(
+        kp.viewing_pubkey().as_bytes() == &keeler_lend::POOL_VIEWING,
+        "the pool key does not give the program's POOL_VIEWING"
+    );
+    ensure!(
+        !lend.mainnet() || !keeler_lend::KEEPERS.contains(&pool.pubkey()),
+        "on mainnet the pool key must not be a keeper key"
+    );
+    let liquidation_fee = lend
+        .liquidation_priority_fee
+        .unwrap_or(network.priority_fee);
+    let chain =
+        crate::lend_chain::LendChain::connect(network, &signer, kp, lend.price, liquidation_fee)?;
+    check_cluster(lend, chain.chain.cluster)?;
     let state = lend.state_path(&signer.pubkey())?;
     Ok(Parts {
         signer,
         chain,
         state,
     })
+}
+
+/// Refuses a chain whose genesis hash is not the network `lend.network`
+/// names.
+pub fn check_cluster(lend: &Lend, chain: crate::chain::Cluster) -> Result<()> {
+    let named = crate::chain::Cluster::of_name(&lend.network);
+    ensure!(
+        named == chain,
+        "lend.network is {} but the RPC serves a {chain:?} chain",
+        lend.network
+    );
+    Ok(())
 }
 
 /// Runs the keeper and an HTTP server with only the lend routes (and
@@ -2185,12 +2739,12 @@ impl<L: Ledger> crate::dealer::Api for Health<'_, L> {
 
 /// The lend routes as the HTTP server calls them.
 pub trait LendRoutes: Sync {
-    fn lend(&self, method: &str, url: &str, body: &[u8]) -> (u16, Value);
+    fn lend(&self, method: &str, url: &str, body: &[u8], paused: bool) -> (u16, Value);
 }
 
 impl<L: Ledger> LendRoutes for Keeper<'_, L> {
-    fn lend(&self, method: &str, url: &str, body: &[u8]) -> (u16, Value) {
-        self.http(method, url, body)
+    fn lend(&self, method: &str, url: &str, body: &[u8], paused: bool) -> (u16, Value) {
+        self.http(method, url, body, paused)
     }
 }
 
@@ -2198,9 +2752,9 @@ impl<L: Ledger> LendRoutes for Keeper<'_, L> {
 pub struct Slot<'a, L>(pub &'a OnceLock<Keeper<'a, L>>);
 
 impl<L: Ledger> LendRoutes for Slot<'_, L> {
-    fn lend(&self, method: &str, url: &str, body: &[u8]) -> (u16, Value) {
+    fn lend(&self, method: &str, url: &str, body: &[u8], paused: bool) -> (u16, Value) {
         match self.0.get() {
-            Some(k) => k.http(method, url, body),
+            Some(k) => k.http(method, url, body, paused),
             None => (
                 503,
                 json!({ "error": "the keeper could not do this right now" }),

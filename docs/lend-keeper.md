@@ -1,8 +1,10 @@
 # Keeler Lend: running the keeper
 
-The keeper is the program's `KEEPER` key. It holds the openings of the pool's notes (the reserve,
-every receipt and position), signs tickets, fills ticketed intents, builds the owner-signed
-`redeem` and `draw`, and liquidates. The page and Worker side is in `docs/lend-api.md`; the design
+A keeper is one of the program's `KEEPERS` keys (up to 4). It holds the openings of the pool's
+notes (the reserve, every receipt and position), signs tickets, fills ticketed intents, builds the
+owner-signed `redeem` and `draw`, and liquidates. Every keeper of the set works under the one pool
+key: its lend keypair is its own signing key under the viewing key the pool key derives, which
+must be the program's `POOL_VIEWING`, so all of them read and write the same notes. The page and Worker side is in `docs/lend-api.md`; the design
 is in `docs/plan-lend.md`. The code is `cli/src/keeper.rs` (logic, HTTP, records),
 `cli/src/lend_chain.rs` (the chain) and `cli/src/lend_auth.rs` (request and ticket signatures).
 
@@ -16,11 +18,20 @@ The keeper runs inside the dealer, on the dealer's HTTP server, when the dealer 
   "program_id": "A7qaBKJ1gJRcKwMWyyRdr9YhmbBmnMaemM9Sijah3EbC",
   "network": "devnet",
   "key": { "keychain": "keeler-lend-keeper" },
+  "pool_key": { "keychain": "keeler-lend-pool" },
+  "role": "primary",
+  "origins": ["https://keeler.example"],
   "state_file": "/Users/me/.local/state/keeler/keeper.json",
   "pause_file": "/Users/me/.local/state/keeler/lend.pause",
   "price": "test",
   "price_refresh_secs": 45,
   "limits": {
+    "max_pool_size": 0,
+    "max_supply_per_wallet": 0,
+    "max_total_collateral": 0,
+    "max_position_collateral": 0,
+    "max_position_debt": 0,
+    "min_position_debt": 0,
     "min_supply": 1000000,
     "min_collateral": 10000000,
     "min_deposit_add": 1,
@@ -44,10 +55,15 @@ The keeper runs inside the dealer, on the dealer's HTTP server, when the dealer 
 On devnet `scripts/run-dealer.sh <config>` runs it: for a config with `lend` it finds the
 deployment whose `target/devnet-<name>/program-id` is `lend.program_id`, builds the binary in
 `target/devnet-<name>/dealer-cargo` with the build parameters `scripts/deploy-lend-devnet.sh`
-recorded in `build-params.json` (it refuses to run if their keeper is not the dealer), and points
-the keeper at the deployment's own copy of the proving keys (`KEELER_LEND_KEYS_DIR=
-target/devnet-<name>/keys`), so a rebuild of `lend/target` cannot change them under a running
-keeper. The keeper is the dealer key, and the Worker still gets only `DEALERS`.
+recorded in `build-params.json` (`keepers`, `pool_viewing` and the rest; it refuses to run if the
+dealer is not one of `keepers`, or if `lend.pool_key` is not the Keychain item
+`keeler-devnet-<name>-pool`), and points the keeper at the deployment's own copy of the proving
+keys (`KEELER_LEND_KEYS_DIR=target/devnet-<name>/keys`), so a rebuild of `lend/target` cannot
+change them under a running keeper. The keeper is the dealer key. With `--standby` it also runs
+the other keeper of `keepers` as a standby (`keeler keeper`, key in `keeler-devnet-<name>-standby`,
+the same lend section with `role: standby`, on the next port behind its own tunnel) and writes
+`LEND_KEEPERS` to the Worker (the dealer's keeper first); without it the Worker's lending goes to
+the first `DEALERS` entry.
 
 Inside the dealer the keeper starts on its own thread: the swap routes serve at once, and the lend
 routes answer 503 until the keeper has connected and settled its records. A start that fails
@@ -67,14 +83,23 @@ Or alone, with no swap program: `keeler keeper <config>`, where the config is
 | Field | Meaning |
 | --- | --- |
 | `program_id` | Must be the program this binary was built for (`KEELER_LEND_PROGRAM_ID` at build time) |
-| `network` | The name in the session text the wallet signs (`Network: <network>`); must match the page's. Lowercase letters, digits and `-`; any name containing `mainnet` is treated as mainnet |
+| `network` | The name in the session text the wallet signs (`Network: <network>`); must match the page's. Lowercase letters, digits and `-`; any name containing `mainnet` is treated as mainnet. The keeper (and the dealer) refuse to start when the RPC's genesis hash is not that network's (`mainnet`, `devnet`, anything else local) |
+| `origins` | Required: the page origins a session may name (`Origin:` in its text), each `https://host` or `http://host[:port]` |
 | `poll_secs` | Seconds between passes (1 to 60) |
-| `key` | The keeper key; default the config's `key`. It must be the program's `KEEPER` |
+| `key` | The keeper key; default the config's `key`. It must be one of the program's `KEEPERS` |
+| `pool_key` | The pool key; default the keeper key. The viewing key it derives must be the program's `POOL_VIEWING`. On mainnet it must not be a keeper key |
+| `role` | `primary` (default) or `standby`. A standby liquidates a position only once it has been past the threshold for `standby_grace_secs` (default 45, at most 600; the clock restarts when it recovers), and re-posts the test price only `price_refresh_secs` + 15 s after the last post |
+| `liquidation_priority_fee` | Micro-lamports per compute unit on liquidations; default `network.priority_fee` (which every other keeper and dealer transaction pays, default 0) |
 | `admin_key` | Only for `keeler lend-init-reserve` |
 | `state_file` | Default `~/.local/state/keeler/keeper-<keeper pubkey>.json` |
 | `pause_file` | While this file exists: no new supply tickets or fills, no deposit tickets or fills that open a position, no borrowing |
 | `price` | `test`: the vault's test price account (local networks, devnet). `pyth`: the vault's Pyth `PriceUpdateV2` account compiled into the program |
-| `price_refresh_secs` | `price: "test"` only: how often the keeper re-posts the test price (5 to 80, default 45; the program refuses a price older than 90 s, the keeper's own draws one older than 60 s) |
+| `price_refresh_secs` | `price: "test"` only: how often the keeper re-posts the test price (5 to 80, default 45; the program refuses a price older than 90 s, the keeper's own draws one older than 65 s) |
+| `limits.max_pool_size` | Most the pool may hold: supply plus open supply tickets, checked at the ticket and again at the fill (a supply that no longer fits waits out its expiry and is refunded) |
+| `limits.max_supply_per_wallet` | Most one wallet may have supplied: its receipts' value plus its open supply tickets |
+| `limits.max_total_collateral`, `max_position_collateral` | Most collateral in all positions, and in one, open deposit tickets counted |
+| `limits.max_position_debt` | Most debt one position may take on by borrowing |
+| `limits.min_position_debt` | A draw leaves no debt or at least this (and the vault's minimum) |
 | `limits.min_supply`, `min_collateral`, `min_deposit_add`, `min_repay` | Ticket minimums; the program's own minimums are the floor |
 | `limits.min_redeem` | Smallest redeem build, unless it empties the receipt |
 | `limits.min_borrow`, `min_withdraw` | Smallest borrow and collateral withdrawal in a draw build (a withdrawal that empties the position is always allowed) |
@@ -87,6 +112,10 @@ Or alone, with no swap program: `keeler keeper <config>`, where the config is
 | `limits.bucket_secs` | `/lend/pools` refresh period (at least 60) |
 | `limits.bound_margin_bps` | The draw bound sits this far below `price − confidence`, the liquidation bound this far above `price + confidence` |
 
+The `max_*` caps are off at 0. On mainnet the keeper refuses to start with any of them at 0, with
+the keeper, pool or admin key read from a file, or with `price: "test"`; the dealer refuses a
+`faucet` section or a key read from a file.
+
 Lend requests run on their own threads (up to 8 at once) with a 30 s deadline and a 16 KiB body
 cap; the swap routes keep their 4 KiB cap and one-at-a-time server. Every route is loopback only and
 needs the `x-keeler-key` header, as the swap routes do. Wallets must be in the user registry: an
@@ -94,7 +123,10 @@ unregistered wallet gets a 400 saying so.
 
 `/lend/pools` gives coarse figures: the reserve accrued to the start of the current bucket
 (`bucket_secs`, default 10 minutes), with size, utilisation and both rates rounded to two
-significant figures, recomputed at most once per bucket.
+significant figures, recomputed at most once per bucket. Each pass also works out the pool's
+surplus (idle plus debt less what suppliers are owed) and bad debt (the debt of positions whose
+collateral at `price − confidence` is worth less than it), logs them when they change, and gives
+them coarse in `/lend/pools`; while the bad debt exceeds the surplus, borrowing is refused (403).
 
 ## CLI commands
 
@@ -121,10 +153,13 @@ One lane for the pool: one keeper transaction at a time, and none while an earli
 transaction may still land. Each pass settles the records first, then runs the most urgent job:
 
 1. Liquidations: every position with debt is checked at `price + confidence` (plus the margin)
-   on every pass, with a price no older than 75 s (the program allows 90 s); one past the
-   threshold is sized with `core::lend::liquidate` (the SDK builder does the same) and repaid from
-   a keeper note of exactly the repay plus the buffer, split or merged from the keeper's own debt
-   token notes by a self-transfer first (an empty change slot: see `lend/AGENTS.md`). Above the
+   on every pass, with a price no older than 80 s (the program allows 90 s; with none, the pass
+   skips liquidations and says so at most once a minute); one past the threshold is sized with
+   `core::lend::liquidate` (the SDK builder does the same) and repaid from a keeper note of exactly
+   the repay, made first when there is none by one self-transfer of exactly that amount (split from
+   the smallest larger note, else merged from the four largest) and waited for up to 30 s (an
+   empty change slot: see `lend/AGENTS.md`). The funds are the debt-token notes at the keeper's
+   lend address (its key under the pool viewing key). Above the
    max limit the whole debt is repaid. A position the last liquidation left a hair past the
    threshold (repay under `min_repay`, or under one debt share) is left. A liquidation that fails
    is logged and that position waits 60 s; the fills go on meanwhile. Liquidations run even while
@@ -169,7 +204,10 @@ JSON, mode 0600, written atomically (a temp file then a rename) on every change:
   openings. A build is saved here before it is sent or handed to a wallet; if the save fails, it is
   neither.
 - `reservation`: the wallet holding the pool, and until when.
-- `scanned`: the newest finalized keeper transaction already read back from the chain.
+- `tickets` also holds the tickets taken on from another keeper (`keeper` names it); only a
+  keeper's own tickets count toward its `tickets_per_wallet_hour`.
+- `scanned`: per keeper address, the newest finalized transaction it paid for already read back
+  from the chain. A file from before the keeper set holds one mark, read as this keeper's.
 
 The keeper takes an exclusive lock on `<state_file without extension>.lock` for as long as it runs,
 and refuses to start when another process holds it.
@@ -186,27 +224,31 @@ whose inputs was spent elsewhere can never land and is dropped, as is one unspen
 as above.
 
 On start, and whenever the keeper holds no reserve, it settles the pending builds, then reads back
-from the chain every transaction the keeper key signed and paid for since `scanned`
+from the chain every transaction a keeper of the set signed and paid for since its mark in `scanned`
 (`getSignaturesForAddress`), its lend instruction (which wallet), and each output opened with the
 keeper's writer key, checked against the hash on chain (it waits up to 60 s for the indexer to have
 each one, and refuses to start rather than rebuild without one). A transaction another key paid
 for is never read, so notes made with the public local test keys are never taken up. It keeps the
 unspent reserve, receipts and positions, merged with the file, and moves `scanned` to the newest
-finalized transaction it read. It refuses to start with two unspent reserves. Tickets are not on chain: after a restart with an empty file the keeper fills no intent
+finalized transaction it read. It refuses to start with two unspent reserves. Every pass also
+reads the other keepers' new transactions, so their fills, deposits and liquidations reach its
+book. Tickets are not on chain: after a restart with an empty file the keeper fills no intent
 made before it (their makers refund after expiry) and the account view shows no old intents.
 
 ## Never
 
-- Run two keepers on one pool. The state file's lock stops two processes on one file, not two
-  state files (or two machines). Both would build on the same reserve; at best one fails every
-  operation, at worst a filled ticket is filled again.
+- Run two processes with one keeper key. The state file's lock stops two processes on one file,
+  not two state files (or two machines). Two keepers of the set may run on one pool, one
+  `primary` and the others `standby`: they race only when the primary is slow, and the loser's
+  build is dropped (it cannot land on a spent reserve).
 - Delete or edit the state file while the keeper runs, or restore an old copy. It is the only
   record of tickets and of builds in flight. (An empty file is recoverable from the chain; a wrong
   one is not.)
-- Put the keeper or admin key in a file or the config. Use the Keychain (`{"keychain": "..."}`).
+- Put the keeper, pool or admin key in a file or the config. Use the Keychain (`{"keychain": "..."}`).
 - Run with `price: "test"` on mainnet (the keeper refuses to), or expose the HTTP port beyond loopback; the Worker is the
   only client.
 - Let the keeper's debt-token balance run out: liquidations need it. Keep at least the largest
-  position's debt in its private balance.
+  position's debt at each keeper's lend address (its key under the pool viewing key, not the
+  dealer's swap wallet).
 - Change `program_id`, the vault mints or the keeper key without rebuilding the binary and the
   program together.

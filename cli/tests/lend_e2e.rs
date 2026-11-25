@@ -53,6 +53,7 @@ const CONF: u64 = 10_000_000;
 const HTTP_PORT: u16 = 47_800;
 const KEY: &str = "lend-e2e-http-key-0123";
 const NET: &str = "localnet";
+const ORIGIN: &str = "http://127.0.0.1:5300";
 
 fn env_path(name: &str) -> PathBuf {
     std::env::var_os(name)
@@ -122,8 +123,8 @@ impl Ledger for Probe<'_> {
         }
         self.inner.send(tx)
     }
-    fn history(&self, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
-        self.inner.history(after)
+    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+        self.inner.history(payer, after)
     }
 }
 
@@ -175,8 +176,10 @@ impl Page {
         f.insert("wallet".into(), self.addr().to_string());
         f.insert("sessionKey".into(), self.session.pubkey().to_string());
         f.insert("sessionExpiry".into(), self.expiry.to_string());
+        f.insert("origin".into(), ORIGIN.into());
         let text = authorisation_text(
             NET,
+            ORIGIN,
             &keeler_lend::ID,
             &self.addr(),
             &self.session.pubkey(),
@@ -247,9 +250,8 @@ impl Env {
     }
 
     fn account(&self, page: &Page) -> Value {
-        let f = page.signed("GET", "/lend/account", &[], self.now());
-        let q: Vec<String> = f.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        let (st, v) = self.get(&format!("/lend/account?{}", q.join("&")));
+        let f = page.signed("POST", "/lend/account", &[], self.now());
+        let (st, v) = self.post("/lend/account", &f);
         assert_eq!(st, 200, "{v}");
         v
     }
@@ -409,6 +411,58 @@ impl Env {
     }
 }
 
+/// The program's Pyth account (the build default: SOL/USD's push account).
+const PYTH_SOL_USD: &str = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
+
+/// Its bytes on mainnet now (`KEELER_MAINNET_RPC`, default the public RPC).
+fn mainnet_pyth_account() -> Result<Vec<u8>> {
+    let url = std::env::var("KEELER_MAINNET_RPC")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
+    let v: Value = reqwest::blocking::Client::new()
+        .post(url)
+        .json(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+            "params": [PYTH_SOL_USD, {"encoding": "base64"}]}),
+        )
+        .send()?
+        .json()?;
+    let a = &v["result"]["value"];
+    ensure!(
+        a["owner"] == json!(keeler_lend::vaults::PYTH_RECEIVER.to_string()),
+        "not the Pyth receiver's: {v}"
+    );
+    let d = B64.decode(a["data"][0].as_str().context("no data")?)?;
+    ensure!(d.len() >= 101, "short PriceUpdateV2");
+    Ok(d)
+}
+
+/// Writes `raw` at the Pyth address with `price` and the chain's time as the
+/// publish time, as a Pyth push would.
+fn push_pyth(rpc: &str, raw: &[u8], price: i64) -> Result<()> {
+    let call = |method: &str, params: Value| -> Result<Value> {
+        let v: Value = reqwest::blocking::Client::new()
+            .post(rpc)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
+            .send()?
+            .json()?;
+        ensure!(v.get("error").is_none(), "{method}: {v}");
+        Ok(v["result"].clone())
+    };
+    let slot = call("getSlot", json!([]))?;
+    let now = call("getBlockTime", json!([slot]))?
+        .as_i64()
+        .context("no block time")?;
+    let mut d = raw.to_vec();
+    d[73..81].copy_from_slice(&price.to_le_bytes());
+    d[93..101].copy_from_slice(&now.to_le_bytes());
+    call(
+        "surfnet_setAccount",
+        json!([PYTH_SOL_USD, {"lamports": 1_825_031, "data": to_hex(&d),
+            "owner": keeler_lend::vaults::PYTH_RECEIVER.to_string()}]),
+    )?;
+    Ok(())
+}
+
 /// Runs passes until `done` holds of the book, or fails after `secs`.
 fn settle(k: &Keeper<Probe>, what: &str, secs: u64, done: impl Fn(&Book) -> bool) -> Result<()> {
     let started = Instant::now();
@@ -515,14 +569,27 @@ fn keeper_end_to_end() -> Result<()> {
     let keeper_key = fixture::actor(0);
     let admin = fixture::actor(3);
     ensure!(
-        keeper_key.pubkey() == keeler_lend::KEEPER && admin.pubkey() == keeler_lend::ADMIN,
-        "default keeper and admin"
+        keeler_lend::KEEPERS == [keeper_key.pubkey(), fixture::payer().pubkey()]
+            && admin.pubkey() == keeler_lend::ADMIN,
+        "default keepers and admin"
     );
     let network = Network::local(ports.rpc_url(), ports.photon_url());
-    let chain = LendChain::connect(&network, &keeper_key, keeper::LendPrice::Test)?;
+    let lend_chain = |key: &Keypair, price| {
+        LendChain::connect(
+            &network,
+            key,
+            keeler_lend_sdk::fixture_keeper_keypair(key)?,
+            price,
+            0,
+        )
+    };
+    let chain = lend_chain(&keeper_key, keeper::LendPrice::Test)?;
+    let pyth_chain = lend_chain(&keeper_key, keeper::LendPrice::Pyth)?;
+    let second_key = fixture::payer();
+    let second_chain = lend_chain(&second_key, keeper::LendPrice::Test)?;
     let env = Env {
         localnet,
-        network,
+        network: network.clone(),
         chain,
         keeper_key,
         tusd,
@@ -568,6 +635,7 @@ fn keeper_end_to_end() -> Result<()> {
     let cfg: Lend = serde_json::from_value(json!({
         "program_id": keeler_lend::ID.to_string(),
         "network": NET,
+        "origins": [ORIGIN],
         "pause_file": dir.join("pause"),
         "limits": { "tickets_per_wallet_hour": 100 }
     }))?;
@@ -861,6 +929,164 @@ fn keeper_end_to_end() -> Result<()> {
             );
             Ok(())
         })
+    })?;
+
+    // 9. Two keepers. The first issues a ticket and goes down; the page
+    // hands the ticket to the second, which fills it on the same reserve;
+    // the first, back, takes the second's notes from the chain and closes
+    // its ticket.
+    let probe2 = Probe {
+        inner: &second_chain,
+        drop_send: AtomicBool::new(false),
+        builds: Mutex::new(Vec::new()),
+    };
+    let (reply, held) = session(&probe, &cfg, &state, |_| {
+        let (st, t) = env.ticket(
+            &lender,
+            &[
+                ("purpose", "supply".into()),
+                ("pool", tusd.to_string()),
+                ("amount", (2 * USD).to_string()),
+            ],
+        );
+        ensure!(st == 200, "ticket: {st} {t}");
+        ensure!(t["keeper"] == json!(keeler_lend::KEEPERS[0].to_string()));
+        let expiry = t["expiry"].as_u64().context("expiry")?;
+        env.raw_intent(&lender, tusd, purpose::SUPPLY, 1, 2 * USD, expiry)?;
+        let held = json!({
+            "id": t["id"], "expiry": t["expiry"], "signature": t["signature"],
+            "keeper": t["keeper"], "purpose": "supply", "pool": tusd.to_string(),
+            "amount": (2 * USD).to_string(),
+        });
+        Ok((t, held))
+    })?;
+    let id = reply["id"].as_str().unwrap().to_owned();
+    let first = session(&probe, &cfg, &state, |k| k.snapshot())?;
+    let b_state = dir.join("second.json");
+    let filled_by_second = timed("second keeper: recover, take on, fill", || {
+        let k2 = Keeper::open(&cfg, &probe2, &second_key, b_state.clone())?;
+        let b = k2.snapshot()?;
+        ensure!(
+            b.reserve.as_ref().map(|r| &r.hash) == first.reserve.as_ref().map(|r| &r.hash),
+            "the second keeper found the first's reserve"
+        );
+        let mut body =
+            serde_json::to_value(lender.signed("POST", "/lend/account", &[], env.now()))?;
+        body["tickets"] = json!([held]);
+        let (st, v) = k2.http("POST", "/lend/account", &serde_json::to_vec(&body)?, false);
+        ensure!(st == 200, "account: {v}");
+        ensure!(
+            k2.snapshot()?.tickets.iter().any(|t| t.id == id),
+            "the second keeper took the ticket on"
+        );
+        settle(&k2, "fill by the second keeper", 180, filled(&id))?;
+        k2.snapshot()
+    })?;
+    ensure!(probe2.builds.lock().unwrap().as_slice() == [Op::Supply]);
+    timed("first keeper: back, follows the second", || {
+        session(&probe, &cfg, &state, |k| {
+            settle(k, "the first follows", 120, |b| {
+                b.reserve.as_ref().map(|r| &r.hash)
+                    == filled_by_second.reserve.as_ref().map(|r| &r.hash)
+                    && b.tickets
+                        .iter()
+                        .any(|t| t.id == id && t.status == TicketStatus::Filled)
+            })?;
+            let hashes = |v: &[Note]| {
+                let mut h: Vec<String> = v.iter().map(|n| n.hash.clone()).collect();
+                h.sort();
+                h
+            };
+            let mine = hashes(&k.snapshot()?.receipts);
+            let theirs = hashes(&filled_by_second.receipts);
+            ensure!(mine == theirs, "both keepers hold the same receipts");
+            Ok(())
+        })
+    })?;
+
+    // 10. The real Pyth account. The local validator runs offline, so the
+    // mainnet SOL/USD PriceUpdateV2 bytes are loaded with surfpool's
+    // `surfnet_setAccount` at the address the program is built with, and a
+    // stand-in pusher keeps its publish time at chain time. The keeper reads
+    // it with `price: "pyth"`, a draw lands, and a price drop is liquidated.
+    let raw = mainnet_pyth_account()?;
+    let at = |o: usize| i64::from_le_bytes(raw[o..o + 8].try_into().unwrap());
+    let (real, conf) = (at(73), at(81) as u64);
+    let expo = i32::from_le_bytes(raw[89..93].try_into()?);
+    ensure!(expo == -8, "SOL/USD is quoted at 1e-8, not {expo}");
+    println!("LEND mainnet SOL/USD: {real} x 1e-8 +- {conf}");
+    let wanted = std::sync::atomic::AtomicI64::new(real);
+    let pushing = AtomicBool::new(true);
+    let rpc_url = ports.rpc_url();
+    let pyth_cfg: Lend = serde_json::from_value(json!({
+        "program_id": keeler_lend::ID.to_string(),
+        "network": NET,
+        "origins": [ORIGIN],
+        "pause_file": dir.join("pause"),
+        "price": "pyth",
+        "limits": { "tickets_per_wallet_hour": 100 }
+    }))?;
+    pyth_cfg.check()?;
+    let pyth_probe = Probe {
+        inner: &pyth_chain,
+        drop_send: AtomicBool::new(false),
+        builds: Mutex::new(Vec::new()),
+    };
+    thread::scope(|s| {
+        s.spawn(|| {
+            while pushing.load(Ordering::Relaxed) {
+                if let Err(e) = push_pyth(&rpc_url, &raw, wanted.load(Ordering::Relaxed)) {
+                    println!("pyth push: {e:#}");
+                }
+                sleep(Duration::from_secs(5));
+            }
+        });
+        let out = session(&pyth_probe, &pyth_cfg, &state, |k| {
+            sleep(Duration::from_secs(1));
+            // The chain layer: 1e-8 USD per SOL is 10 tUSD base units per
+            // lamport x 1e12.
+            let q = pyth_chain.quote(1)?;
+            ensure!(
+                q.low == (real as u64 - conf) * 10 && q.high == (real as u64 + conf) * 10,
+                "quote {q:?}"
+            );
+            ensure!(env.now().abs_diff(q.published as u64) <= 10, "fresh");
+            let pos = 2;
+            // 0.2 SOL at the real price, 4 tUSD drawn.
+            let id = env.intent(&borrower, purpose::DEPOSIT, pos, SOL / 5)?;
+            settle(k, "deposit (pyth)", 180, filled(&id))?;
+            let draw = vec![
+                ("op", "draw".to_string()),
+                ("vault", "1".into()),
+                ("position", pos.to_string()),
+                ("borrow", (4 * USD).to_string()),
+                ("withdraw", "0".into()),
+            ];
+            let (st, v, tx) = timed("draw build on the Pyth price", || {
+                env.build(&borrower, &draw)
+            })?;
+            ensure!(st == 200, "draw: {v}");
+            let bound: u64 = v["bound"].as_str().context("bound")?.parse()?;
+            ensure!(bound < q.low && bound > q.low / 100 * 99, "bound {bound}");
+            env.send(tx.unwrap())?;
+            settle(k, "draw resolved (pyth)", 120, |b| b.pending.is_empty())?;
+            // $15: 0.2 SOL is worth $3 against $4 of debt. The liquidation
+            // takes the collateral; what it cannot cover is bad debt, which
+            // halts borrowing.
+            wanted.store(15_0000_0000, Ordering::Relaxed);
+            timed("liquidation on the Pyth price", || {
+                settle(k, "liquidation (pyth)", 180, |b| {
+                    b.pending.is_empty()
+                        && pyth_probe.builds.lock().unwrap().contains(&Op::Liquidate)
+                })
+            })?;
+            let owed = debt(k, &borrower.addr(), pos, env.now());
+            ensure!(owed < 2 * USD, "liquidated: owed {owed}");
+            ensure!(env.build(&borrower, &draw)?.0 == 403, "borrowing halts");
+            Ok(())
+        });
+        pushing.store(false, Ordering::Relaxed);
+        out
     })?;
     println!("LEND times:");
     for (name, t) in TIMES.lock().unwrap().iter() {

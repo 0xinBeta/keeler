@@ -9,8 +9,9 @@
 //! `KEELER_WRITE_FIXTURES=1 cargo test -p keeler --test fixtures`.
 use std::path::PathBuf;
 
+use keeler::chain::Cluster;
 use keeler::trader::{quote_message_for, sign_quote, signed_by};
-use keeler_core::rfq::Rfq;
+use keeler_core::rfq::{quote_message, Quote, Rfq};
 use serde_json::{json, Value};
 use solana_address::Address;
 use solana_instruction::Instruction;
@@ -143,9 +144,12 @@ fn example_build() -> bool {
 }
 
 fn check(name: &str, got: Value) {
-    if !example_build() {
-        return;
+    if example_build() {
+        write_or_compare(name, got);
     }
+}
+
+fn write_or_compare(name: &str, got: Value) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../web/tests/fixtures")
         .join(name);
@@ -253,16 +257,46 @@ fn quote_signature() {
         trader: Address::new_from_array([4; 32]).to_string(),
     };
     let (buy_amount, expiry) = (2_997_000, 1_763_900_030);
-    let q = sign_quote(&dealer, &rfq, buy_amount, expiry).unwrap();
-    assert!(signed_by(&dealer.pubkey(), &rfq, &q));
+    let net = Cluster::Devnet;
+    // Under the example program ID whatever this build's is: the vector is
+    // the core message, which the dealer's own signing matches below.
+    let program = Address::from_str_const(EXAMPLE_ID);
+    let key = |s: &str| *s.parse::<Address>().unwrap().as_array();
+    let message = quote_message(
+        net.byte(),
+        program.as_array(),
+        &key(&rfq.sell_mint),
+        &key(&rfq.buy_mint),
+        &key(&rfq.trader),
+        rfq.sell_amount,
+        buy_amount,
+        expiry,
+    );
+    let q = Quote {
+        buy_amount,
+        expiry,
+        signature: dealer.sign_message(&message).as_ref().try_into().unwrap(),
+    };
+    if swap_program::ID == program {
+        assert_eq!(
+            quote_message_for(net, &rfq, buy_amount, expiry).unwrap(),
+            message
+        );
+        assert_eq!(
+            sign_quote(&dealer, net, &rfq, buy_amount, expiry).unwrap(),
+            q
+        );
+        assert!(signed_by(&dealer.pubkey(), net, &rfq, &q));
+    }
     let mut wire = serde_json::to_value(q).unwrap();
     wire["buy_amount"] = json!(buy_amount.to_string());
-    check(
+    write_or_compare(
         "quote-sig.json",
         json!({
-            "about": "Ed25519 over message_hex by pubkey. message = \"keeler-quote-v1\" || program_id || sell_mint || buy_mint || trader || sell_amount u64 LE || buy_amount u64 LE || expiry u64 LE (167 bytes). http_reply is the dealer's POST /quote reply for this request.",
+            "about": "Ed25519 over message_hex by pubkey. message = \"keeler-quote-v2\" || network u8 (0 local, 1 devnet, 2 mainnet) || program_id || sell_mint || buy_mint || trader || sell_amount u64 LE || buy_amount u64 LE || expiry u64 LE (168 bytes). http_reply is the dealer's POST /quote reply for this request.",
             "inputs": {
-                "program_id": swap_program::ID.to_string(),
+                "network": "devnet",
+                "program_id": EXAMPLE_ID,
                 "sell_mint": rfq.sell_mint,
                 "buy_mint": rfq.buy_mint,
                 "trader": rfq.trader,
@@ -271,7 +305,7 @@ fn quote_signature() {
                 "expiry": expiry,
                 "dealer_keypair_seed": hex(&[1; 32]),
             },
-            "message_hex": hex(&quote_message_for(&rfq, buy_amount, expiry).unwrap()),
+            "message_hex": hex(&message),
             "pubkey": dealer.pubkey().to_string(),
             "signature_hex": hex(&q.signature),
             "http_reply": {"quote": wire},
