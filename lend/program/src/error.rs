@@ -1,5 +1,5 @@
 //! Program error codes, `ProgramError::Custom(code)`. Each instruction owns a
-//! range of 100 so pieces of work never collide:
+//! range of 100 so codes never collide:
 //!
 //! | Range | Owner |
 //! | --- | --- |

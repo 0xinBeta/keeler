@@ -4,7 +4,7 @@ A lending pool with private amounts on Helius Privacy Rings (custom Xark circuit
 Groth16 in a Pinocchio program that moves notes through the shielded pool), with private swaps as
 a second, smaller part.
 
-![Supply, borrow, a price drop and a liquidation, then the explorer showing only encrypted notes](docs/demo.gif)
+![A supply, a borrow, a price drop and a liquidation on devnet](docs/demo.gif)
 
 - Devnet lend program: [`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`](https://explorer.solana.com/address/CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL?cluster=devnet)
 - Live page (devnet): https://keeler.xterminbeta.workers.dev
@@ -21,7 +21,7 @@ a second, smaller part.
 | Health and liquidation price of a position | hidden | seen | hidden | its own only |
 | Pool size and utilisation | coarse figures only (two significant figures, `/lend/pools`) | seen | estimable from the price indices at their own operations | as other users |
 | The liquidator's other funds | hidden | seen | hidden | hidden, if the keeper liquidates from a note of exactly the repay (it does; not enforced) |
-| Anything a user later unshields to a public account | seen | seen | seen | seen |
+| The amount of any move between a public and a private balance, in either direction (shielding in, unshielding out) | seen | seen | seen | seen |
 
 The Worker that serves the page also sees each wallet's account view in clear
 (`docs/threat-model.md`).
@@ -31,8 +31,8 @@ anyone can forge a proof; the circuits are unaudited and Xark is experimental; o
 keeper posts the collateral price itself (a mainnet build cannot have that account and reads Pyth);
 the keepers are a trusted set that sees every amount and can halt the pool. Before mainnet:
 an external audit of the circuits, program, keeper and page; a multi-party key ceremony for the 11
-lend circuits; the upgrade authority handed to a Squads multisig; two always-on keeper hosts; and
-the fixes the internal audit decided (`docs/audit-2026-11-25.md`, `docs/mainnet-runbook.md`).
+lend circuits; the upgrade authority handed to a Squads multisig; and two always-on keeper hosts
+(`docs/mainnet-runbook.md`; the internal review's findings are in `docs/audit-2026-11-25.md`).
 
 Built with Claude Code.
 
@@ -93,21 +93,24 @@ flowchart LR
   then supplies. Every build is recorded before it is sent; the chain decides which landed. A
   standby follows the others' transactions and takes over tickets and liquidations when the
   primary stops.
-- **Lend program** (`lend/program/`). Pinocchio. Each instruction checks its signers (a keeper on
-  every reserve spend and every fill), canonical PDAs, the pinned pool viewing key, a public `now`
-  within 120 s of the clock, and for `draw` and `liquidate` the price bound against the price
-  account; then verifies the Groth16 proof against public inputs it computes itself, and signs the
-  shielded-pool CPI for the pool and user PDAs.
+- **Lend program** (`lend/program/`). Pinocchio. Each instruction that spends a reserve checks a
+  keeper signer, canonical PDAs, the pinned pool viewing key, a public `now` within 120 s of the
+  clock, and for `draw` and `liquidate` the price bound against the price account. Deposits check
+  a keeper signer and `now` and take no pool key; `intent`, `cancel_intent` and `close` are signed
+  by the user and take neither. Each instruction then verifies the Groth16 proof against public
+  inputs it computes itself, and signs the shielded-pool CPI for the pool and user PDAs.
 - **Shielded pool program** (Privacy Rings, Default Ring). Holds every note; verifies its own
-  transact proof; nullifiers stop double spends and the reserve's unique address.
+  transact proof. Its nullifiers stop double spends, and it lets the reserve's fixed address be
+  created only once, so each pool has one reserve note.
 - **Indexer** (Photon). Serves notes and proof data to the page and the keeper; the keeper reads
   its peers' outputs from it and checks each against the hash on chain.
 - **Prover**. The shielded pool's transact proofs come from Helius' prover under the network's
   signed TEE policy (the local `zolana` prover on a local network). The lend circuits are never
   proved there: the browser proves its three, the keeper proves the rest natively.
 - **Price account**. A mainnet build reads only the vault's pinned Pyth `PriceUpdateV2` account
-  (receiver-owned, fully verified, pinned feed id, at most 90 s old). A `test-price` build, which
-  devnet uses, also accepts a program-owned test price account that keepers write.
+  (receiver-owned, fully verified, pinned feed id, published within 90 s of the cluster clock). A
+  `test-price` build, which devnet uses, also accepts a program-owned test price account that
+  keepers write.
 
 ## Circuits
 
@@ -124,7 +127,7 @@ Eleven circuits, one verifying key each (`lend/program/src/circuits/`, `lend/sdk
 | `deposit_open` | keeper | intent | position | A position for the maker with the intent's id, all of the collateral, no debt, at least the vault minimum |
 | `deposit_add` | keeper | position, intent | position | Only into the maker's own position, the one the intent names |
 | `draw` | keeper, owner signs | position, reserve | position, reserve, debt payout, collateral payout | Only the owner; afterwards debt at most the collateral factor (80%) of the collateral at the bound; utilisation at most 95%; vault minimums; both payouts always present |
-| `repay` | keeper | position, reserve, intent | position, reserve, change | Only the maker's own position; debt shares removed by the repay rule; the rest back to the maker |
+| `repay` | keeper | position, reserve, intent | position, reserve, change | Only the maker's own position; debt shares removed by the repay rule, and a partial repay must remove at least one; the rest back to the maker |
 | `liquidate` | keeper | position, reserve, the keeper's note | position, reserve, change, collateral payout | Past the threshold (85%) at the bound; `0 < x <= debt`; at least one debt share removed; payout `floor((x + 1% of x) × 1e12 / bound)` capped at the collateral; not left healthier than the threshold unless above the max limit (90%) |
 | `close` | browser | a position with no debt | payout | Only the owner; zero debt shares; all the collateral back |
 
@@ -133,8 +136,9 @@ the mint, and takes the keeper's fresh salt. Every keeper-proved circuit that se
 its output blindings from a note that user holds (the intent, receipt or position), so the user
 can recompute its own outputs. The maths is
 `core/src/lend.rs`, with shared vectors (`web/tests/fixtures/lend-vectors.json`) that the Rust
-reference, the circuits (natively) and the page's TypeScript twin all pass. Why these shapes:
-`docs/design-decisions.md`.
+reference and the page's TypeScript twin pass; the circuits, run natively, pass the vectors of
+the functions they implement (the tests in `circuits/math.rs` and `circuits/vault.rs`). Why these
+shapes: `docs/design-decisions.md`.
 
 ## Measured
 
@@ -146,11 +150,11 @@ same test were running. Transaction size is the v1 wire size against the 4,096-b
 | Instruction | Constraints | Native proving | Compute units | v1 tx bytes (of 4,096) | Ix data bytes | Accounts (ix / tx) |
 | --- | --- | --- | --- | --- | --- | --- |
 | `init_reserve` | 20,569 | 0.90 s | 249,865 | 1,236 | 789 | 9 / 8 |
-| `intent` | 14,097 | 0.91 s | 245,202 | 1,244 | 893 | 9 / 7 |
+| `intent` | 14,097 | 0.91, 0.92 s | 245,202, 245,350 | 1,244 | 893 | 9 / 7 |
 | `cancel_intent` | 7,179 | 0.77 s | 244,561 | 977 | 627 | 8 / 7 |
 | `supply` | 33,652 | 1.93 to 2.13 s | 267,174 to 268,913 | 1,553 | 1,137 | 10 / 9 |
 | `redeem` (partial / full) | 35,302 | 2.08 / 2.09 s | 269,435 / 272,070 | 1,767 | 1,254 | 11 / 10 |
-| `deposit_open` | 14,546 | 0.94 s | 245,220 | 1,148 | 798 | 8 / 7 |
+| `deposit_open` | 14,546 | 0.94, 0.95 s | 245,220 | 1,148 | 798 | 8 / 7 |
 | `deposit_add` | 23,859 | 1.26 s | 249,409 | 1,214 | 831 | 9 / 8 |
 | `draw` (borrow) | 45,657 | 2.39 to 2.43 s | 276,718 to 280,570 | 1,949 | 1,403 | 12 / 11 |
 | `repay` (partial / full) | 46,929 | 2.48 / 2.51 s | 274,617 / 276,943 | 1,760 | 1,311 | 11 / 10 |
@@ -184,12 +188,13 @@ sends v1 transactions.
 
 ## Build and run
 
-Needs macOS on Apple silicon or Linux x86-64, git, curl, Python 3.11 or newer, rustup, the
-Solana/Agave CLI (`cargo build-sbf`), Node and pnpm. Pinned in the repository: Rust 1.98.1
+Needs macOS on Apple silicon (every secret beyond a local network is read from the macOS Keychain
+with `security`), git, curl, Python 3.11 or newer, rustup, the Solana/Agave CLI (`cargo build-sbf`),
+Node and pnpm. Pinned in the repository: Rust 1.98.1
 (`rust-toolchain.toml`, `lend/rust-toolchain.toml`); `helius-labs/privacy-ring-examples` at
 `9e5d69ade7e0c107a2929306d3b758a8969e1089` and SBF platform tools v1.54 (`scripts/setup.sh`,
-`scripts/setup-lend.sh`); `xark` 0.3.1 and the `spr-*` crates 0.10.0, built with the `zolana` CLI
-`cli-v0.10.0` (`lend/Cargo.toml`); `@heliuslabs/spr` 0.9.0-alpha (`web/package.json`).
+`scripts/setup-lend.sh`); `xark` 0.3.1, the `spr-*` crates 0.10.0 (`spr-hasher` 0.8.0), built with
+the `zolana` CLI `cli-v0.10.0` (`lend/Cargo.toml`); `@heliuslabs/spr` 0.9.0-alpha (`web/package.json`).
 
 ```sh
 scripts/setup.sh        # the pinned swap example into .tools/, .tools/env; idempotent, slow the first time
@@ -216,7 +221,8 @@ source .tools/env && cargo test --release -p keeler --test e2e -- --nocapture   
 
 The page against a real local keeper: `scripts/lend-web-stack.sh start` (local network, keeper,
 Worker), then `cd web && pnpm e2e:lend`. Local networks use a port offset and stop what they start.
-Every worktree needs its own `.tools/` and `target/`, several GB each.
+The scripts read the tool paths from the main checkout's `.tools/env`; each checkout builds its own
+`target/` (several GB).
 
 Devnet and mainnet deploys: `docs/lend-deploy.md` (`scripts/deploy-lend-devnet.sh`) and
 `docs/mainnet-runbook.md` (`scripts/deploy-mainnet.sh`, which refuses test keys, the test price, a
@@ -244,7 +250,7 @@ dirty tree and a single-key upgrade authority).
 - `docs/design-decisions.md`: the reasons behind the reserve note, fixed outputs, the keeper
   signature, the price bound, keeper-built transactions and liquidation sizing.
 - `docs/notes-for-xark-builders.md`: Xark pitfalls hit here and the spike's measurements.
-- `docs/audit-2026-11-25.md`: the internal audit and its decisions.
+- `docs/audit-2026-11-25.md`: the internal security review and its decisions.
 - `docs/plan-lend.md`: the lending design, the keeper set and the pool key.
 - `docs/lend-keeper.md`, `docs/lend-api.md`: running the keeper; the page-keeper contract.
 - `docs/mainnet-runbook.md`, `docs/lend-deploy.md`: deploys.
@@ -261,7 +267,7 @@ dirty tree and a single-key upgrade authority).
 - An intent's expiry has no upper bound in the circuit; the page uses the ticket's.
 - The liquidated owner can derive the blinding of the liquidator's change note; the keeper
   liquidates from a note of exactly the repay so that change is zero.
-- The accepted audit findings P-1, K-2 and W-3, and the rest of `docs/threat-model.md`.
+- The accepted review findings K-2 and W-3, and the rest of `docs/threat-model.md`.
 
 ## Swaps
 
@@ -362,5 +368,6 @@ rescans the order history on every poll.
 ## Licence and credits
 
 Apache-2.0 (`LICENSE`). The swap side runs Helius' `privacy-ring-examples` swap program, fetched
-at a pinned commit and patched (`patches/swap.patch`), not copied into this repository. Built on Helius Privacy Rings (`spr-*`,
+at a pinned commit and patched (`patches/swap.patch`), not copied; five test and SDK helper files
+derive from that repository (`NOTICE`). Built on Helius Privacy Rings (`spr-*`,
 `@heliuslabs/spr`), Blueshift's Xark, and Pinocchio.

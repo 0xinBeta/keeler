@@ -188,14 +188,16 @@ transaction may still land. Each pass settles the records first, then runs the m
    the repay, made first when there is none by one self-transfer of exactly that amount (split from
    the smallest larger note, else merged from the four largest) and waited for up to 30 s (an
    empty change slot: see `lend/AGENTS.md`). The funds are the debt-token notes at the keeper's
-   lend address (its key under the pool viewing key). Above the
-   max limit the whole debt is repaid. A position the last liquidation left a hair past the
-   threshold (repay under `min_repay`, or under one debt share) is left. A liquidation that fails
-   is logged and that position waits 60 s, its funds note given back at once; the fills go on
-   meanwhile. A liquidation that failed because another transaction (an owner build, a peer's
+   lend address (its key under the pool viewing key). Above the max limit it repays the largest
+   amount up to the whole debt whose payout fits the collateral. A position the last liquidation
+   left a hair past the threshold (repay under `min_repay`, or under one debt share) is left. A
+   liquidation that fails is logged and that position waits 60 s, its funds note given back at
+   once; the fills go on meanwhile. A liquidation that failed because another transaction (an owner build, a peer's
    fill) spent its reserve or position first is tried again next pass on the new notes, without
-   the 60 s wait, and owner builds get 409 until it has run. Liquidations run even while a wallet holds the reservation, and while a peer's
-   history cannot be read (that is logged and read again next pass).
+   the 60 s wait; owner builds get 409 until it has run, and no fill runs in the pass that lost
+   the reserve, since its notes are stale. Liquidations run even while a wallet holds the
+   reservation, and while a peer's history cannot be read (that is logged and read again next
+   pass).
 2. Repay fills, then deposit fills (into an existing position, then new positions).
 3. Supply fills, oldest ticket first within each kind. Owner builds (`/lend/build`) take the lane
    between passes.
@@ -217,12 +219,16 @@ An owner build reserves the pool for its wallet for `reservation_secs`: other wa
 keeper's fills wait, liquidations do not. A later build by the same wallet does not extend it. It
 ends when the build lands or the time runs out. A wallet that lets it run out unused gets 409 for
 `reservation_secs`, doubled for each earlier reservation it let lapse unused in the last hour (20,
-40, 80 s ... at most an hour); a build that lands after its reservation ran out (an honest user a
-second late) is not counted. After any unused lapse, every waiting fill, supply included, runs
-before the next owner build. What remains: N wallets taking turns hold the pool about N x 160 s
-an hour with the default 20 s. An owner build checks, in order: the wallet owns the receipt or
+40, 80 s ... at most an hour). A build that lands after its reservation ran out (an honest user a
+second late) is not counted, nor is a reservation cut short because another transaction (a
+liquidation, a peer's fill) spent the notes its build needed. After any unused lapse, every
+waiting fill, supply included, runs before the next owner build. What remains: N wallets whose
+builds are never sent hold the pool about N x 160 s an hour with the default 20 s; a wallet that
+sends every build just late is forgiven each time, so it can hold one reservation per build, up
+to `builds_per_wallet_hour`. An owner build checks, in order: the wallet owns the receipt or
 position (404), `builds_per_wallet_hour` (429), the lane and reservation (409), then counts
-toward `builds_per_wallet_hour` (a 409 does not), the minimums (422), the price age (412, draws),
+toward `builds_per_wallet_hour` (the refusals before this point do not; every later one does),
+the minimums (422), the price age (412, draws),
 a borrow against the pool's bad debt at that fresh price (403), the vault minimums (422) and
 health (423), and last the pool's
 liquidity (410) at the amount rounded up to two significant figures, so a refusal tells little

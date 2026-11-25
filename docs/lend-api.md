@@ -245,7 +245,7 @@ with the 128-byte compressed proof.
 | cancel_intent args | proof, viewing [33], user_bump, expiry u64 |
 | redeem args | proof, mint [32], pool_viewing [33], pool_bump, owner_viewing [33], user_bump, now u64 |
 | draw args | proof, vault u64, pool_viewing [33], pool_bump, owner_viewing [33], user_bump, now u64, bound u64 |
-| liquidate args | proof, vault u64, pool_viewing [33], pool_bump, owner [32], owner_viewing [33], user_bump, now u64, bound u64 (the page reads only `bound`, to report a liquidation) |
+| liquidate args | proof, vault u64, pool_viewing [33], pool_bump, owner [32], owner_viewing [33], user_bump, now u64, bound u64 (the page reads `now` and `bound`, to report a liquidation) |
 | close args | proof, vault u64, viewing [33], user_bump |
 | Keeper-built account head | keeper (writable signer, fee payer) at 0, owner (read-only signer) at 1; draw always has the price account at 2 |
 | Owner-built account head | intent, cancel_intent and close: the owner (writable signer, fee payer) at 0 |
