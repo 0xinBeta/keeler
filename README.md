@@ -192,15 +192,20 @@ sends v1 transactions.
 
 Needs macOS on Apple silicon (every secret beyond a local network is read from the macOS Keychain
 with `security`), git, curl, Python 3.11 or newer, rustup, the Solana/Agave CLI (`cargo build-sbf`),
-`wasm-pack` (the circuit compiler builds the browser packages with it), Node and pnpm. Pinned in the repository: Rust 1.98.1
-(`rust-toolchain.toml`, `lend/rust-toolchain.toml`); `helius-labs/privacy-ring-examples` at
-`9e5d69ade7e0c107a2929306d3b758a8969e1089` and SBF platform tools v1.54 (`scripts/setup.sh`,
-`scripts/setup-lend.sh`); `xark` 0.3.1, the `spr-*` crates 0.10.0 (`spr-hasher` 0.8.0), built with
-the `zolana` CLI `cli-v0.10.0` (`lend/Cargo.toml`); `@heliuslabs/spr` 0.9.0-alpha (`web/package.json`);
-Node 25.4.0 (`.node-version`) and pnpm 10.28.2 (`packageManager` in `web/package.json` and
-`worker/package.json`); Agave 4.1.2 and `wasm-pack` 0.15.1, the versions CI
-installs (`AGAVE_VERSION`, `WASM_PACK_VERSION` in `.github/workflows/ci.yml`). Outside the checkout, `scripts/setup.sh` downloads the Zolana prover,
-Photon and surfpool into `~/.config/zolana/cache` and the provers use `~/.config/zolana/proving-keys`.
+`wasm-pack` (the circuit compiler builds the browser packages with it), Node and pnpm. The setup
+scripts and the gating tests also run on Linux x86-64 (CI); the local-network and end-to-end tests
+have been run on macOS only.
+
+Pinned in the repository: Rust 1.98.1 (`rust-toolchain.toml`, `lend/rust-toolchain.toml`);
+`helius-labs/privacy-ring-examples` at `9e5d69ade7e0c107a2929306d3b758a8969e1089` and SBF platform
+tools v1.54 (`scripts/setup.sh`, `scripts/setup-lend.sh`); `xark` 0.3.1, the `spr-*` crates 0.10.0
+(`spr-hasher` 0.8.0), built with the `zolana` CLI `cli-v0.10.0` (`lend/Cargo.toml`);
+`@heliuslabs/spr` 0.9.0-alpha (`web/package.json`); Node 25.4.0 (`.node-version`); pnpm 10.28.2
+(`packageManager` in `web/package.json` and `worker/package.json`); Agave 4.1.2 and `wasm-pack`
+0.15.1, the versions CI installs (`AGAVE_VERSION`, `WASM_PACK_VERSION` in
+`.github/workflows/ci.yml`). Outside the checkout, `scripts/setup.sh` downloads the Zolana prover,
+Photon and surfpool into `~/.config/zolana/cache`, and the provers keep their keys in
+`~/.config/zolana/proving-keys`.
 
 ```sh
 scripts/setup.sh        # the pinned swap example into .tools/, .tools/env; idempotent, slow the first time
