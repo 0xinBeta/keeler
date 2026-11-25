@@ -65,7 +65,7 @@ let page: Page;
 const problems: string[] = [];
 
 async function open() {
-  await page.goto("/");
+  await page.goto("/#swap");
   const p = panel(page);
   await p.getByRole("button", { name: /Browser test wallet/ }).click();
   await p.getByRole("button", { name: "Sign to unlock" }).click();

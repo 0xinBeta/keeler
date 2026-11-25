@@ -82,7 +82,7 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
     document.addEventListener("securitypolicyviolation", (e) => console.error(`CSP blocked ${e.violatedDirective}: ${e.blockedURI}`));
   });
 
-  const main = await page.goto("/");
+  const main = await page.goto("/#swap");
   expect(main?.headers()["content-security-policy"]).toContain("'wasm-unsafe-eval'");
 
   // Wallet, unlock, test tokens (a new wallet has no SOL for the fee), register.

@@ -8,30 +8,31 @@ import { Panel } from "./Panel";
 import type { Tab } from "./Panel";
 import type { DealerLight } from "./ring";
 import { RingCanvas } from "./RingCanvas";
-import { errorText } from "./shared";
+import { errorText, Logo, NetworkPill } from "./shared";
 
-const PILL = { local: "Local", devnet: "Devnet beta", mainnet: "Mainnet" } as const;
 const OPEN: Order["status"][] = ["pending", "locked"];
 
-export function NetworkPill({ config }: { config: Config | null }) {
-  if (!config) return null;
-  return (
-    <span className="net-pill">
-      <span className="net-dot" aria-hidden="true" />
-      {PILL[config.network]}
-    </span>
-  );
+/** The app's views, each with its own hash; any other hash shows the landing. */
+export const ROUTES = ["earn", "borrow", "swap", "balances", "activity"] as const;
+export type Route = (typeof ROUTES)[number];
+const routeOf = (hash: string): Route | null => ROUTES.find((r) => `#${r}` === hash) ?? null;
+const isTab = (r: Route | null): r is Tab => r !== null && r !== "activity";
+
+/** The route the location's hash names, or null for the landing. */
+function useRoute(): Route | null {
+  const [route, setRoute] = useState(() => routeOf(location.hash));
+  useEffect(() => {
+    const read = () => setRoute(routeOf(location.hash));
+    window.addEventListener("hashchange", read);
+    return () => window.removeEventListener("hashchange", read);
+  }, []);
+  return route;
 }
 
-export function Logo() {
-  return (
-    <svg viewBox="0 0 40 24" width="34" height="20" aria-hidden="true" className="logo">
-      <ellipse cx="20" cy="12" rx="17" ry="7" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <ellipse cx="20" cy="12" rx="12" ry="4.6" fill="none" stroke="currentColor" strokeWidth="1.6" opacity=".55" />
-      <circle cx="31.5" cy="8.6" r="1.9" fill="#F4EBD6" />
-    </svg>
-  );
-}
+/** Shows a route by setting the hash, so the back button walks the views. */
+export const go = (route: Route) => {
+  location.hash = route;
+};
 
 export function App({ keeler }: { keeler: Keeler }) {
   const [config, setConfig] = useState<Config | null>(null);
@@ -45,6 +46,8 @@ export function App({ keeler }: { keeler: Keeler }) {
   const [settled, setSettled] = useState(0);
   const panel = useRef<HTMLElement>(null);
   const hero = useRef<HTMLElement>(null);
+  const heroSlot = useRef<HTMLDivElement>(null);
+  const appHero = useRef<HTMLDivElement>(null);
   const seen = useRef(new Map<string, Order["status"]>());
   const inflight = useRef<Promise<Order[]> | null>(null);
 
@@ -190,14 +193,22 @@ export function App({ keeler }: { keeler: Keeler }) {
     };
   }, [lendPending, owing, refreshAccount]);
 
-  const [tab, setTab] = useState<Tab>("swap");
+  const route = useRoute();
+  const view = route ? "app" : "landing";
+  const [tab, setTab] = useState<Tab>(isTab(route) ? route : "swap");
+  if (isTab(route) && route !== tab) setTab(route);
   const ringInput = useMemo(() => ({ dealers: lights, proving, settled }), [lights, proving, settled]);
-  const openTab = useCallback((t: Tab) => {
-    setTab(t);
-    panel.current?.focus();
-    panel.current?.scrollIntoView({ block: "center" });
-  }, []);
-  const startSwap = useCallback(() => openTab("swap"), [openTab]);
+  const startSwap = useCallback(() => go("swap"), []);
+
+  const shownView = useRef(view);
+  useEffect(() => {
+    if (shownView.current === view) return;
+    shownView.current = view;
+    const anchor = isTab(route) ? null : document.getElementById(location.hash.slice(1));
+    if (anchor) anchor.scrollIntoView();
+    else window.scrollTo(0, 0);
+    if (view === "app" && !panel.current?.contains(document.activeElement)) panel.current?.focus({ preventScroll: true });
+  }, [view, route]);
 
   return (
     <>
@@ -205,7 +216,11 @@ export function App({ keeler }: { keeler: Keeler }) {
         Skip to the swap
       </a>
       <div className="stage">
-        <RingCanvas mode="hero" input={ringInput} anchor={panel} hero={hero} />
+        {view === "landing" ? (
+          <RingCanvas key="landing" mode="hero" input={ringInput} anchor={heroSlot} hero={hero} />
+        ) : (
+          <RingCanvas key="app" mode="hero" input={ringInput} anchor={panel} hero={appHero} />
+        )}
         <header className="top">
           <a className="wordmark" href="#top" aria-label="Keeler, top of page">
             <Logo />
@@ -221,107 +236,118 @@ export function App({ keeler }: { keeler: Keeler }) {
           <NetworkPill config={config} />
         </header>
         <main id="top">
-          <section className="hero" ref={hero} aria-labelledby="hero-title">
-            <div className="intro">
-              <h1 id="hero-title">Swap without showing your hand.</h1>
-              <p className="lede">
-                Keeler gets you signed quotes from dealers, checks them against a reference price, and settles the best
-                one privately on Solana. The chain sees that you traded. It never sees how much, or at what price.
-              </p>
-              <div className="pills">
-                <button className="pill pill-gold" onClick={startSwap}>
-                  Start a swap
-                </button>
-                <a className="pill pill-outline" href="#how">
-                  See how it works
-                </a>
-              </div>
-              <ul className="chips" aria-label="Foundations">
-                <li>Built on Helius Privacy Rings</li>
-                <li>Settles on Solana</li>
-                <li>Order proved in your browser</li>
-              </ul>
-            </div>
-            <section className="panel" id="swap" ref={panel} tabIndex={-1} aria-label="Private swap">
-              {config ? (
-                <Panel
-                  keeler={keeler}
-                  config={config}
-                  balances={balances}
-                  orders={orders}
-                  chainOffset={chainOffset}
-                  onReady={() => setReady(true)}
-                  refreshBalances={refreshBalances}
-                  refreshOrders={refreshOrders}
-                  reloadConfig={reloadConfig}
-                  setLights={setLights}
-                  setProving={setProving}
-                  tab={tab}
-                  setTab={setTab}
-                  market={market}
-                  account={account}
-                  refreshLend={refreshLend}
-                />
-              ) : configError ? (
-                <div className="panel-body">
-                  <h2 className="panel-title">Keeler is not reachable</h2>
-                  <p className="note note-error" role="alert">
-                    {configError}
-                  </p>
-                  <button className="btn btn-primary" onClick={() => location.reload()}>
-                    Reload the page
-                  </button>
-                </div>
-              ) : (
-                <div className="panel-body" aria-busy="true">
-                  <p className="muted">Loading…</p>
-                </div>
-              )}
-            </section>
-          </section>
-          <Facts />
-          {ready && (
-            <Orders
-              keeler={keeler}
-              orders={orders}
-              chainOffset={chainOffset}
-              refresh={refreshOrders}
-              refreshBalances={refreshBalances}
-              rescan={() =>
-                keeler.rescanOrders().then((list) => {
-                  for (const o of list) seen.current.set(o.id, o.status);
-                  setOrders(list);
-                  return list;
-                })
-              }
-            />
-          )}
-          {ready && lend && (
-            <LendActivity
-              lend={lend}
-              balances={balances}
-              market={market}
-              account={account}
-              chainOffset={chainOffset}
-              refreshLend={refreshLend}
-              refreshBalances={refreshBalances}
-            />
-          )}
-          <Features />
-          <ChainSees pair={pairOf(market)} />
-          <Steps />
-          {lend && (
+          {view === "landing" && (
             <>
-              <LendFeatures market={market} onOpen={openTab} pair={pairOf(market)} />
-              <LendPrivacy pair={pairOf(market)} />
-              <LendLiquidation pair={pairOf(market)} />
-              <LendNumbers />
+              <section className="hero" ref={hero} aria-labelledby="hero-title">
+                <div className="intro">
+                  <h1 id="hero-title">Swap without showing your hand.</h1>
+                  <p className="lede">
+                    Keeler gets you signed quotes from dealers, checks them against a reference price, and settles the best
+                    one privately on Solana. The chain sees that you traded. It never sees how much, or at what price.
+                  </p>
+                  <div className="pills">
+                    <button className="pill pill-gold" onClick={startSwap}>
+                      Start a swap
+                    </button>
+                    <a className="pill pill-outline" href="#how">
+                      See how it works
+                    </a>
+                  </div>
+                  <ul className="chips" aria-label="Foundations">
+                    <li>Built on Helius Privacy Rings</li>
+                    <li>Settles on Solana</li>
+                    <li>Order proved in your browser</li>
+                  </ul>
+                </div>
+                <div ref={heroSlot} aria-hidden="true" />
+              </section>
+              <Facts />
+              <Features />
+              <ChainSees pair={pairOf(market)} />
+              <Steps />
+              {lend && (
+                <>
+                  <LendFeatures market={market} onOpen={go} pair={pairOf(market)} />
+                  <LendPrivacy pair={pairOf(market)} />
+                  <LendLiquidation pair={pairOf(market)} />
+                  <LendNumbers />
+                </>
+              )}
+              <Audience />
+              <Dealers />
+              <Faq lend={!!lend} pair={pairOf(market)} />
+              <Closing onStart={startSwap} />
             </>
           )}
-          <Audience />
-          <Dealers />
-          <Faq lend={!!lend} pair={pairOf(market)} />
-          <Closing onStart={startSwap} />
+          <div className="app-view" hidden={view !== "app"}>
+            <div className="hero app-hero" ref={appHero}>
+              <section className="panel" id="swap" ref={panel} tabIndex={-1} aria-label="Private swap">
+                {config ? (
+                  <Panel
+                    keeler={keeler}
+                    config={config}
+                    balances={balances}
+                    orders={orders}
+                    chainOffset={chainOffset}
+                    onReady={() => setReady(true)}
+                    refreshBalances={refreshBalances}
+                    refreshOrders={refreshOrders}
+                    reloadConfig={reloadConfig}
+                    setLights={setLights}
+                    setProving={setProving}
+                    tab={tab}
+                    setTab={go}
+                    market={market}
+                    account={account}
+                    refreshLend={refreshLend}
+                  />
+                ) : configError ? (
+                  <div className="panel-body">
+                    <h2 className="panel-title">Keeler is not reachable</h2>
+                    <p className="note note-error" role="alert">
+                      {configError}
+                    </p>
+                    <button className="btn btn-primary" onClick={() => location.reload()}>
+                      Reload the page
+                    </button>
+                  </div>
+                ) : (
+                  <div className="panel-body" aria-busy="true">
+                    <p className="muted">Loading…</p>
+                  </div>
+                )}
+              </section>
+            </div>
+            <div id="activity">
+              {ready && (
+                <Orders
+                  keeler={keeler}
+                  orders={orders}
+                  chainOffset={chainOffset}
+                  refresh={refreshOrders}
+                  refreshBalances={refreshBalances}
+                  rescan={() =>
+                    keeler.rescanOrders().then((list) => {
+                      for (const o of list) seen.current.set(o.id, o.status);
+                      setOrders(list);
+                      return list;
+                    })
+                  }
+                />
+              )}
+              {ready && lend && (
+                <LendActivity
+                  lend={lend}
+                  balances={balances}
+                  market={market}
+                  account={account}
+                  chainOffset={chainOffset}
+                  refreshLend={refreshLend}
+                  refreshBalances={refreshBalances}
+                />
+              )}
+            </div>
+          </div>
         </main>
       </div>
       <footer className="foot">

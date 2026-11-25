@@ -25,7 +25,7 @@ async function setUp(page: Page, search = "") {
   page.on("console", (m) => m.type() === "error" && problems.push(`console: ${m.text()}`));
   page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
   await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.goto(`/${search}`);
+  await page.goto(`/${search}#swap`);
   const p = panel(page);
   await p.getByRole("button", { name: /Browser test wallet/ }).click();
   await p.getByRole("button", { name: "Sign to unlock" }).click();
@@ -189,21 +189,27 @@ test("a keeper that is offline is reported before anything is sent", async ({ pa
   await expect(p.locator("#earn-amt")).toBeVisible();
 });
 
-test("landing: lend sections and FAQ", async ({ page }, info) => {
-  await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.goto("/");
-  await expect(page.getByRole("heading", { name: /Jupiter-style lending\. The chain never sees your position's size\./ })).toBeVisible();
-  await expect(page.getByText(/supply APR now/)).toBeVisible();
-  const privacy = page.locator("#lend-privacy");
-  await privacy.getByRole("button", { name: "On Keeler" }).click();
-  await expect(privacy.getByText("Here they can't.", { exact: false })).toBeVisible();
-  for (const q of ["Who runs the pool?", "What if the keeper is offline?", "What is visible when I lend or borrow?", "Is Keeler on mainnet?"]) {
-    await page.locator("#faq summary", { hasText: q }).click();
-  }
-  await expect(page.getByText(/By design it cannot take your principal/)).toBeVisible();
-  // The lend buttons move focus into the panel (its heading, as on every panel change).
+test("a running operation survives another desk, Activity and the landing", async ({ page }) => {
+  const problems = await setUp(page, "?mock=keeper-stalls");
+  const p = panel(page);
+  await p.getByRole("button", { name: "Earn", exact: true }).click();
+  await p.locator("#earn-amt").fill("50");
+  await p.getByRole("button", { name: "Deposit and earn" }).click();
+  await expect(p.locator(".step-now", { hasText: "Waiting for the keeper" })).toBeVisible({ timeout: 10_000 });
+
+  await p.getByRole("button", { name: "Borrow", exact: true }).click();
+  await expect(page).toHaveURL(/#borrow$/);
+  await expect(p.getByRole("heading", { name: "Borrow privately" })).toBeVisible();
+  await page.evaluate(() => (location.hash = "activity"));
+  await expect(activity(page).locator("li.order-pending")).toHaveCount(1);
+  await page.getByRole("link", { name: "Keeler, top of page" }).click();
+  await expect(page.getByRole("heading", { name: "Swap without showing your hand." })).toBeVisible();
+  await expect(p).toBeHidden();
+
   await page.getByRole("button", { name: "Start earning" }).click();
-  await expect(panel(page).getByRole("heading", { name: "Choose a wallet" })).toBeFocused();
-  for (const [id, name] of [["#lend", "09-landing-lend"], ["#lend-privacy", "10-landing-privacy"], ["#liquidation", "11-landing-liquidation"], [".section-facts", "12-landing-numbers"], ["#faq", "13-landing-faq"]] as const)
-    await shot(page, info, name, id);
+  await expect(page).toHaveURL(/#earn$/);
+  await expect(p.getByRole("heading", { name: "Earn privately" })).toBeVisible();
+  await expect(p.locator(".step-now", { hasText: "Waiting for the keeper" })).toBeVisible();
+  await expect(p.getByRole("button", { name: "Take funds back" })).toBeVisible({ timeout: 45_000 });
+  expect(problems).toEqual([]);
 });
