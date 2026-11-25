@@ -302,11 +302,11 @@ describe("pools", () => {
     expect(vaults[0]).toMatchObject({ id: 1, pool: TUSD, collateralFactorBps: 8000, price: 142_370_000_000n, priceTime: T0, minCollateral: 50_000000n });
   });
 
-  it("prices a vault in debt base units per collateral base unit, and values a debt token without a price at 1", () => {
+  it("prices a vault in debt base units per collateral base unit, and values the debt token at exactly 1, as the program does", () => {
     const sol = assets[1]!;
     const usd = assets[0]!;
     expect(vaultPrice({ [TSOL]: TSOL_PRICE }, sol, usd).price).toBe(142_370_000_000n);
-    expect(vaultPrice({ [TSOL]: TSOL_PRICE, [TUSD]: { price: "200000000", expo: -8, publishTime: T0 - 5 } }, sol, usd)).toEqual({ price: 71_185_000_000n, priceTime: T0 - 5 });
+    expect(vaultPrice({ [TSOL]: TSOL_PRICE, [TUSD]: { price: "98500000", expo: -8, publishTime: T0 - 5 } }, sol, usd)).toEqual({ price: 142_370_000_000n, priceTime: T0 });
     expect(() => vaultPrice({}, sol, usd)).toThrow(/no reference price/);
   });
 
@@ -468,38 +468,81 @@ describe("the keeper account view", () => {
     expect((await W.lend.lendAccount()).receipts).toEqual([]);
   });
 
-  /** Position 42 held (4 tSOL, 100 tUSD of debt), then spent by a liquidation at `bound`; the keeper offers what it left. */
-  async function liquidated(collateral: bigint, debtShares: bigint, bound = 120_000_000_000n) {
+  /**
+   * Position 42 held (4 tSOL, 100 tUSD of debt), then spent at `at` by a liquidation at `bound`; the keeper's view
+   * then lists `next` (its latest note, which may come after later operations), or nothing, as the real keeper does
+   * for a position left empty.
+   */
+  async function liquidated(bound: bigint, next?: [bigint, bigint], at = T0 - 20) {
     await W.lend.supply(TUSD, 1_000000n, () => {}); // opens the session
     const held = await givePosition(W, 42n, 4_000000000n, 100_000000n);
     await W.lend.lendAccount();
     const sig = "7".repeat(88);
     const args = new Uint8Array(ARGS.liquidate.length);
+    args.set(u64Bytes(BigInt(at)), ARGS.liquidate.now);
     args.set(u64Bytes(bound), ARGS.liquidate.bound);
     W.txs.set(sig, wire(W.KEEPER, [{ programAddress: PROGRAM, accounts: [ws(W.KEEPER)], data: Uint8Array.of(TAG.liquidate, ...args) }]));
     W.notes.set(hex(held.hash), { leafIndex: 9n, spentBy: sig });
     W.keeper.account.positions = [];
-    return givePosition(W, 42n, collateral, debtShares);
+    return next ? givePosition(W, 42n, next[0], next[1]) : undefined;
   }
+  // At $28.50 a tSOL, as lend-math's `liquidate` (the program's) computes it.
+  const PARTIAL = { at: T0 - 20, price: 28_500_000_000n, collateralSold: 776_393192n, debtRepaid: 21_908125n, collateralLeft: 3_223_606808n, debtLeft: 78_091875n };
 
   it("records what a liquidation left, and keeps that after a later repayment", async () => {
-    const after = await liquidated(3_000000000n, 60_000000n);
-    const liquidation = { at: T0, price: 120_000_000_000n, collateralSold: 1_000000000n, debtRepaid: 40_000000n, collateralLeft: 3_000000000n, debtLeft: 60_000000n };
-    expect((await W.lend.lendAccount()).positions).toEqual([{ vault: 1, id: "42", collateral: 3_000000000n, debt: 60_000000n, lastLiquidation: liquidation }]);
+    const after = (await liquidated(PARTIAL.price, [PARTIAL.collateralLeft, PARTIAL.debtLeft]))!;
+    expect((await W.lend.lendAccount()).positions).toEqual([{ vault: 1, id: "42", collateral: PARTIAL.collateralLeft, debt: PARTIAL.debtLeft, lastLiquidation: PARTIAL }]);
     // The owner then repays everything: the position shows no debt, the liquidation still says what it left.
     W.notes.set(hex(after.hash), { leafIndex: 9n, spentBy: "8".repeat(88) });
     W.txs.set("8".repeat(88), wire(W.KEEPER, [{ programAddress: PROGRAM, accounts: [ws(W.KEEPER)], data: Uint8Array.of(TAG.repay) }]));
     W.keeper.account.positions = [];
-    await givePosition(W, 42n, 3_000000000n, 0n);
-    expect((await W.lend.lendAccount()).positions).toEqual([{ vault: 1, id: "42", collateral: 3_000000000n, debt: 0n, lastLiquidation: liquidation }]);
+    await givePosition(W, 42n, PARTIAL.collateralLeft, 0n);
+    expect((await W.lend.lendAccount()).positions).toEqual([{ vault: 1, id: "42", collateral: PARTIAL.collateralLeft, debt: 0n, lastLiquidation: PARTIAL }]);
   });
 
-  it("lists a position a full liquidation left with nothing as emptied, not as a position", async () => {
-    await liquidated(0n, 0n);
+  it("says what the liquidation did even when a top-up landed before the page read", async () => {
+    await liquidated(PARTIAL.price, [PARTIAL.collateralLeft + 1_000000000n, PARTIAL.debtLeft]);
+    expect((await W.lend.lendAccount()).positions).toEqual([{ vault: 1, id: "42", collateral: PARTIAL.collateralLeft + 1_000000000n, debt: PARTIAL.debtLeft, lastLiquidation: PARTIAL }]);
+  });
+
+  it("does not credit the liquidation with a repayment that landed before the page read", async () => {
+    await liquidated(PARTIAL.price, [PARTIAL.collateralLeft, 0n]);
+    const [p] = (await W.lend.lendAccount()).positions;
+    expect(p).toEqual({ vault: 1, id: "42", collateral: PARTIAL.collateralLeft, debt: 0n, lastLiquidation: PARTIAL });
+    expect(p!.lastLiquidation!.debtLeft).toBe(78_091875n);
+  });
+
+  it("lists a position a full liquidation left with nothing as emptied, though the keeper lists no such position", async () => {
+    // At $25.25 a tSOL the 4 tSOL pay exactly 100 tUSD and its 1%.
+    await liquidated(25_250_000_000n);
+    expect(W.keeper.account.positions).toEqual([]);
     const a = await W.lend.lendAccount();
     expect(a.positions).toEqual([]);
-    expect(a.emptied).toEqual([{ vault: 1, id: "42", collateral: 0n, debt: 0n, lastLiquidation: { at: T0, price: 120_000_000_000n, collateralSold: 4_000000000n, debtRepaid: 100_000000n, collateralLeft: 0n, debtLeft: 0n } }]);
+    expect(a.emptied).toEqual([{ vault: 1, id: "42", collateral: 0n, debt: 0n, lastLiquidation: { at: T0 - 20, price: 25_250_000_000n, collateralSold: 4_000000000n, debtRepaid: 100_000000n, collateralLeft: 0n, debtLeft: 0n } }]);
     expect((await W.lend.lendAccount()).emptied).toHaveLength(1);
+  });
+
+  it("does not call a partial liquidation followed by a close emptied", async () => {
+    await liquidated(PARTIAL.price);
+    const a = await W.lend.lendAccount();
+    expect(a.positions).toEqual([]);
+    expect(a.emptied).toEqual([]);
+  });
+
+  it("after a reload, reads the keeper for an intent on chain whose ticket waits, so another keeper can fill it", async () => {
+    const op = await W.lend.supply(TUSD, 250_000000n, () => {});
+    await W.lend.lendAccount(); // the intent lands: on chain, waiting for the keeper
+    expect(W.store.get("op", op.id)).toMatchObject({ onChain: true, status: "pending" });
+    const reads = () => W.log.requests.filter((r) => r.path === "/api/lend/account");
+    const before = reads().length;
+    // A reload: a new client, no session, nothing spent, nothing lost.
+    await createLend(W.deps).lendAccount();
+    expect(reads()).toHaveLength(before + 1);
+    expect((reads().at(-1)!.body.tickets as { id: string }[]).map((t) => t.id)).toEqual([W.store.get("op", op.id)!.ticket!.id]);
+    // Without one waiting there is nothing to ask a keeper about.
+    W.clock.now = T0 + 301;
+    await createLend(W.deps).lendAccount();
+    expect(reads()).toHaveLength(before + 1);
   });
 
   it("brings back intents and positions after the browser lost its records", async () => {
@@ -617,6 +660,26 @@ describe("keeper-built operations: redeem and draw", () => {
     expect(op).toMatchObject({ kind: "draw", status: "landed", positionId: "42" });
     const a = await W.lend.lendAccount();
     expect(a.positions[0]).toMatchObject({ id: "42", collateral: 4_000000000n, debt: 100_000001n }); // debt rounds up
+  });
+
+  it("values the debt token at 1 when /api/prices says it is off its peg: a draw at the program's price is accepted", async () => {
+    const http = W.deps.http;
+    W.deps.http = async (path, init) => (path === "/api/prices" ? new Response(JSON.stringify({ [TSOL]: TSOL_PRICE, [TUSD]: { price: "98500000", expo: -8, publishTime: T0 } }), { status: 200 }) : http(path, init));
+    W.lend = createLend(W.deps);
+    // The program's price, from which health is computed: tSOL in tUSD at 1, not 142.37 / 0.985.
+    expect((await W.lend.pools()).vaults[0]).toMatchObject({ price: 142_370_000_000n });
+    await W.lend.supply(TUSD, 1_000000n, () => {});
+    const p = await givePosition(W, 42n, 4_000000000n, 0n);
+    await W.lend.lendAccount();
+    const shares = (100_000000n * 1_000_000_000_000n + INDEX - 1n) / INDEX;
+    const notes = [
+      { slot: SLOT.draw.position, owner: PDA_ADDR, mint: mintBytes(TSOL), amount: 4_000000000n, kind: 3, state: Uint8Array.of(...p.state.slice(0, -8), ...u64Bytes(shares)) },
+      { slot: SLOT.draw.debtPayout, owner: USER_ADDR, mint: mintBytes(TUSD), amount: 100_000000n, kind: 0, state: new Uint8Array() },
+      { slot: SLOT.draw.collateralPayout, owner: USER_ADDR, mint: mintBytes(TSOL), amount: 0n, kind: 0, state: new Uint8Array() },
+    ];
+    // 141: within 2% of 142.37, more than 2% below the 144.54 a priced debt token would give.
+    W.keeper.build = () => keeperBuild(W, "draw", p, notes, [], 141_000_000_000n);
+    expect(await W.lend.draw("42", 100_000000n, 0n, () => {})).toMatchObject({ kind: "draw", status: "landed" });
   });
 });
 

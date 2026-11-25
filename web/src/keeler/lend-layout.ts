@@ -35,7 +35,7 @@ const PROOF = 128;
  * - redeem: proof, mint [32], pool_viewing [33], pool_bump u8, owner_viewing [33], user_bump u8, now u64.
  * - draw: proof, vault u64, pool_viewing [33], pool_bump u8, owner_viewing [33], user_bump u8, now u64, bound u64.
  * - liquidate: proof, vault u64, pool_viewing [33], pool_bump u8, owner [32], owner_viewing [33], user_bump u8, now u64,
- *   bound u64 (only `bound` is read, to report a liquidation).
+ *   bound u64 (`now` and `bound` are read, to report a liquidation).
  * - close: proof, vault u64, viewing [33], user_bump u8.
  */
 export const ARGS = {
@@ -43,7 +43,7 @@ export const ARGS = {
   cancelIntent: { length: PROOF + 33 + 1 + 8, expiry: PROOF + 34 },
   redeem: { length: PROOF + 32 + 33 + 1 + 33 + 1 + 8, ownerViewing: PROOF + 66, now: PROOF + 100 },
   draw: { length: PROOF + 8 + 33 + 1 + 33 + 1 + 8 + 8, ownerViewing: PROOF + 42, now: PROOF + 76, bound: PROOF + 84 },
-  liquidate: { length: PROOF + 8 + 33 + 1 + 32 + 33 + 1 + 8 + 8, bound: PROOF + 116 },
+  liquidate: { length: PROOF + 8 + 33 + 1 + 32 + 33 + 1 + 8 + 8, now: PROOF + 108, bound: PROOF + 116 },
   close: { length: PROOF + 8 + 33 + 1 },
 } as const;
 

@@ -73,7 +73,7 @@ export function lendCompiled(served: { programId: string; keepers?: unknown }, b
   const isList = (v: unknown): v is string[] => Array.isArray(v) && v.length > 0 && v.every((k) => typeof k === "string" && isAddress(k));
   if (typeof built.programId !== "string" || built.programId !== served.programId || !isList(keepers) || !isList(served.keepers)) return undefined;
   const known = served.keepers.every((k) => (keepers as string[]).includes(k));
-  if (!known || typeof built.poolViewing !== "string" || !/^[0-9a-f]{66}$/.test(built.poolViewing)) return undefined;
+  if (!known || typeof built.poolViewing !== "string" || !/^04[0-9a-f]{64}$/.test(built.poolViewing)) return undefined;
   return { programId: address(built.programId), keepers: keepers.map((k) => address(k)), poolViewing: fromHex(built.poolViewing) };
 }
 type QuoteReply = { dealer: string; quote: { buy_amount: string; expiry: number; signature?: string } | null }[];
