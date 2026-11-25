@@ -13,6 +13,8 @@ permissions:
 
 env:
   AGAVE_VERSION: v4.1.2
+  WASM_PACK_VERSION: v0.15.1
+  WASM_PACK_SHA256: 410101009739b9d01c7d5affaaad6e9c9a24b4cba6791a4805db8e89b9bf7af2
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
@@ -34,12 +36,21 @@ jobs:
             ~/.local/share/solana
             ~/.cache/solana
             ~/.config/zolana/cache
-          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ hashFiles('scripts/setup.sh') }}
+            ~/.cache/.wasm-pack
+          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('scripts/setup.sh') }}
       - name: Install Agave
         run: |
           bin=$HOME/.local/share/solana/install/active_release/bin
           [[ -x $bin/cargo-build-sbf ]] || sh -c "$(curl -sSfL https://release.anza.xyz/$AGAVE_VERSION/install)"
           echo "$bin" >>"$GITHUB_PATH"
+      - name: Install wasm-pack
+        run: |
+          mkdir -p /tmp/wasm-pack
+          curl -sSfL -o /tmp/wasm-pack.tar.gz "https://github.com/wasm-bindgen/wasm-pack/releases/download/$WASM_PACK_VERSION/wasm-pack-$WASM_PACK_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$WASM_PACK_SHA256  /tmp/wasm-pack.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/wasm-pack.tar.gz -C /tmp/wasm-pack --strip-components=1
+          install -m 755 /tmp/wasm-pack/wasm-pack "$HOME/.cargo/bin/wasm-pack"
+          wasm-pack --version
       - name: Install the pinned Rust toolchains
         run: |
           rustup toolchain install

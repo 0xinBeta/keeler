@@ -4,6 +4,8 @@ A lending pool with private amounts on Helius Privacy Rings (custom Xark circuit
 Groth16 in a Pinocchio program that moves notes through the shielded pool), with private swaps as
 a second, smaller part.
 
+[![CI](https://github.com/0xinBeta/keeler/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/0xinBeta/keeler/actions/workflows/ci.yml)
+
 ![A supply, a borrow, a price drop and a liquidation on devnet](docs/demo.gif)
 
 - Devnet lend program: [`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`](https://explorer.solana.com/address/CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL?cluster=devnet)
@@ -190,11 +192,15 @@ sends v1 transactions.
 
 Needs macOS on Apple silicon (every secret beyond a local network is read from the macOS Keychain
 with `security`), git, curl, Python 3.11 or newer, rustup, the Solana/Agave CLI (`cargo build-sbf`),
-Node and pnpm. Pinned in the repository: Rust 1.98.1
+`wasm-pack` (the circuit compiler builds the browser packages with it), Node and pnpm. Pinned in the repository: Rust 1.98.1
 (`rust-toolchain.toml`, `lend/rust-toolchain.toml`); `helius-labs/privacy-ring-examples` at
 `9e5d69ade7e0c107a2929306d3b758a8969e1089` and SBF platform tools v1.54 (`scripts/setup.sh`,
 `scripts/setup-lend.sh`); `xark` 0.3.1, the `spr-*` crates 0.10.0 (`spr-hasher` 0.8.0), built with
-the `zolana` CLI `cli-v0.10.0` (`lend/Cargo.toml`); `@heliuslabs/spr` 0.9.0-alpha (`web/package.json`).
+the `zolana` CLI `cli-v0.10.0` (`lend/Cargo.toml`); `@heliuslabs/spr` 0.9.0-alpha (`web/package.json`);
+Node 25.4.0 (`.node-version`) and pnpm 10.28.2 (`packageManager` in `web/package.json` and
+`worker/package.json`); Agave 4.1.2 and `wasm-pack` 0.15.1, the versions CI
+installs (`AGAVE_VERSION`, `WASM_PACK_VERSION` in `.github/workflows/ci.yml`). Outside the checkout, `scripts/setup.sh` downloads the Zolana prover,
+Photon and surfpool into `~/.config/zolana/cache` and the provers use `~/.config/zolana/proving-keys`.
 
 ```sh
 scripts/setup.sh        # the pinned swap example into .tools/, .tools/env; idempotent, slow the first time
@@ -209,20 +215,29 @@ cargo test -p keeler-core
 cargo test -p keeler --lib --test fixtures --test deploy_mainnet_refusals
 cd lend
 cargo test --release -p keeler-lend --features build-circuits --lib   # maths and the shared vectors
-cargo test -p keeler-lend --test program                              # Mollusk, on lend/target/deploy/keeler_lend.so
+cargo test -p keeler-lend --test program --test earn --test vault    # Mollusk, on lend/target/deploy/keeler_lend.so
 cargo test --release -p keeler-lend-sdk                               # builders, compiled-circuit refusals
 scripts/run-chain-test.sh                                             # local network, port offset 2100
 cd ..
 scripts/run-lend-e2e.sh                                               # the keeper end to end, two keepers, port offset 2500
 (cd web && pnpm install && pnpm test)
 (cd worker && pnpm install && pnpm test)
-source .tools/env && cargo test --release -p keeler --test e2e -- --nocapture   # swaps end to end
+scripts/run-swap-e2e.sh                                               # swaps end to end, port offset 2600
 ```
 
 The page against a real local keeper: `scripts/lend-web-stack.sh start` (local network, keeper,
-Worker), then `cd web && pnpm e2e:lend`. Local networks use a port offset and stop what they start.
+Worker), then `cd web && pnpm exec playwright install chromium && pnpm e2e:lend`; the same page against
+its mock client, with no network: `pnpm e2e:mock`. Local networks use a port offset and stop what they start.
 The scripts read the tool paths from the main checkout's `.tools/env`; each checkout builds its own
 `target/` (several GB).
+
+Continuous integration (`.github/workflows/ci.yml`, on every push and pull request) runs on Linux:
+`cargo fmt --check`, `cargo clippy -D warnings`, `scripts/setup.sh` and `scripts/setup-lend.sh`
+(so the lend keys checksum is checked), the `keeler-core`, `keeler` (lib, fixtures, deploy refusals),
+circuit and lend SDK native tests, and the web and Worker type checks and unit tests. It does not
+run the Mollusk tests, the local-network tests, the two end-to-end tests or the mock browser suite:
+those are `.github/workflows/slow.yml`, run by hand, which gates nothing. Nothing in CI runs the page
+against a real local keeper, reaches devnet or mainnet, or uses a secret.
 
 Devnet and mainnet deploys: `docs/lend-deploy.md` (`scripts/deploy-lend-devnet.sh`) and
 `docs/mainnet-runbook.md` (`scripts/deploy-mainnet.sh`, which refuses test keys, the test price, a
