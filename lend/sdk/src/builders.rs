@@ -91,6 +91,11 @@ impl Prepared {
         })
     }
 
+    /// The lend circuit this transaction proves.
+    pub fn circuit(&self) -> CircuitId {
+        self.circuit
+    }
+
     /// The instruction's own accounts, ahead of the SPP transact accounts.
     pub fn head(&self) -> &[AccountMeta] {
         &self.head

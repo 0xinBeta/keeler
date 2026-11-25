@@ -15,6 +15,8 @@
 //! `LEND_CHAIN_TESTS=vault_chain` (`ZOLANA_PORT_OFFSET`, the tool paths from
 //! `.tools/env`, the SBF build in `lend/target/deploy`). Ignored in a plain
 //! `cargo test`.
+#[path = "measure.rs"]
+mod measure;
 #[path = "tamper.rs"]
 mod tamper;
 #[path = "wallet.rs"]
@@ -22,7 +24,6 @@ mod wallet;
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -128,20 +129,7 @@ impl Env {
     }
 
     fn report(&self, name: &str, payer: &Address, ix: &Instruction, sig: &Signature) -> Result<()> {
-        let size = spr_client::transaction_size(
-            payer,
-            std::slice::from_ref(ix),
-            ComputeBudgetConfig::new(BUDGET),
-        )
-        .map_err(err)?
-        .bytes;
-        println!(
-            "VAULT {name}: {} CU, v1 tx {size} bytes, ix data {} bytes, {} accounts",
-            compute_units(&self.rpc_url, sig)?,
-            ix.data.len(),
-            ix.accounts.len()
-        );
-        Ok(())
+        measure::report(&self.rpc_url, name, payer, ix, sig)
     }
 
     /// Proves and sends a keeper-built transaction; the keeper alone signs.
@@ -170,6 +158,7 @@ impl Env {
         first: impl FnOnce(&Instruction) -> Result<()>,
     ) -> Result<Signature> {
         let (tree, _) = self.tree();
+        measure::lend_proof(name, &p)?;
         let ix = p.prove(self.localnet.client.indexer(), tree, keeper)?;
         first(&ix)?;
         let sig = send(self.localnet.client.rpc(), &[key], ix.clone())?;
@@ -196,26 +185,6 @@ impl Env {
         send(self.localnet.client.rpc(), &[&self.keeper_key], ix)?;
         Ok(())
     }
-}
-
-fn compute_units(rpc: &str, signature: &Signature) -> Result<u64> {
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["{signature}",{{"encoding":"json","maxSupportedTransactionVersion":1,"commitment":"confirmed"}}]}}"#
-    );
-    let out = Command::new("/usr/bin/curl")
-        .args([
-            "-s",
-            "-H",
-            "content-type: application/json",
-            "-d",
-            &body,
-            rpc,
-        ])
-        .output()?;
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    value["result"]["meta"]["computeUnitsConsumed"]
-        .as_u64()
-        .with_context(|| format!("no compute units in {value}"))
 }
 
 /// A signature made elsewhere: the keeper's, handed to the owner with the
@@ -531,6 +500,7 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
             p.outputs[DRAW_RESERVE_SLOT].clone(),
             p.outputs[DRAW_DEBT_SLOT].clone(),
         );
+        measure::lend_proof("draw (borrow)", &p)?;
         let ix = p.prove(indexer, tree, keeper)?;
         // The proof resent with one argument changed is refused.
         let resend = |edit: fn(&mut DrawArgs)| {
@@ -742,6 +712,7 @@ fn borrow_accrue_repay_liquidate_close() -> Result<()> {
         let p = vault::close(&borrower, position, V, tree_id)?;
         let out = p.outputs[CLOSE_PAYOUT_SLOT].clone();
         ensure!(out.amount == left, "close pays all");
+        measure::lend_proof("close", &p)?;
         let ix = p.prove(indexer, tree, &borrower)?;
         let sig = send(rpc, &[&borrower_key], ix.clone())?;
         env.confirm(sig)?;

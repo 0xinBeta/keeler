@@ -8,6 +8,8 @@
 //! Run through `lend/scripts/run-chain-test.sh` (`ZOLANA_PORT_OFFSET`, the
 //! tool paths from `.tools/env`, the SBF build in `lend/target/deploy`).
 //! Ignored in a plain `cargo test`.
+#[path = "measure.rs"]
+mod measure;
 #[path = "tamper.rs"]
 mod tamper;
 #[path = "wallet.rs"]
@@ -15,7 +17,6 @@ mod wallet;
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -87,43 +88,6 @@ fn indexed(
         output.hash(tree_id).map_err(err)?,
     )?;
     owner.input(output, tree_id, proof.leaf_index).map_err(err)
-}
-
-fn compute_units(rpc: &str, signature: &Signature) -> Result<u64> {
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["{signature}",{{"encoding":"json","maxSupportedTransactionVersion":1,"commitment":"confirmed"}}]}}"#
-    );
-    let out = Command::new("/usr/bin/curl")
-        .args([
-            "-s",
-            "-H",
-            "content-type: application/json",
-            "-d",
-            &body,
-            rpc,
-        ])
-        .output()?;
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    value["result"]["meta"]["computeUnitsConsumed"]
-        .as_u64()
-        .with_context(|| format!("no compute units in {value}"))
-}
-
-fn report(rpc: &str, name: &str, payer: &Address, ix: &Instruction, sig: &Signature) -> Result<()> {
-    let size = spr_client::transaction_size(
-        payer,
-        std::slice::from_ref(ix),
-        ComputeBudgetConfig::new(BUDGET),
-    )
-    .map_err(err)?
-    .bytes;
-    println!(
-        "EARN {name}: {} CU, v1 tx {size} bytes, ix data {} bytes, {} accounts",
-        compute_units(rpc, sig)?,
-        ix.data.len(),
-        ix.accounts.len()
-    );
-    Ok(())
 }
 
 /// A signature made elsewhere: the keeper's, handed to the owner with the
@@ -288,12 +252,11 @@ fn supply_accrue_and_redeem() -> Result<()> {
         .find(|o| o.data_hash.is_some())
         .cloned()
         .context("no reserve output")?;
-    send(
-        rpc,
-        &[&keeper_key, &admin_key],
-        init.prove(indexer, tree, &keeper)?,
-    )?;
+    measure::lend_proof("init_reserve", &init)?;
+    let ix = init.prove(indexer, tree, &keeper)?;
+    let sig = send(rpc, &[&keeper_key, &admin_key], ix.clone())?;
     let mut reserve = indexed(&localnet, &pool, &reserve_out)?;
+    measure::report(&rpc_url, "init_reserve", &keeper_key.pubkey(), &ix, &sig)?;
     println!("reserve created");
 
     // 2. Both users shield funds and make supply intents.
@@ -329,8 +292,11 @@ fn supply_accrue_and_redeem() -> Result<()> {
             tree_id,
         )?;
         let out = intent.outputs[keeler_lend::circuits::INTENT_SLOT].clone();
-        send(rpc, &[key], intent.prove(indexer, tree, user)?)?;
+        measure::lend_proof("intent", &intent)?;
+        let ix = intent.prove(indexer, tree, user)?;
+        let sig = send(rpc, &[key], ix.clone())?;
         intents.push(indexed(&localnet, &user_pda(&key.pubkey()).owner, &out)?);
+        measure::report(&rpc_url, "intent", &key.pubkey(), &ix, &sig)?;
         wallets.push(wallet);
     }
     println!("intents made");
@@ -356,6 +322,7 @@ fn supply_accrue_and_redeem() -> Result<()> {
             p.outputs[SUPPLY_RESERVE_SLOT].clone(),
             p.outputs[SUPPLY_RECEIPT_SLOT].clone(),
         );
+        measure::lend_proof("supply", &p)?;
         let ix = p.prove(indexer, tree, &keeper)?;
         if i == 0 {
             // The proof resent with one argument changed is refused.
@@ -391,7 +358,7 @@ fn supply_accrue_and_redeem() -> Result<()> {
             }
         }
         let sig = send(rpc, &[&keeper_key], ix.clone())?;
-        report(&rpc_url, "supply", &keeper_key.pubkey(), &ix, &sig)?;
+        measure::report(&rpc_url, "supply", &keeper_key.pubkey(), &ix, &sig)?;
         reserve = indexed(&localnet, &pool, &res_out)?;
         let state: ReserveState = decode(&reserve)?;
         ensure!(state.last_update == now, "last update {state:?}");
@@ -449,13 +416,14 @@ fn supply_accrue_and_redeem() -> Result<()> {
         p.outputs[REDEEM_RECEIPT_SLOT].clone(),
         p.outputs[REDEEM_PAYOUT_SLOT].clone(),
     );
+    measure::lend_proof("redeem (partial)", &p)?;
     let ix = p.prove(indexer, tree, &keeper)?;
     let sig = keeper_then_owner(rpc, &keeper_key, &a_key, ix.clone())?;
     localnet
         .client
         .confirm_private_transaction_sync(sig)
         .map_err(err)?;
-    report(
+    measure::report(
         &rpc_url,
         "redeem (partial)",
         &keeper_key.pubkey(),
@@ -495,13 +463,14 @@ fn supply_accrue_and_redeem() -> Result<()> {
         p.outputs[REDEEM_RESERVE_SLOT].clone(),
         p.outputs[REDEEM_RECEIPT_SLOT].clone(),
     );
+    measure::lend_proof("redeem (full)", &p)?;
     let ix = p.prove(indexer, tree, &keeper)?;
     let sig = keeper_then_owner(rpc, &keeper_key, &b_key, ix.clone())?;
     localnet
         .client
         .confirm_private_transaction_sync(sig)
         .map_err(err)?;
-    report(&rpc_url, "redeem (full)", &keeper_key.pubkey(), &ix, &sig)?;
+    measure::report(&rpc_url, "redeem (full)", &keeper_key.pubkey(), &ix, &sig)?;
     reserve = indexed(&localnet, &pool, &res_out)?;
     let state: ReserveState = decode(&reserve)?;
     let empty: ReceiptState = decode(&indexed(
