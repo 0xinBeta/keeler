@@ -156,6 +156,10 @@ if ! [[ $vault_index =~ ^[0-9]{1,3}$ ]] || ((vault_index > 255)); then die "--va
 rpc_url=${arg_rpc_url:-https://mainnet.helius-rpc.com}
 [[ $rpc_url =~ ^https://[a-z0-9.-]+\.helius-rpc\.com/?$ ]] || die "--rpc-url is a Helius https host (the key comes from the Keychain)"
 rpc_url=${rpc_url%/}
+if [[ -n $arg_manifest ]]; then
+    [[ -f $arg_manifest ]] || die "no manifest $arg_manifest"
+    arg_manifest=$(cd "$(dirname "$arg_manifest")" && pwd)/$(basename "$arg_manifest")
+fi
 
 # A worktree's .tools is a link to the main checkout's, untracked: the one
 # untracked path allowed.
@@ -178,25 +182,29 @@ no_ceremony() {
     die "no key ceremony yet: $1. The mainnet deploy cannot run before the ceremony's verifying keys are committed (docs/mainnet-runbook.md, step 3). --estimate works without them."
 }
 if ! $estimate; then
-    check_manifest "${arg_manifest}"
-    for n in deploy "$program-program" "$program-buffer"; do
-        security find-generic-password -s "keeler-mainnet-$n" >/dev/null 2>&1 ||
-            die "no Keychain item keeler-mainnet-$n (docs/mainnet-runbook.md)"
-    done
     if [[ $program == lend ]]; then
-        grep -l 'insecure_test_setup\\x00true' "$root"/lend/program/src/verifier/*.vk.rs >/dev/null &&
+        if grep -l 'insecure_test_setup\\x00true' "$root"/lend/program/src/verifier/*.vk.rs >/dev/null; then
             no_ceremony "lend/program/src/verifier/*.vk.rs are test setups"
-        [[ -f ${arg_keeper_config} ]] || die "no keeper config ${arg_keeper_config}"
-        # The keeper proves with the ceremony's proving keys.
-        (cd "${arg_keys_dir}" && shasum -a 256 -c --quiet "${arg_manifest}") ||
-            die "${arg_keys_dir} does not hold the manifest's proving keys"
+        fi
     else
         for c in make take cancel; do
             [[ -f $root/ceremony/swap/$c.vk.rs ]] || no_ceremony "no ceremony/swap/$c.vk.rs"
         done
-        grep -l 'insecure_test_setup\\x00true' "$root"/ceremony/swap/*.vk.rs >/dev/null &&
+        if grep -l 'insecure_test_setup\\x00true' "$root"/ceremony/swap/*.vk.rs >/dev/null; then
             no_ceremony "ceremony/swap/*.vk.rs are test setups"
+        fi
     fi
+    check_manifest "$arg_manifest"
+    if [[ $program == lend ]]; then
+        [[ -f $arg_keeper_config ]] || die "no keeper config $arg_keeper_config"
+        # The keeper proves with the ceremony's proving keys.
+        (cd "$arg_keys_dir" && shasum -a 256 -c --quiet "$arg_manifest") ||
+            die "$arg_keys_dir does not hold the manifest's proving keys"
+    fi
+    for n in deploy "$program-program" "$program-buffer"; do
+        security find-generic-password -s "keeler-mainnet-$n" >/dev/null 2>&1 ||
+            die "no Keychain item keeler-mainnet-$n (docs/mainnet-runbook.md)"
+    done
 fi
 
 # The deploy tool: `keeler deploy` (cli/src/deploy.rs), in its own target.

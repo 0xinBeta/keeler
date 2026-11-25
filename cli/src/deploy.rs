@@ -1199,6 +1199,15 @@ mod tests {
     }
 
     #[test]
+    fn squads_vault_matches_mainnet() {
+        // A mainnet multisig whose rent_collector is its vault 0 (read 2026-11-25).
+        assert_eq!(
+            squads_vault(&address("1cKogaUTm7Xm3JqRZAZb372y64Z4FEPS1W9JjSKQN2x"), 0),
+            address("2Hfkz8iZ3z6aUrdgotTWUHpT7CSWgW6LfeiUhaLMJUdx")
+        );
+    }
+
+    #[test]
     fn the_fixture_pool_key_gives_the_compiled_fixture_viewing_key() {
         let kp = Keypair::new_from_array(keeler_lend_sdk::FIXTURE_POOL_SEED);
         assert_eq!(
