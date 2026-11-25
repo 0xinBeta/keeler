@@ -8,6 +8,12 @@ a second, smaller part.
 
 ![A supply, a borrow, a price drop and a liquidation on devnet](docs/demo.gif)
 
+Recorded on devnet on 26 November 2026 with a new wallet, shown at three times speed (100 seconds
+in real time): 100 tUSD supplied, a position opened with 0.5 tSOL, 58 tUSD borrowed, then the test
+price is set to 132 and the keeper repays 11.046788 tUSD of the debt with 0.084020125 tSOL at
+132.79. The keeper posts the test price of 150 again a few seconds later, which is why the vault
+header still reads 150.
+
 - Devnet lend program: [`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`](https://explorer.solana.com/address/CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL?cluster=devnet)
 - Live page (devnet): https://keeler.xterminbeta.workers.dev
 
