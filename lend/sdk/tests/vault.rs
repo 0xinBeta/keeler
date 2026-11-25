@@ -7,8 +7,8 @@ mod utxo;
 use keeler_lend::circuits::{Close, DepositAdd, DepositOpen, Draw, Liquidate, Repay};
 use keeler_lend_sdk::proof::CircuitId;
 use refusal::{
-    field, identity_of, refused, refused_because, reserve_refusals, set, state_leaves, under,
-    Compiled,
+    field, identity_of, refused, refused_because, reserve_leaves, reserve_refusals, set,
+    state_leaves, under, Compiled,
 };
 
 use keeler_core::lend as core;
@@ -930,6 +930,43 @@ fn liquidate_removes_at_least_one_debt_share() {
         field(&p.proof_inputs, "program.private.{repay,salt}", 0, 64, 1),
         LIQ,
         "require(removed != 0)",
+        IN_EXECUTE,
+    );
+}
+
+#[test]
+fn repay_removes_at_least_one_debt_share() {
+    let user = keypair(7);
+    let r = reserve_with(1_000 * USD, |s| s.borrow_price = 1_500_000_000_000);
+    let p = draw(&user, r, open(&user, SOL, 7), 100 * USD, 0, P150).unwrap();
+    let pos = pda_input(&user, &p.outputs[DRAW_POSITION_SLOT], 4);
+    let r = reserve_out(&p, DRAW_RESERVE_SLOT);
+    let shares = decode::<PositionState>(&pos).unwrap().debt_shares;
+
+    let dust = intent_full(&user, debt(), 1, purpose::REPAY, 7);
+    refused_because(
+        repay(&user, r.clone(), pos.clone(), dust.clone()),
+        "ZeroShares",
+    );
+    let back =
+        builders::cancel_intent(&user, dust.clone(), keeper().viewing_pubkey(), TREE).unwrap();
+    let refund = &back.outputs[keeler_lend::circuits::CANCEL_REFUND_SLOT];
+    assert_eq!((refund.amount, refund.owner_address), (1, Some(addr(&user))));
+
+    let two = intent_full(&user, debt(), 2, purpose::REPAY, 7);
+    let p = repay(&user, r.clone(), pos.clone(), two).unwrap();
+    let after: PositionState =
+        decode(&pda_input(&user, &p.outputs[REPAY_POSITION_SLOT], 5)).unwrap();
+    assert_eq!(after.debt_shares, shares - 1);
+    Compiled {
+        id: CircuitId::Repay,
+        inputs: &p.proof_inputs,
+        execute: Repay::execute,
+    }
+    .refuses(
+        reserve_leaves(&r, |s| s.borrow_price = 3_000_000_000_000, None),
+        "circuits/repay.rs",
+        "require(left == 0 || removed != 0)",
         IN_EXECUTE,
     );
 }

@@ -351,6 +351,8 @@ pub fn draw(
 }
 
 /// Fills `owner`'s repay intent into the position it names. The keeper pays.
+/// A partial repay that would remove no debt share fails here with
+/// `core::LendError::ZeroShares`, before proving.
 #[allow(clippy::too_many_arguments)]
 pub fn repay(
     keeper: &ShieldedKeypair,
@@ -374,6 +376,13 @@ pub fn repay(
     let reserve_state: ReserveState = decode(&reserve)?;
     let intent_state: IntentState = decode(&intent)?;
     let expiry = intent_state.expiry;
+    core::repay(
+        &accrued(&reserve_state, now)?,
+        position_state.debt_shares,
+        intent.utxo.amount,
+        &core::TUSD_POOL.curve,
+    )
+    .map_err(err)?;
     let transaction = RepayClient {
         private: RepayPrivateInputsClient {
             tx_context: options(POSITION_BLINDING_DOMAIN, &position, tree_id)?,
