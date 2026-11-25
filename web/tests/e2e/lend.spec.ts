@@ -141,7 +141,7 @@ test("borrow: open, borrow, repay, withdraw, liquidation, repay all and close", 
   await expect(p.locator(".position .badge")).toHaveText("Liquidatable", { timeout: 4000 });
   await shot(page, info, "06-liquidatable", "panel");
   await expect(p.getByText(/^Liquidated /)).toBeVisible({ timeout: 15_000 });
-  await expect(p.getByText(/The position is back to 85% or less, and the rest is still yours\./)).toBeVisible();
+  await expect(p.getByText(/It brought the position back to 85% or less, and the rest stayed yours\./)).toBeVisible();
   await expect(meter).toHaveAttribute("aria-valuetext", /^8[45]\.\d%/);
   const collateral = units(await p.locator(".position dd").first().innerText(), 9);
   expect(collateral).toBeLessThan(3_500_000_000n);
