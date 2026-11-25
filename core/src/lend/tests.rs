@@ -97,7 +97,13 @@ fn a_partial_repay_must_remove_a_share() {
     let (_, done) = repay(&r, 1_000_000, 2, &C).unwrap();
     assert_eq!(done.shares, 999_999);
     let (_, done) = repay(&r, 0, 1, &C).unwrap();
-    assert_eq!(done, Repaid { shares: 0, change: 1 });
+    assert_eq!(
+        done,
+        Repaid {
+            shares: 0,
+            change: 1
+        }
+    );
 }
 
 #[test]
