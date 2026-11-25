@@ -1,10 +1,10 @@
 name: CI
 
-# Gates pushes and pull requests to main. The slow suites are in slow.yml.
+# Gates pull requests to main; also runs on every push, so a branch is checked before its pull request.
+# The slow suites are in slow.yml and gate nothing.
 
 on:
   push:
-    branches: [main]
   pull_request:
     branches: [main]
 
