@@ -1,7 +1,7 @@
 # Mainnet runbook
 
-The whole launch, in order. Nothing here has been run on mainnet. **[owner]** marks a step that
-needs the owner: funds, keys, signers, hosts or the domain. Do the steps in order; each list is a
+The whole launch, in order. Nothing here has been run on mainnet. **[operator]** marks a step that
+needs the operator in person: funds, keys, signers, hosts or the domain. Do the steps in order; each list is a
 checklist. No secret goes on a command line: each is read from the Keychain by command
 substitution into an environment variable or a pipe.
 
@@ -29,7 +29,8 @@ The debt token is valued at exactly 1 USD, by the program and by the page (whate
 
 - [ ] Every circuit, the program, the keeper and the page are final. A circuit change after the
       ceremony means a new ceremony.
-- [ ] The open questions in `docs/plan-mainnet.md` ("Open for the owner") are decided **[owner]**.
+- [ ] The liquidation penalty split and the bad-debt policy are decided (today the whole 1% goes to
+      the liquidator and there is no write-off: `docs/plan-lend.md`, "Rules"; both change a circuit) **[operator]**.
 - [ ] P-1 from `docs/audit-2026-11-25.md` is fixed before the freeze: a partial repay worth less
       than one debt share is refused by the repay circuit (regenerated repay keys and checksums),
       by the Rust and TypeScript math and by the keeper before it builds.
@@ -37,7 +38,7 @@ The debt token is valued at exactly 1 USD, by the program and by the page (whate
 
 ## 2. Audit
 
-- [ ] The audit covers the tagged commit: `lend/`, `core/`, `cli/`, `worker/`, `web/` **[owner]**.
+- [ ] The audit covers the tagged commit: `lend/`, `core/`, `cli/`, `worker/`, `web/` **[operator]**.
 - [ ] Every finding is fixed or accepted in writing, then tag again. A fix to a circuit goes back to
       step 1.
 
@@ -48,7 +49,7 @@ forge a proof for them. A mainnet build refuses them (they `compile_error!` with
 `insecure-test-setup`), and `scripts/deploy-mainnet.sh` stops here until this step is done.
 
 - [ ] Run a Xark phase-2 ceremony for the 11 lend circuits (and the 3 swap circuits if the swap
-      launches) with at least one contributor from outside the operator **[owner]**.
+      launches) with at least one contributor from outside the operator **[operator]**.
 - [ ] Commit its verifying keys: lend's into `lend/program/src/verifier/<circuit>.vk.rs` (generated
       with `insecure_test_setup` false), the swap's into `ceremony/swap/{make,take,cancel}.vk.rs`.
 - [ ] Keep the manifest: one `<sha256>  <circuit>/pk.bin` line per circuit, the format
@@ -72,7 +73,7 @@ forge a proof for them. A mainnet build refuses them (they `compile_error!` with
 
 Every key is a Keychain item (a Solana keypair JSON array, or a secret string); create each with
 `cargo run --release -p keeler --example deploy -- keygen` piped into `security`, as
-`scripts/deploy-devnet.sh` does **[owner]**. The names below are the ones the configs and commands
+`scripts/deploy-devnet.sh` does **[operator]**. The names below are the ones the configs and commands
 in this runbook use.
 
 | Item | What | Deploy Mac | Keeper host 1 | Keeper host 2 |
@@ -95,7 +96,7 @@ in this runbook use.
       `keeler-mainnet-pool` there before step 5 and delete both from it after step 5
       (`security delete-generic-password -s <item>`).
 
-The multisig **[owner]**:
+The multisig **[operator]**:
 
 - [ ] Create a Squads v4 multisig with threshold at least 2, signers on separate devices, and no
       config authority (autonomous: changes to members or threshold need a proposal). The deploy
@@ -118,11 +119,11 @@ On the deploy Mac, from the audited tag with a clean tree (`.tools` from `script
       0.936017000 SOL at peak. The program data is exactly the `.so`'s size; a larger upgrade
       first extends it (section 11), at the rent of the added bytes then (6,960 lamports a byte
       today: 0.0713 SOL per 10 KiB).
-- [ ] Fund `keeler-mainnet-deploy` with the peak **[owner]**, and keeper 1's address
+- [ ] Fund `keeler-mainnet-deploy` with the peak **[operator]**, and keeper 1's address
       (`keeler-mainnet-keeper-1`) with at least 0.05 SOL for the reserve's creation.
 - [ ] The keeper config for the reserve, `keeper-1.json`, as in section 6 with
       `"admin_key": {"keychain": "keeler-mainnet-deploy"}` added to its `lend` section.
-- [ ] Deploy **[owner]**: types the program ID, then the multisig address, to confirm.
+- [ ] Deploy **[operator]**: types the program ID, then the multisig address, to confirm.
 
 ```sh
 scripts/deploy-mainnet.sh lend \
@@ -159,7 +160,7 @@ rest. `target/mainnet-lend/` keeps `build.json` (commit, tag and `.so` sha256),
 `deployment.json` and `deploy.log`. It creates no token, runs no faucet and moves no funds.
 
 - [ ] Check `build.json`'s `tag` (also in the log's first line) is the audited tag and `commit`
-      is that tag's commit (`git rev-list -n 1 <tag>`) **[owner]**.
+      is that tag's commit (`git rev-list -n 1 <tag>`) **[operator]**.
 - [ ] Check it independently: `solana program show <program id>` names the vault as authority;
       `solana program dump <program id> /tmp/p.so` and
       `scripts/deploy-mainnet.sh lend --check-so /tmp/p.so --manifest <manifest>` pass.
@@ -167,7 +168,7 @@ rest. `target/mainnet-lend/` keeps `build.json` (commit, tag and `.so` sha256),
 
 ## 6. Keeper hosts
 
-Two always-on hosts **[owner]**, each with its own keeper key and the same pool key, both in the
+Two always-on hosts **[operator]**, each with its own keeper key and the same pool key, both in the
 compiled `KEEPERS`. A mainnet keeper runs on its own (`keeler keeper`), not inside a dealer and
 not with `scripts/run-dealer.sh` (a devnet tool: quick tunnels, devnet deployments only).
 
@@ -222,7 +223,7 @@ CARGO_TARGET_DIR=target/mainnet-keeper \
 - [ ] Caps (`lend.limits`, every one non-zero or the keeper refuses to start on mainnet), the same
       on both hosts. A canary: `max_pool_size`, `max_total_collateral`,
       `max_position_collateral`, `max_position_debt`, `max_supply_per_wallet`, small enough that
-      losing all of it is acceptable **[owner]**.
+      losing all of it is acceptable **[operator]**.
 - [ ] `min_position_debt`: a liquidation pays the liquidator 1% of the debt it repays, which must
       cover its cost: the base fees of its two transactions (a split to a note of exactly `x`, then
       the liquidation), the priority fee and the proofs' Helius credits. Set it so 1% of it is at
@@ -232,7 +233,7 @@ CARGO_TARGET_DIR=target/mainnet-keeper \
       transaction, `lend.liquidation_priority_fee` higher. Pick from recent fees on the program's
       accounts (Helius `getPriorityFeeEstimate` or `getRecentPrioritizationFees`) and recheck when
       transactions land slowly.
-- [ ] Fund **every** keeper **[owner]**: each liquidates from notes at its own lend address, so a
+- [ ] Fund **every** keeper **[operator]**: each liquidates from notes at its own lend address, so a
       standby with no USDC cannot liquidate when the primary is down.
   - SOL for fees: a plain transfer to the keeper's address.
   - USDC for liquidations, at least the largest position's debt, on each keeper. With the
@@ -286,9 +287,9 @@ security find-generic-password -s keeler-price-rpc-url -w | npx wrangler secret 
       must equal the Worker's `ASSETS` exactly, or the page refuses its config. Lending stays
       hidden unless `/api/config` matches the compiled keepers. A mainnet build names no test token and has no faucet or
       browser test wallet (`web/tests/build.test.ts`).
-- [ ] The custom domain **[owner]**.
+- [ ] The custom domain **[operator]**.
 - [ ] Seed the pool with a first supply, then a small deposit, borrow, repay and close from a
-      second wallet **[owner]** (real funds).
+      second wallet **[operator]** (real funds).
 
 ## 8. Kill switches
 
@@ -312,7 +313,7 @@ Pyth's price pusher, which writes the same shard-0 account. Sources: the pusher'
 (`@pythnetwork/price-pusher` 11.3.0, https://cdn.jsdelivr.net/npm/@pythnetwork/price-pusher@11.3.0/README.md)
 and Pyth's push-feeds page (https://docs.pyth.network/price-feeds/core/push-feeds), read
 2026-11-25. Pyth's page says the pusher needs a Pyth Pro API key passed with
-`--hermes-access-token`, version 10.5.0 or later **[owner]**: the key in the Keychain item
+`--hermes-access-token`, version 10.5.0 or later **[operator]**: the key in the Keychain item
 `keeler-pyth-pro-key`, and a small hot wallet `keeler-mainnet-pyth-pusher` with SOL for fees.
 
 `price-config.yaml`:
@@ -370,7 +371,7 @@ print(json.dumps({"endpoint": url, "hermes-access-token": os.environ["PYTH_PRO"]
 The keeper set and the pool key are compiled in; changing them is a program upgrade. There is no
 key rotation: a removed keeper that kept the pool key still reads every amount, past and future.
 
-- [ ] New host and keeper key **[owner]**; copy the pool key into its Keychain **[owner]**.
+- [ ] New host and keeper key **[operator]**; copy the pool key into its Keychain **[operator]**.
 - [ ] Build the upgrade from a clean tree with the new `--keepers` (same everything else):
       `scripts/deploy-mainnet.sh lend --build-only <parameters> --manifest <manifest>`.
 - [ ] If the new `.so` is larger than the program data (`solana program show <program id>`, "Data
@@ -389,7 +390,7 @@ key rotation: a removed keeper that kept the pool key still reads every amount, 
 - [ ] Write it to a buffer (`solana program write-buffer target/mainnet-lend/deploy/keeler_lend.so`),
       hand the buffer's authority to the vault (`solana program set-buffer-authority <buffer>
       --new-buffer-authority <vault>`), and propose the upgrade in Squads; the signers check the
-      buffer's bytes against `build.json`'s sha256 first **[owner]**.
+      buffer's bytes against `build.json`'s sha256 first **[operator]**.
 - [ ] If the upgrade changes vault 1's parameters, change `TSOL_TUSD_VAULT` in
       `web/src/keeler/lend-math.ts` with them, or the page refuses the Worker's config.
 - [ ] After the upgrade: rebuild every keeper (section 6) with the new `KEELER_LEND_KEEPERS`,
@@ -399,7 +400,7 @@ key rotation: a removed keeper that kept the pool key still reads every amount, 
 
 ## 12. Raising caps
 
-- [ ] Decide the new caps **[owner]**; keep `min_position_debt` covering a liquidation's cost.
+- [ ] Decide the new caps **[operator]**; keep `min_position_debt` covering a liquidation's cost.
 - [ ] Set the same `lend.limits` on every keeper; restart the standby, check its health, then the
       primary. A cap is the keeper's check, not the program's.
 

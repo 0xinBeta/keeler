@@ -1,6 +1,5 @@
-//! The vaults' fixed parameters (`docs/plan-lend.md`, Vault), their error
-//! codes and the guard on the test price account. Owned by the Vault piece
-//! (`lend/AGENTS.md`).
+//! The vaults' fixed parameters (`docs/plan-lend.md`, "Rules"), their error
+//! codes and the guard on the test price account.
 //!
 //! Build parameters (base58 unless noted, defaults for local tests, see
 //! `build.rs`): `KEELER_LEND_VAULT1_COLLATERAL_MINT` (default: SOL, the zero

@@ -138,30 +138,27 @@ reference, the circuits (natively) and the page's TypeScript twin all pass. Why 
 
 ## Measured
 
-Only figures that come from a file in this repository, with their source. Everything else is
-"not measured yet".
+Every figure below comes from a command in [`lend/MEASUREMENTS.md`](lend/MEASUREMENTS.md), run once
+on an Apple M4 (10 cores, 16 GB) on 2026-11-25 while the local validator, indexer and prover of the
+same test were running. Transaction size is the v1 wire size against the 4,096-byte v1 limit
+(`solana_message::v1::MAX_TRANSACTION_SIZE`). Every lend proof is 128 bytes as sent.
 
-Per shipped instruction. Transaction size is the v1 wire size against the 4,096-byte v1 limit the
-SDK and page use (`docs/lend-api.md`, "build").
+| Instruction | Constraints | Native proving | Compute units | v1 tx bytes (of 4,096) | Ix data bytes | Accounts (ix / tx) |
+| --- | --- | --- | --- | --- | --- | --- |
+| `init_reserve` | 20,569 | 0.90 s | 249,865 | 1,236 | 789 | 9 / 8 |
+| `intent` | 14,097 | 0.91 s | 245,202 | 1,244 | 893 | 9 / 7 |
+| `cancel_intent` | 7,179 | 0.77 s | 244,561 | 977 | 627 | 8 / 7 |
+| `supply` | 33,652 | 1.93 to 2.13 s | 267,174 to 268,913 | 1,553 | 1,137 | 10 / 9 |
+| `redeem` (partial / full) | 35,302 | 2.08 / 2.09 s | 269,435 / 272,070 | 1,767 | 1,254 | 11 / 10 |
+| `deposit_open` | 14,546 | 0.94 s | 245,220 | 1,148 | 798 | 8 / 7 |
+| `deposit_add` | 23,859 | 1.26 s | 249,409 | 1,214 | 831 | 9 / 8 |
+| `draw` (borrow) | 45,657 | 2.39 to 2.43 s | 276,718 to 280,570 | 1,949 | 1,403 | 12 / 11 |
+| `repay` (partial / full) | 46,929 | 2.48 / 2.51 s | 274,617 / 276,943 | 1,760 | 1,311 | 11 / 10 |
+| `liquidate` | 48,878 | 2.56 to 3.35 s | 277,177 to 278,637 | 1,889 | 1,406 | 13 / 11 |
+| `close` | 13,510 | 0.84 to 1.06 s | 246,335 to 246,339 | 977 | 627 | 8 / 7 |
 
-| Instruction | Program proof bytes | Compute units | v1 tx bytes (of 4,096) | Browser proof time |
-| --- | --- | --- | --- | --- |
-| `init_reserve` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `intent` | not measured yet | not measured yet | not measured yet | not measured yet |
-| `cancel_intent` | not measured yet | not measured yet | not measured yet | not measured yet |
-| `supply` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `redeem` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `deposit_open` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `deposit_add` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `draw` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `repay` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `liquidate` | not measured yet | not measured yet | not measured yet | keeper-proved |
-| `close` | not measured yet | not measured yet | not measured yet | not measured yet |
-
-The local-network tests print compute units and sizes for the shipped instructions:
-`LEND_CHAIN_TESTS=earn_chain lend/scripts/run-chain-test.sh` and
-`LEND_CHAIN_TESTS=vault_chain lend/scripts/run-chain-test.sh` (lines starting `EARN` and the vault
-equivalents). Their output is not committed yet.
+Not measured: proving time in the browser (`intent`, `cancel_intent` and `close` are the three the
+page proves), a `draw` that only withdraws collateral, and the shielded pool's own proof on its own.
 
 The toolkit spike, on prototype circuits that are not the shipped ones (source:
 `docs/notes-for-xark-builders.md`, from `lend/scripts/run-spike.sh`):
@@ -366,4 +363,4 @@ rescans the order history on every poll.
 
 Apache-2.0 (`LICENSE`). The swap side runs Helius' `privacy-ring-examples` swap program, fetched
 at a pinned commit and patched (`patches/swap.patch`), not copied into this repository. Built on Helius Privacy Rings (`spr-*`,
-`@heliuslabs/spr`), Blueshift's Xark, and Pinocchio. Built with Claude Code.
+`@heliuslabs/spr`), Blueshift's Xark, and Pinocchio.

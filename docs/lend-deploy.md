@@ -1,7 +1,7 @@
 # Deploying Keeler Lend to devnet
 
 `scripts/deploy-lend-devnet.sh [--estimate] [name]` deploys the lend program as deployment `name`
-(default `lend`). It needs the owner's go-ahead for the SOL: run `--estimate` first, which sends
+(default `lend`). It spends SOL from the deploy key: run `--estimate` first, which sends
 nothing.
 
 ## Before

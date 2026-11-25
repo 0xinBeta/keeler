@@ -1,5 +1,4 @@
-//! Keeler Lend: a pool with private amounts (`docs/plan-lend.md`). See
-//! `../AGENTS.md` for which files belong to which piece of work.
+//! Keeler Lend: a pool with private amounts (`docs/plan-lend.md`).
 // Exactly one of `insecure-test-setup` (local networks and devnet) and
 // `mainnet`. A mainnet build also needs verifying keys from a real setup
 // (the committed ones refuse to compile without insecure-test-setup) and
