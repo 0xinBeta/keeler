@@ -1,0 +1,64 @@
+Keeler
+Copyright 2026 0xinBeta
+
+Licensed under the Apache License, Version 2.0 (see LICENSE), except where
+noted below.
+
+Third-party work this repository builds on
+------------------------------------------
+
+helius-labs/privacy-ring-examples
+  https://github.com/helius-labs/privacy-ring-examples
+  Pinned commit 9e5d69ade7e0c107a2929306d3b758a8969e1089.
+  That repository carries no licence file and no licence field in its
+  manifests. scripts/setup.sh clones it into .tools/ (not part of this
+  repository) and builds its swap program, which the swap side of Keeler runs.
+  These files in this repository are adapted from it:
+    patches/swap.patch            a patch to swap/xark (program features, lock)
+    lend/sdk/tests/utxo.rs        from test-utils/utxo.rs
+    lend/sdk/tests/wallet.rs      from test-utils/wallet.rs
+    lend/spike/tests/wallet.rs    from test-utils/wallet.rs
+    lend/program/tests/mollusk.rs from test-utils/mollusk.rs
+    lend/sdk/src/proof.rs         in part, from swap/xark/sdk/src/proof.rs
+  Copyright in those parts remains with their authors (Helius Labs). They are
+  not offered under this repository's licence.
+
+Privacy Rings crates (spr-account-checks, spr-client, spr-interface,
+spr-keypair, spr-program, spr-program-test, spr-transaction,
+spr-user-registry-interface)
+  https://github.com/helius-labs/privacy-rings
+  Apache-2.0. Dependencies from crates.io.
+
+spr-hasher
+  https://github.com/helius-labs/zolana
+  Apache-2.0. Dependency from crates.io.
+
+@heliuslabs/spr (npm)
+  Apache-2.0. Dependency of the web page.
+
+zolana CLI
+  https://github.com/helius-labs/zolana
+  Downloaded at setup by the privacy-ring-examples scripts, not included here.
+  It generates the Groth16 verifier sources under
+  lend/program/src/verifier/ and lend/spike/src/verifier/.
+
+Xark (xark, xark-groth16)
+  https://github.com/blueshift-gg/xark
+  MIT. Dependencies from crates.io; the circuits under lend/program/src/circuits
+  are written in it.
+
+groth16-solana
+  https://github.com/Lightprotocol/groth16-solana
+  MIT. Dependency from crates.io.
+
+light-program-profiler
+  https://github.com/Lightprotocol/light-program-profiler
+  Apache-2.0. Git dependency at a9b6735c1cd252111fe07a1c93824158f658d530.
+
+Mollusk (mollusk-svm), Pinocchio
+  https://github.com/anza-xyz/mollusk, https://github.com/anza-xyz/pinocchio
+  Apache-2.0. Dependencies from crates.io.
+
+Onest and Unbounded fonts (@fontsource-variable/onest, @fontsource/unbounded)
+  SIL Open Font License 1.1. Bundled into the built web page, not this
+  repository.
