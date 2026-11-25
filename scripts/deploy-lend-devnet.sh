@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Deploys Keeler Lend to devnet as deployment <name> (default lend). NOT TO
-# BE RUN until the owner approves the SOL it needs: run with --estimate
-# first, which sends nothing and creates no Keychain item. Safe to rerun
+# Deploys Keeler Lend to devnet as deployment <name> (default lend). It
+# spends devnet SOL from keeler-devnet-deploy: run with --estimate first,
+# which sends nothing and creates no Keychain item. Safe to rerun
 # after any failure: the deploy resumes from its buffer and a finished one
 # sends nothing.
 #
@@ -242,9 +242,12 @@ else
 fi
 
 # What the site build and the Worker need (docs/lend-deploy.md, worker/README.md).
-python3 - "$out/build-params.json" <<'EOF' >&2
+python3 - "$out/build-params.json" "$swap" <<'EOF' >&2
 import json, sys
 p = json.load(open(sys.argv[1]))
+tokens = {sym: (mint, decimals) for sym, mint, decimals in json.load(open(sys.argv[2]))["mints"]}
+assets = json.dumps([{"mint": tokens[sym][0], "symbol": sym, "decimals": tokens[sym][1]} for sym in ("tUSD", "tSOL")],
+                    separators=(",", ":"))
 keepers = json.dumps(p["keepers"], separators=(",", ":"))
 listed = json.dumps([{"url": f"<keeper {i + 1} URL>", "pubkey": k} for i, k in enumerate(p["keepers"])],
                     separators=(",", ":"))
@@ -253,6 +256,7 @@ print(f"  VITE_NETWORK=devnet")
 print(f"  VITE_LEND_PROGRAM_ID={p['program_id']}")
 print(f"  VITE_LEND_KEEPERS='{keepers}'")
 print(f"  VITE_LEND_POOL_VIEWING={p['pool_viewing']}")
+print(f"  VITE_ASSETS='{assets}'")
 print("Worker:")
 print(f"  NETWORK=devnet")
 print(f"  LEND_PROGRAM_ID={p['program_id']}")

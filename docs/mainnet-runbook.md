@@ -30,6 +30,9 @@ The debt token is valued at exactly 1 USD, by the program and by the page (whate
 - [ ] Every circuit, the program, the keeper and the page are final. A circuit change after the
       ceremony means a new ceremony.
 - [ ] The open questions in `docs/plan-mainnet.md` ("Open for the owner") are decided **[owner]**.
+- [ ] P-1 from `docs/audit-2026-11-25.md` is fixed before the freeze: a partial repay worth less
+      than one debt share is refused by the repay circuit (regenerated repay keys and checksums),
+      by the Rust and TypeScript math and by the keeper before it builds.
 - [ ] Tag the commit. Every later step builds from this tag with a clean tree.
 
 ## 2. Audit
@@ -55,6 +58,13 @@ forge a proof for them. A mainnet build refuses them (they `compile_error!` with
       `KEELER_LEND_KEYS_DIR` names) and the three browser keys (`intent`, `cancel_intent`, `close`)
       into the site's package; check each copy against the manifest (`shasum -a 256 -c <manifest>`
       in the keys directory).
+- [ ] If the swap launches: install the ceremony's swap browser artifacts in the site package
+      before the mainnet site build. For `make` and `cancel`, copy `circuit.xbc`, `pk.bin` and
+      `vk.bin` from the ceremony's build into `web/public/swap/<circuit>/`, and the
+      `proving-keys.json` of that build (the pk hashes the prover checks) into `web/public/swap/`,
+      replacing the test ones `scripts/setup.sh` put there; check the `pk.bin` files against the
+      swap manifest. Without them a mainnet page proves swaps with the test keys, which the
+      program refuses.
 - [ ] `scripts/setup-lend.sh` and `lend/lend-keys.CHECKSUM` still build and check test keys; they
       need a ceremony mode before the site is built for mainnet.
 
@@ -74,6 +84,7 @@ in this runbook use.
 | `keeler-mainnet-keeper-2` | Keeper 2's key | no | no | yes |
 | `keeler-mainnet-pool` | The pool key: no keeper's key, no deploy key. Whoever holds it reads every amount | for step 5 only | yes | yes |
 | `keeler-mainnet-keeper-http` | The shared `x-keeler-key` (the Worker's `DEALER_KEY`), at least 16 characters | for step 7 | yes | yes |
+| `keeler-price-rpc-url` | The Worker's `PRICE_RPC_URL`: a second provider's RPC URL (with its key), not Helius | for step 7 | no | no |
 
 - [ ] A keeper key per host (2 hosts, at most 4 keepers). No keeper key is the deploy key.
 - [ ] One pool key, made once, copied into the keeper hosts' Keychains and, for the deploy only,
@@ -126,13 +137,20 @@ scripts/deploy-mainnet.sh lend \
   --keeper-config keeper-1.json --keys-dir <ceremony proving keys>
 ```
 
-It refuses a dirty tree, another cluster, a missing parameter, a test or unlisted verifying key, the
-test price, and an authority that is not an autonomous Squads multisig with threshold at least 2.
+It refuses a dirty tree, another cluster, a missing parameter, a vault other than the SOL/USDC one
+of the table above (the four values are fixed in the script), a committed `<circuit>.vk.rs` that
+does not name the manifest's proving key for that circuit (or a circuit the manifest does not
+list), a test or unlisted verifying key, the test price, and an authority that is not an
+autonomous Squads multisig with threshold at least 2, at least two members who can initiate and
+two who can execute, and a time lock of at most two days (`--max-time-lock-secs` to allow
+longer).
 Then: it builds its own `keeler` with the eight build parameters above (`--locked`) and, before
 anything is sent, checks everything the reserve's creation needs (`keeler deploy reserve check`:
 the keeper config loads, `lend.network` is `mainnet`, the keeper, pool and admin keys come from
 the Keychain, keeper 1 is in the compiled set, the pool key gives the compiled viewing key and is
-no keeper's, the admin key is the compiled admin, the RPC is mainnet's, keeper 1 holds 0.05 SOL).
+no keeper's, the admin key is the compiled admin, the RPC is mainnet's, the compiled price account
+is owned by Pyth's receiver and holds a fully verified update for the compiled feed id, keeper 1
+holds 0.05 SOL).
 Then build, cost, deploy, the marker checks again on the deployed bytes, the upgrade authority to
 the vault (read back), and the reserve (`keeler deploy reserve create`, the keeper paying, the
 deploy key co-signing; "reserve exists" when an earlier run made it). A rerun after a failure at
@@ -234,6 +252,8 @@ KEELER_LEND_KEYS_DIR=<ceremony proving keys> target/mainnet-keeper/release/keele
       Its `https://` URL is the keeper's entry in `LEND_KEEPERS`. The Worker refuses a plain
       `http://` keeper off a local network (`DEALER_KEY` goes with every request).
 - [ ] Start the primary, then the standby; `GET /health` answers on both (with `x-keeler-key`).
+- [ ] One process per key: the keeper's and the dealer's lock files stop a second process on the
+      same state file on one host, not on a second host.
 
 ## 7. Worker and site
 
@@ -242,19 +262,29 @@ KEELER_LEND_KEYS_DIR=<ceremony proving keys> target/mainnet-keeper/release/keele
       Worker asks each in order, up to four, when one gives no keeper reply or is still starting),
       `LEND_POOLS` and `LEND_VAULTS` exactly as compiled, `ASSETS`, `PYTH_ACCOUNTS` with both the
       SOL and the USDC account of the table above, the rate limits (`worker/README.md`). Only after
-      the upgrade authority is the vault. The secrets go through a pipe, in `worker/`:
+      the upgrade authority is the vault.
+- [ ] `PRICE_RPC_URL`: an `https://` RPC of a second provider, not a Helius host (the Worker
+      refuses one, and without it `/api/prices` answers 500 on mainnet). The dealer always reads
+      prices through Helius, so the page's reference price must come from another provider: one
+      provider could otherwise show both the same false price. A secret when its URL carries a key.
+- [ ] The secrets go through a pipe, in `worker/`:
 
 ```sh
 security find-generic-password -s keeler-mainnet-keeper-http -w | npx wrangler secret put DEALER_KEY
 security find-generic-password -s keeler-helius-api-key -w | npx wrangler secret put HELIUS_API_KEY
+security find-generic-password -s keeler-price-rpc-url -w | npx wrangler secret put PRICE_RPC_URL
 ```
 
   (`HELIUS_API_KEY` is the key itself: if the Keychain item holds a URL, pipe its `api-key`
   value.)
 - [ ] Site: `VITE_NETWORK=mainnet`, `VITE_LEND_PROGRAM_ID`, `VITE_LEND_KEEPERS` (a JSON list: the
       program's whole keeper set; the Worker lists the ones it runs), `VITE_LEND_POOL_VIEWING`,
-      `VITE_DEALERS`; the ceremony's browser keys. Lending stays hidden unless `/api/config`
-      matches the compiled keepers. A mainnet build names no test token and has no faucet or
+      `VITE_DEALERS`; the ceremony's browser keys; and the assets with their decimals, compiled in
+      (a mainnet build refuses to start without them):
+      `VITE_ASSETS='[{"mint":"11111111111111111111111111111111","symbol":"SOL","decimals":9},{"mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","symbol":"USDC","decimals":6}]'`.
+      SOL is the all-ones address, as the pool and the Worker see it; the mints and both symbols
+      must equal the Worker's `ASSETS` exactly, or the page refuses its config. Lending stays
+      hidden unless `/api/config` matches the compiled keepers. A mainnet build names no test token and has no faucet or
       browser test wallet (`web/tests/build.test.ts`).
 - [ ] The custom domain **[owner]**.
 - [ ] Seed the pool with a first supply, then a small deposit, borrow, repay and close from a
@@ -360,6 +390,8 @@ key rotation: a removed keeper that kept the pool key still reads every amount, 
       hand the buffer's authority to the vault (`solana program set-buffer-authority <buffer>
       --new-buffer-authority <vault>`), and propose the upgrade in Squads; the signers check the
       buffer's bytes against `build.json`'s sha256 first **[owner]**.
+- [ ] If the upgrade changes vault 1's parameters, change `TSOL_TUSD_VAULT` in
+      `web/src/keeler/lend-math.ts` with them, or the page refuses the Worker's config.
 - [ ] After the upgrade: rebuild every keeper (section 6) with the new `KEELER_LEND_KEEPERS`,
       rebuild the site with the new `VITE_LEND_KEEPERS`, set the Worker's `LEND_KEEPERS`, fund and
       start the new keeper. It replays the history and takes the reserve's notes from it.

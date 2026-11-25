@@ -117,7 +117,9 @@ others see or use. Nothing here is done by the deploy script.
    the `LEND_*_LIMIT` rate limits. Deploy the Worker.
 8. **Site build** (**public**): `VITE_NETWORK=devnet`, `VITE_DEALERS`, `VITE_LEND_PROGRAM_ID` (the
    program ID), `VITE_LEND_KEEPERS` (the JSON list of keeper pubkeys from `build-params.json`) and
-   `VITE_LEND_POOL_VIEWING` (its `pool_viewing`); the script prints all three at the end. Then `pnpm build` in `web/` and
+   `VITE_LEND_POOL_VIEWING` (its `pool_viewing`), and `VITE_ASSETS` (tUSD and tSOL with their mints
+   and decimals, from the swap deploy's summary; the symbols must equal the Worker's `ASSETS`); the
+   script prints all four at the end. Then `pnpm build` in `web/` and
    deploy. The page reads the pools and vaults from `/api/config`.
 9. **Check**: open the Earn tab (the pool shows its figures and the price), make a small deposit,
    borrow, repay all and close from a second wallet.
