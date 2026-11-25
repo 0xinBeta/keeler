@@ -740,6 +740,8 @@ const message = base64(512);
 const POOLS_REPLY: Spec = {
   pools: [list(object({
     mint: [address, true], at: [uint, true], size: [amount, true], utilisationBps: [bps, true], supplyRateBps: [uint, true], borrowRateBps: [uint, true],
+    // The keeper's coarse solvency figures (docs/lend-keeper.md): borrowing stops while badDebt exceeds surplus.
+    surplus: [amount, true], badDebt: [amount, true],
   }), 0, 8), true],
 };
 const TICKET_REQUEST: Spec = {

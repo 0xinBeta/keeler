@@ -555,7 +555,7 @@ describe("/api/lend/*", () => {
   });
   const TX = "A".repeat(5464); // 4,096 bytes
   const OUT = "cd".repeat(32);
-  const POOLS_REPLY = { pools: [{ mint: MINT_B, at: 1_800_000_000, size: "1000000000", utilisationBps: 5000, supplyRateBps: 120, borrowRateBps: 280 }] };
+  const POOLS_REPLY = { pools: [{ mint: MINT_B, at: 1_800_000_000, size: "1000000000", utilisationBps: 5000, supplyRateBps: 120, borrowRateBps: 280, surplus: "0", badDebt: "0" }] };
   const ACCOUNT_REPLY = {
     receipts: [{ pool: MINT_B, shares: "5000000", message: "AAAA" }],
     positions: [{ vault: 0, position: "7", collateral: "10000000", debtShares: "0", message: "AAAA" }],
