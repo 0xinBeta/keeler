@@ -481,6 +481,33 @@ fn a_declined_last_look_makes_one_split_and_keeps_its_note() {
     assert_eq!(notes(), vec![want, DEALER_SOL - want], "no second split");
     assert_eq!(settle(&[true, true]), dealer::Settle::Took);
     assert_eq!(chain.status(&order).unwrap(), Status::Settled);
+    let expiry = chain.now().unwrap() + 20;
+    let late = chain
+        .lock(
+            &trader,
+            OrderTerms {
+                destination_mint: chain.mint(SOL_MINT).unwrap(),
+                destination_amount: want,
+                maker: trader.shielded_address().unwrap(),
+                expiry,
+                taker: Some(identity(&dealer_pk).unwrap()),
+            },
+            100_000_000,
+            chain.notes(&trader, net.spl).unwrap().remove(0),
+            chain.resolve(dealer_pk).unwrap(),
+        )
+        .unwrap();
+    while chain.now().unwrap() <= expiry {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let again = chain.exact_note(&dealer, SOL_MINT, want).unwrap();
+    assert_eq!(notes(), vec![DEALER_SOL - 2 * want], "claimed");
+    assert!(chain.take(&dealer, &late, again).is_err());
+    assert_eq!(
+        notes(),
+        vec![want, DEALER_SOL - 2 * want],
+        "a take refused at its send gives its note back"
+    );
 }
 
 #[test]
