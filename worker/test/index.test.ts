@@ -841,7 +841,7 @@ describe("/api/lend/*", () => {
       expect((await call(post("/api/lend/ticket", TICKET), lendEnv())).res.status).toBe(status);
       expect(calls).toHaveLength(1);
     }
-    // Both fail: the last failure, and never a third try.
+    // Both fail: the last failure, once each.
     mockFetch(() => { throw new TypeError("down"); });
     expect((await call(post("/api/lend/ticket", TICKET), lendEnv())).res.status).toBe(502);
     expect(calls).toHaveLength(2);
@@ -849,6 +849,40 @@ describe("/api/lend/*", () => {
     mockFetch(() => { throw new TypeError("down"); });
     expect((await call(post("/api/lend/ticket", TICKET), lendEnv({ LEND_KEEPERS: JSON.stringify([KEEPERS[0]]) }))).res.status).toBe(502);
     expect(calls).toHaveLength(1);
+  });
+
+  it("tries every listed keeper in order, up to four", async () => {
+    const four = [...KEEPERS, { url: "https://k3.example", pubkey: TRADER }, { url: "https://k4.example", pubkey: PROGRAM }];
+    mockFetch((url) => (new URL(url).host === "k4.example" ? Response.json({ ...TICKET_REPLY, keeper: PROGRAM }) : (() => { throw new TypeError("down"); })()));
+    const { res, body } = await call(post("/api/lend/ticket", TICKET), lendEnv({ LEND_KEEPERS: JSON.stringify(four) }));
+    expect(res.status).toBe(200);
+    expect(body.keeper).toBe(PROGRAM);
+    expect(calls.map((c) => new URL(c.url).host)).toEqual(["k1.example", "k2.example", "k3.example", "k4.example"]);
+  });
+
+  it("passes over a keeper still starting inside its dealer, and says lending is starting when none is left", async () => {
+    // The dealer's answer while its keeper replays history or cannot start (cli/src/keeper.rs `Slot`).
+    const starting = () => Response.json({ starting: "the keeper is starting" }, { status: 503 });
+    mockFetch((url) => (new URL(url).host === "k2.example" ? Response.json({ ...TICKET_REPLY, keeper: K2 }) : starting()));
+    const ok = await call(post("/api/lend/ticket", TICKET), lendEnv());
+    expect(ok.res.status).toBe(200);
+    expect(ok.body.keeper).toBe(K2);
+    mockFetch(starting);
+    const { res, body } = await call(post("/api/lend/ticket", TICKET), lendEnv());
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: "Lending is starting up. Try again in a minute." });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("refuses a NETWORK it does not know and a plain-http keeper or dealer off a local network", async () => {
+    expect((await call(req("/api/config"), env({ NETWORK: "mainnet-beta" }))).res.status).toBe(500);
+    mockFetch(() => Response.json(POOLS_REPLY));
+    const plain = JSON.stringify([{ url: "http://k1.example", pubkey: K1 }]);
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPERS: plain }))).res.status).toBe(500);
+    expect((await call(req("/api/lend/pools"), lendEnv({ LEND_KEEPERS: undefined, LEND_KEEPER_URL: "http://keeper.example" }))).res.status).toBe(500);
+    expect((await call(req("/api/config"), env({ DEALERS: JSON.stringify([{ url: "http://d1.example", pubkey: K1 }]) }))).res.status).toBe(500);
+    expect(calls).toHaveLength(0);
+    expect((await call(req("/api/lend/pools"), lendEnv({ NETWORK: "local", LEND_KEEPERS: plain }))).res.status).toBe(200);
   });
 
   it("charges each limit once for a request that fails over", async () => {
@@ -861,26 +895,27 @@ describe("/api/lend/*", () => {
     expect(seen).toEqual(["LEND_TICKET_LIMIT", "LEND_TICKET_GLOBAL_LIMIT"]);
   });
 
-  it("LEND_PAUSED refuses new tickets and builds, and lets reads, repayments and deposit additions through", async () => {
-    const replies: Record<string, unknown> = { "/lend/pools": POOLS_REPLY, "/lend/account": ACCOUNT_REPLY, "/lend/ticket": TICKET_REPLY };
+  it("LEND_PAUSED refuses new Earn deposits itself and forwards everything else marked paused", async () => {
+    const replies: Record<string, unknown> = { "/lend/pools": POOLS_REPLY, "/lend/account": ACCOUNT_REPLY, "/lend/ticket": TICKET_REPLY, "/lend/build": BUILD_REPLY };
     mockFetch((url) => Response.json(replies[new URL(url).pathname]));
     const e = lendEnv({ LEND_PAUSED: "1" });
+    expect(TICKET.purpose).toBe("supply");
+    const { res, body } = await call(post("/api/lend/ticket", TICKET), e);
+    expect(res.status).toBe(503);
+    expect(body.error).toMatch(/paused/);
+    expect(calls).toHaveLength(0);
     const repay = await signed("/lend/ticket", { purpose: "repay", amount: "1000000", vault: 1, position: "7" });
     const deposit = await signed("/lend/ticket", { purpose: "deposit", amount: "1000000", vault: 1, position: "7" });
-    for (const r of [post("/api/lend/ticket", TICKET), post("/api/lend/build", BUILD), post("/api/lend/build", REDEEM)]) {
-      const { res, body } = await call(r, e);
-      expect(res.status, r.url).toBe(503);
-      expect(body.error).toMatch(/paused/);
-    }
-    expect(calls).toHaveLength(0);
-    for (const r of [req("/api/lend/pools"), post("/api/lend/account", ACCOUNT), post("/api/lend/ticket", repay), post("/api/lend/ticket", deposit)]) {
+    // Builds pass too: the keeper refuses only those that borrow (cli/src/keeper.rs, `x-keeler-paused`), so a
+    // withdrawal from Earn or of collateral still works.
+    const passed = [req("/api/lend/pools"), post("/api/lend/account", ACCOUNT), post("/api/lend/ticket", repay), post("/api/lend/ticket", deposit), post("/api/lend/build", BUILD), post("/api/lend/build", REDEEM)];
+    for (const r of passed) {
       expect((await call(r, e)).res.status, r.url).toBe(200);
     }
-    // The keeper is told, so it refuses a deposit that would open a position.
-    expect(calls.map((c) => (c.init.headers as Record<string, string>)["x-keeler-paused"])).toEqual(["1", "1", "1", "1"]);
+    expect(calls.map((c) => (c.init.headers as Record<string, string>)["x-keeler-paused"])).toEqual(passed.map(() => "1"));
     // Not paused: no header.
     await call(req("/api/lend/pools"), lendEnv());
-    expect((calls[4]!.init.headers as Record<string, string>)["x-keeler-paused"]).toBeUndefined();
+    expect((calls[passed.length]!.init.headers as Record<string, string>)["x-keeler-paused"]).toBeUndefined();
   });
 
   it("refuses a session authorised for another site", async () => {
