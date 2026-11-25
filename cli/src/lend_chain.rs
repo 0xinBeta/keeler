@@ -240,7 +240,7 @@ impl LendChain {
         let amounts: Vec<u64> = notes.iter().map(|u| u.utxo.amount).collect();
         let inputs: Vec<WalletUtxo> = match plan_funds(&amounts, need)? {
             Funding::Exact(i) => {
-                crate::chain::claim(&notes[i]);
+                self.chain.claim(&notes[i]);
                 return Ok(notes[i].clone());
             }
             Funding::Split(i) => vec![notes[i].clone()],
@@ -250,7 +250,7 @@ impl LendChain {
             "lend: making a note of exactly {need} from {} keeper notes for a liquidation",
             inputs.len()
         );
-        inputs.iter().for_each(crate::chain::claim);
+        inputs.iter().for_each(|n| self.chain.claim(n));
         let payer = self.kp.pubkey();
         let me = self.kp.shielded_address().map_err(err)?;
         let mut tx = ConfidentialTransaction::new(inputs, payer).map_err(err)?;
@@ -270,7 +270,7 @@ impl LendChain {
                 .into_iter()
                 .find(|u| u.utxo.amount == need)
             {
-                crate::chain::claim(&n);
+                self.chain.claim(&n);
                 return Ok(n);
             }
             std::thread::sleep(Duration::from_secs(1));

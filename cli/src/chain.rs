@@ -117,6 +117,9 @@ pub struct Chain {
     pub cluster: Cluster,
     /// `network.priority_fee`, micro-lamports per compute unit.
     pub priority_fee: u64,
+    /// Which network this is among the process's connections (a hash of the
+    /// RPC URL): claims on one do not hide another's notes.
+    scope: u64,
     /// Mint decimals never change.
     decimals: Mutex<HashMap<Address, u8>>,
 }
@@ -124,24 +127,10 @@ pub struct Chain {
 /// Notes one part of this process picked to spend, by hash, with when. The
 /// swap dealer and the lend keeper share one wallet in one process, so
 /// [`Chain::notes`] hides a claimed note from both until its spend has
-/// landed or died and the indexer has caught up.
-static CLAIMED: Mutex<Vec<([u8; 32], Instant)>> = Mutex::new(Vec::new());
+/// landed or died and the indexer has caught up. Scoped by network: local
+/// test networks in one process hold fixture notes with the same hashes.
+static CLAIMED: Mutex<Vec<(u64, [u8; 32], Instant)>> = Mutex::new(Vec::new());
 const CLAIM: Duration = Duration::from_secs(180);
-
-/// Claims `note` for a spend about to be built.
-pub fn claim(note: &WalletUtxo) {
-    if let Ok(mut c) = CLAIMED.lock() {
-        c.retain(|(_, at)| at.elapsed() < CLAIM);
-        c.push((note.utxo_hash, Instant::now()));
-    }
-}
-
-fn claimed(note: &WalletUtxo) -> bool {
-    CLAIMED.lock().is_ok_and(|c| {
-        c.iter()
-            .any(|(h, at)| *h == note.utxo_hash && at.elapsed() < CLAIM)
-    })
-}
 
 /// Unix time from the Clock sysvar's data.
 pub fn clock_time(data: &[u8]) -> Result<i64> {
@@ -160,10 +149,32 @@ pub enum Status {
 }
 
 impl Chain {
+    /// Claims `note` for a spend about to be built.
+    pub fn claim(&self, note: &WalletUtxo) {
+        if let Ok(mut c) = CLAIMED.lock() {
+            c.retain(|(_, _, at)| at.elapsed() < CLAIM);
+            c.push((self.scope, note.utxo_hash, Instant::now()));
+        }
+    }
+
+    fn claimed(&self, note: &WalletUtxo) -> bool {
+        CLAIMED.lock().is_ok_and(|c| {
+            c.iter().any(|(scope, h, at)| {
+                *scope == self.scope && *h == note.utxo_hash && at.elapsed() < CLAIM
+            })
+        })
+    }
+
     /// Connects, checks the default tree is tree id 0, and registers the
     /// pool's asset id of every mint in `mints`.
     pub fn connect(network: &Network, mints: &[Address]) -> Result<Self> {
         let (rpc_url, indexer_url) = network.urls()?;
+        let scope = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            rpc_url.hash(&mut h);
+            h.finish()
+        };
         let cluster = cluster_at(&rpc_url)?;
         let client = match &network.prover {
             // The local prover (`ZOLANA_PROVER_URL`); proof data comes from
@@ -223,6 +234,7 @@ impl Chain {
             registry,
             cluster,
             priority_fee: network.priority_fee,
+            scope,
             decimals: Mutex::default(),
         })
     }
@@ -283,7 +295,7 @@ impl Chain {
             .map(|b| b.utxos.clone())
             .unwrap_or_default()
             .into_iter()
-            .filter(|u| u.utxo.ring_program_id.is_none() && !claimed(u))
+            .filter(|u| u.utxo.ring_program_id.is_none() && !self.claimed(u))
             .collect())
     }
 
@@ -314,7 +326,7 @@ impl Chain {
     ) -> Result<WalletUtxo> {
         let notes = self.notes(kp, mint)?;
         if let Some(note) = notes.iter().find(|u| u.utxo.amount == amount) {
-            claim(note);
+            self.claim(note);
             return Ok(note.clone());
         }
         let source = notes
@@ -322,7 +334,7 @@ impl Chain {
             .filter(|u| u.utxo.amount > amount)
             .min_by_key(|u| u.utxo.amount)
             .ok_or_else(|| anyhow!("no note of {mint} covers {amount}"))?;
-        claim(&source);
+        self.claim(&source);
         let payer = kp.pubkey();
         let me = kp.shielded_address()?;
         let mut tx = ConfidentialTransaction::new(vec![source], payer)?;
@@ -343,7 +355,7 @@ impl Chain {
             .into_iter()
             .find(|u| u.utxo.amount == amount)
             .ok_or_else(|| anyhow!("split note of {amount} not found after self-transfer"))?;
-        claim(&note);
+        self.claim(&note);
         Ok(note)
     }
 
