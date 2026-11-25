@@ -4,8 +4,8 @@ import { Audience, ChainSees, Closing, Dealers, Facts, Faq, Features, LendFeatur
 import { LendActivity } from "./Lend";
 import type { Market } from "./Lend";
 import { Orders } from "./Orders";
+import { short } from "./format";
 import { Panel } from "./Panel";
-import type { Tab } from "./Panel";
 import type { DealerLight } from "./ring";
 import { RingCanvas } from "./RingCanvas";
 import { errorText, Logo, NetworkPill } from "./shared";
@@ -16,7 +16,7 @@ const OPEN: Order["status"][] = ["pending", "locked"];
 export const ROUTES = ["earn", "borrow", "swap", "balances", "activity"] as const;
 export type Route = (typeof ROUTES)[number];
 const routeOf = (hash: string): Route | null => ROUTES.find((r) => `#${r}` === hash) ?? null;
-const isTab = (r: Route | null): r is Tab => r !== null && r !== "activity";
+const NAV: Record<Route, string> = { earn: "Earn", borrow: "Borrow", swap: "Swap", balances: "Balances", activity: "Activity" };
 
 /** The route the location's hash names, or null for the landing. */
 function useRoute(): Route | null {
@@ -44,10 +44,10 @@ export function App({ keeler }: { keeler: Keeler }) {
   const [lights, setLights] = useState<DealerLight[] | null>(null);
   const [proving, setProving] = useState(false);
   const [settled, setSettled] = useState(0);
+  const [address, setAddress] = useState<string | null>(null);
   const panel = useRef<HTMLElement>(null);
   const hero = useRef<HTMLElement>(null);
   const heroSlot = useRef<HTMLDivElement>(null);
-  const appHero = useRef<HTMLDivElement>(null);
   const seen = useRef(new Map<string, Order["status"]>());
   const inflight = useRef<Promise<Order[]> | null>(null);
 
@@ -195,46 +195,38 @@ export function App({ keeler }: { keeler: Keeler }) {
 
   const route = useRoute();
   const view = route ? "app" : "landing";
-  const [tab, setTab] = useState<Tab>(isTab(route) ? route : "swap");
-  if (isTab(route) && route !== tab) setTab(route);
+  const [tab, setTab] = useState<Route>(route ?? "swap");
+  if (route && route !== tab) setTab(route);
   const ringInput = useMemo(() => ({ dealers: lights, proving, settled }), [lights, proving, settled]);
   const startSwap = useCallback(() => go("swap"), []);
+  const refundable =
+    orders.filter((o) => o.status === "refundable").length + (account?.operations.filter((o) => o.status === "refundable").length ?? 0);
+  const nav = ROUTES.filter((r) => lend || (r !== "earn" && r !== "borrow"));
 
   const shownView = useRef(view);
   useEffect(() => {
     if (shownView.current === view) return;
     shownView.current = view;
-    const anchor = isTab(route) ? null : document.getElementById(location.hash.slice(1));
+    const anchor = route ? null : document.getElementById(location.hash.slice(1));
     if (anchor) anchor.scrollIntoView();
     else window.scrollTo(0, 0);
     if (view === "app" && !panel.current?.contains(document.activeElement)) panel.current?.focus({ preventScroll: true });
   }, [view, route]);
+  useEffect(() => {
+    if (route) window.scrollTo(0, 0);
+  }, [route]);
 
   return (
     <>
-      <a className="skip" href="#swap">
-        Skip to the swap
-      </a>
-      <div className="stage">
-        {view === "landing" ? (
-          <RingCanvas key="landing" mode="hero" input={ringInput} anchor={heroSlot} hero={hero} />
-        ) : (
-          <RingCanvas key="app" mode="hero" input={ringInput} anchor={panel} hero={appHero} />
+      <div className="stage" hidden={view !== "landing"}>
+        {view === "landing" && (
+          <>
+            <a className="skip" href="#swap">
+              Skip to the swap
+            </a>
+            <RingCanvas key="landing" mode="hero" input={ringInput} anchor={heroSlot} hero={hero} />
+          </>
         )}
-        <header className="top">
-          <a className="wordmark" href="#top" aria-label="Keeler, top of page">
-            <Logo />
-            Keeler
-          </a>
-          <nav aria-label="On this page">
-            <a href="#how">How it works</a>
-            <a href="#privacy">Privacy</a>
-            {lend && <a href="#lend">Earn & Borrow</a>}
-            <a href="#dealers">Dealers</a>
-            <a href="#faq">FAQ</a>
-          </nav>
-          <NetworkPill config={config} />
-        </header>
         <main id="top">
           {view === "landing" && (
             <>
@@ -279,85 +271,130 @@ export function App({ keeler }: { keeler: Keeler }) {
               <Closing onStart={startSwap} />
             </>
           )}
-          <div className="app-view" hidden={view !== "app"}>
-            <div className="hero app-hero" ref={appHero}>
-              <section className="panel" id="swap" ref={panel} tabIndex={-1} aria-label="Private swap">
-                {config ? (
-                  <Panel
-                    keeler={keeler}
-                    config={config}
-                    balances={balances}
-                    orders={orders}
-                    chainOffset={chainOffset}
-                    onReady={() => setReady(true)}
-                    refreshBalances={refreshBalances}
-                    refreshOrders={refreshOrders}
-                    reloadConfig={reloadConfig}
-                    setLights={setLights}
-                    setProving={setProving}
-                    tab={tab}
-                    setTab={go}
-                    market={market}
-                    account={account}
-                    refreshLend={refreshLend}
-                  />
-                ) : configError ? (
-                  <div className="panel-body">
-                    <h2 className="panel-title">Keeler is not reachable</h2>
-                    <p className="note note-error" role="alert">
-                      {configError}
-                    </p>
-                    <button className="btn btn-primary" onClick={() => location.reload()}>
-                      Reload the page
-                    </button>
-                  </div>
-                ) : (
-                  <div className="panel-body" aria-busy="true">
-                    <p className="muted">Loading…</p>
-                  </div>
-                )}
-              </section>
-            </div>
-            <div id="activity">
-              {ready && (
-                <Orders
-                  keeler={keeler}
-                  orders={orders}
-                  chainOffset={chainOffset}
-                  refresh={refreshOrders}
-                  refreshBalances={refreshBalances}
-                  rescan={() =>
-                    keeler.rescanOrders().then((list) => {
-                      for (const o of list) seen.current.set(o.id, o.status);
-                      setOrders(list);
-                      return list;
-                    })
-                  }
-                />
-              )}
-              {ready && lend && (
-                <LendActivity
-                  lend={lend}
-                  balances={balances}
-                  market={market}
-                  account={account}
-                  chainOffset={chainOffset}
-                  refreshLend={refreshLend}
-                  refreshBalances={refreshBalances}
-                />
-              )}
-            </div>
-          </div>
         </main>
       </div>
-      <footer className="foot">
-        <div className="foot-brand">
-          <Logo />
-          <span>Keeler</span>
-        </div>
-        <p className="muted">Built on Helius Privacy Rings</p>
-        <NetworkPill config={config} />
-      </footer>
+      <div className="app" hidden={view !== "app"}>
+        <a
+          className="skip"
+          href={`#${tab}`}
+          onClick={(e) => {
+            e.preventDefault();
+            panel.current?.focus();
+          }}
+        >
+          Skip to the workspace
+        </a>
+        <header className="topbar">
+          <div className="wrap topbar-inner">
+            <a className="brand" href="#top" aria-label="Keeler, top of page">
+              <Logo />
+              Keeler
+            </a>
+            <nav aria-label="Application">
+              {nav.map((r) => (
+                <a
+                  key={r}
+                  href={`#${r}`}
+                  aria-current={route === r ? "page" : undefined}
+                  aria-label={r === "activity" && refundable > 0 ? `${NAV[r]}, ${refundable} to take back` : undefined}
+                >
+                  {NAV[r]}
+                  {r === "activity" && refundable > 0 && (
+                    <span className="nav-count" aria-hidden="true">
+                      {refundable}
+                    </span>
+                  )}
+                </a>
+              ))}
+            </nav>
+            <div className="topbar-end">
+              <NetworkPill config={config} />
+              <span className="account" title={address ?? undefined}>
+                <span className="account-dot" aria-hidden="true" />
+                {address ? short(address) : "No wallet connected"}
+              </span>
+            </div>
+          </div>
+        </header>
+        <main id="workspace" className="wrap">
+          <section ref={panel} tabIndex={-1} aria-label="Keeler app">
+            {config ? (
+              <Panel
+                keeler={keeler}
+                config={config}
+                balances={balances}
+                orders={orders}
+                chainOffset={chainOffset}
+                onReady={() => setReady(true)}
+                refreshBalances={refreshBalances}
+                refreshOrders={refreshOrders}
+                reloadConfig={reloadConfig}
+                setLights={setLights}
+                setProving={setProving}
+                tab={tab}
+                setTab={go}
+                market={market}
+                account={account}
+                refreshLend={refreshLend}
+                address={address}
+                setAddress={setAddress}
+                refundable={refundable}
+                activity={
+                  <>
+                    {ready && (
+                      <Orders
+                        keeler={keeler}
+                        orders={orders}
+                        chainOffset={chainOffset}
+                        refresh={refreshOrders}
+                        refreshBalances={refreshBalances}
+                        rescan={() =>
+                          keeler.rescanOrders().then((list) => {
+                            for (const o of list) seen.current.set(o.id, o.status);
+                            setOrders(list);
+                            return list;
+                          })
+                        }
+                      />
+                    )}
+                    {ready && lend && (
+                      <LendActivity
+                        lend={lend}
+                        balances={balances}
+                        market={market}
+                        account={account}
+                        chainOffset={chainOffset}
+                        refreshLend={refreshLend}
+                        refreshBalances={refreshBalances}
+                      />
+                    )}
+                  </>
+                }
+              />
+            ) : configError ? (
+              <div className="desk-page">
+                <div className="page-heading">
+                  <h1>Keeler is not reachable</h1>
+                </div>
+                <p className="note note-error" role="alert">
+                  {configError}
+                </p>
+                <button className="button button-primary" onClick={() => location.reload()}>
+                  Reload the page
+                </button>
+              </div>
+            ) : (
+              <div className="desk-page" aria-busy="true">
+                <p className="muted">Loading…</p>
+              </div>
+            )}
+          </section>
+        </main>
+        <footer className="wrap app-footer">
+          <a href="#top">Back to Keeler</a>
+          <span>Built on Helius Privacy Rings</span>
+        </footer>
+      </div>
     </>
   );
 }

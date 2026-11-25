@@ -1,11 +1,15 @@
 // Earn and Borrow in the panel, and the lending activity list below the hero. Copy rules: docs/plan-landing.md and
 // the brief in docs/plan-lend.md; a sentence that says what a money-moving button does stays next to that button.
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Asset, Balance, KeelerLend, LendAccount, LendKind, LendOperation, LendStep, Pool, Position, Vault } from "../keeler/index";
 import type { MockLendControls } from "../keeler/mock-lend";
+import { useReport } from "./app/ring";
+import type { Report } from "./app/ring";
 import { countdown, formatUnits, parseUnits } from "./format";
-import { drawPrice, grow, healthBps, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceText } from "./lend-view";
-import { Amount, ErrorNote, errorText, useChainNow } from "./shared";
+import { borrowLimits, drawPrice, earnLimits, grow, healthBps, liquidatable, liquidationPrice, maxBorrow, pct, priceText } from "./lend-view";
+import { borrowModel, earnModel } from "./orbit/model";
+import type { DeskModel } from "./orbit/model";
+import { Amount, amountText, ErrorNote, errorText, Funds, RefundNotice, useChainNow } from "./shared";
 
 export type Market = { pools: Pool[]; vaults: Vault[] };
 
@@ -19,6 +23,8 @@ export type LendProps = {
   refreshLend: (prompt?: boolean) => Promise<unknown>;
   refreshBalances: () => Promise<unknown>;
 };
+
+type DeskProps = LendProps & { lend: KeelerLend; refundable: number; report: Report };
 
 const FLOW: Record<LendKind, LendStep[]> = {
   supply: ["proving", "signing", "keeper", "landed"],
@@ -67,7 +73,6 @@ export function kindLabel(o: Pick<LendOperation, "kind" | "amounts">, collateral
 /** A value growing at `rateBps` a year since `asOf`, recomputed each second from chain time. */
 const grown = (value: bigint, rateBps: number, asOf: number, now: number | null) => (now === null ? value : grow(value, rateBps, now - asOf));
 
-const largest = (balances: Balance[] | null, asset: Asset) => balances?.find((b) => b.asset.mint === asset.mint)?.largestNote ?? null;
 const plain = (v: bigint, a: Asset) => formatUnits(v, a.decimals).replace(/,/g, "");
 
 /** The step list for one operation; `failed` marks the step it stopped at. */
@@ -163,13 +168,14 @@ function Progress({ p, op, onDone }: { p: LendProps; op: ReturnType<typeof useOp
   };
 
   return (
-    <div className="stack">
-      <p className="muted">
+    <div className="ticket-flow">
+      {status === "landed" && <span className="result-mark" aria-hidden="true" />}
+      <p className="review-lede">
         {kindLabel(run)}: {what}
       </p>
       <OpSteps kind={run.kind} step={step} status={status} failed={!!run.failed} />
       {status === "pending" && step === "keeper" && left !== null && (
-        <p className="muted small num">{left > 0 ? `If it isn't taken in, you can take it back in ${countdown(left)}.` : "Request expired, checking…"}</p>
+        <p className="ticket-foot num">{left > 0 ? `If it isn't taken in, you can take it back in ${countdown(left)}.` : "Request expired, checking…"}</p>
       )}
       <p className={`status${run.failed || status === "failed" ? " bad" : ""}`} aria-live="polite">
         {line}
@@ -180,12 +186,12 @@ function Progress({ p, op, onDone }: { p: LendProps; op: ReturnType<typeof useOp
         </p>
       )}
       {status === "refundable" && (
-        <button className="btn btn-primary" onClick={refund} disabled={busy} aria-busy={busy}>
+        <button className="button button-primary main-action" onClick={refund} disabled={busy} aria-busy={busy}>
           {busy ? "Taking funds back…" : "Take funds back"}
         </button>
       )}
       {(run.failed || status === "landed" || status === "refunded" || status === "failed") && (
-        <button className="btn btn-primary" onClick={onDone}>
+        <button className="button button-primary main-action" onClick={onDone}>
           Done
         </button>
       )}
@@ -207,25 +213,29 @@ function Field(props: {
 }) {
   const { id, asset } = props;
   return (
-    <div className="field">
-      <label htmlFor={id}>{props.label}</label>
-      <div className="combo">
-        <input
-          id={id}
-          inputMode="decimal"
-          autoComplete="off"
-          placeholder="0"
-          value={props.text}
-          onChange={(e) => props.setText(e.target.value)}
-          aria-invalid={!!props.invalid}
-          aria-describedby={`${id}-hint`}
-        />
-        <span className="combo-sym">{asset.symbol}</span>
+    <div className="money-field">
+      <div className="field-frame">
+        <label className="instrument-label" htmlFor={id}>
+          {props.label}
+        </label>
+        <div className="amount-row">
+          <input
+            id={id}
+            inputMode="decimal"
+            autoComplete="off"
+            placeholder="0"
+            value={props.text}
+            onChange={(e) => props.setText(e.target.value)}
+            aria-invalid={!!props.invalid}
+            aria-describedby={`${id}-hint`}
+          />
+          <span className="asset-static">{asset.symbol}</span>
+        </div>
       </div>
-      <div className="hint" id={`${id}-hint`}>
+      <div className="field-hint" id={`${id}-hint`}>
         {props.invalid ? <span className="bad">{props.invalid}</span> : <span>{props.hint}</span>}
         {props.max !== null && props.max > 0n && (
-          <button type="button" className="link" onClick={() => props.setText(plain(props.max!, asset))}>
+          <button type="button" className="inline-button" onClick={() => props.setText(plain(props.max!, asset))}>
             {props.maxLabel ?? "Use maximum"}
           </button>
         )}
@@ -245,39 +255,64 @@ function check(text: string, asset: Asset, shown: boolean, max: bigint | null, t
   return { parsed: typeof parsed === "bigint" ? parsed : null, invalid: shown ? invalid : null, ok: !invalid };
 }
 
-/* ---------------- Earn ---------------- */
+function DeskLayout({ p, title, rail, railLabel, children }: { p: DeskProps; title: string; rail: React.ReactNode; railLabel: string; children: React.ReactNode }) {
+  return (
+    <div className="workspace-grid lending-workspace">
+      <section className="ticket" aria-label={title}>
+        <div className="ticket-header">
+          <h2>{title}</h2>
+        </div>
+        <div className="ticket-body">
+          <RefundNotice count={p.refundable} />
+          <KeeperCheck p={p} />
+          {children}
+        </div>
+      </section>
+      <aside className="context-rail" aria-label={railLabel}>
+        {rail}
+        <Funds balances={p.balances} />
+      </aside>
+    </div>
+  );
+}
 
-export function EarnTab(p: LendProps) {
-  const pool = p.market?.pools[0];
-  const [chosen, setMode] = useState<"in" | "out">("in");
-  const [text, setText] = useState("");
-  const [shown, setShown] = useState(false);
-  const op = useOperation(p);
-  const now = useChainNow(p.chainOffset);
-
-  if (!pool) return <p className="muted">Reading the pool…</p>;
-  if (op.run)
-    return (
-      <Progress
-        p={p}
-        op={op}
-        onDone={() => {
-          op.clear();
-          setText("");
-          setShown(false);
+function KeeperCheck({ p }: { p: LendProps }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (!p.account?.needsSession) return null;
+  return (
+    <div className="note keeper-check">
+      The keeper may have news for your lending (a fill, or a change made in another browser).{" "}
+      <button
+        className="button button-secondary button-small"
+        disabled={busy}
+        onClick={() => {
+          setBusy(true);
+          setError(null);
+          p.refreshLend(true)
+            .catch((e) => setError(errorText(e)))
+            .finally(() => setBusy(false));
         }}
-      />
-    );
+      >
+        Check with the keeper
+      </button>{" "}
+      Your wallet asks once to allow this lending session.
+      <ErrorNote text={error} />
+    </div>
+  );
+}
 
+const amountsText = (amounts: Running["amounts"]) => amounts.map((x) => amountText(x.amount, x.asset)).join(" and ");
+
+
+function earnForm(p: LendProps, pool: Pool, chosen: "in" | "out", text: string, shown: boolean, now: number | null) {
   const a = pool.asset;
   // Every receipt in this pool counts towards the deposit; one withdrawal spends one receipt, so the largest caps it.
-  const mine = p.account?.receipts.filter((r) => r.pool === pool.id && r.shares > 0n) ?? [];
+  const { mine, largestReceipt, note } = earnLimits(pool, p.account?.receipts ?? null, p.balances);
   const receipt = mine.length ? { value: mine.reduce((t, r) => t + r.value, 0n) } : undefined;
-  const largestReceipt = mine.reduce((m, r) => (r.value > m ? r.value : m), 0n);
   // With nothing left to withdraw the form goes back to depositing.
   const mode = receipt ? chosen : "in";
   const value = receipt ? grown(receipt.value, pool.supplyAprBps, p.account!.asOf, now) : 0n;
-  const note = largest(p.balances, a);
   const max = mode === "in" ? note : largestReceipt;
   const f = check(
     text,
@@ -291,7 +326,40 @@ export function EarnTab(p: LendProps) {
         : `Your deposit is worth ${formatUnits(max ?? 0n, a.decimals)} ${a.symbol}. Enter that or less.`,
     mode === "in" ? { value: pool.minSupply, text: `The pool takes at least ${formatUnits(pool.minSupply, a.decimals)} ${a.symbol}.` } : undefined,
   );
+  return { a, receipt, mode, value, note, max, f };
+}
 
+export function EarnTab(p: DeskProps) {
+  const pool = p.market?.pools[0];
+  const [chosen, setMode] = useState<"in" | "out">("in");
+  const [text, setText] = useState("");
+  const [shown, setShown] = useState(false);
+  const op = useOperation(p);
+  const now = useChainNow(p.chainOffset);
+  const submitted = useRef<Pick<DeskModel, "fraction" | "ltv"> | null>(null);
+
+  const form = pool ? earnForm(p, pool, chosen, text, shown, now) : null;
+  const input = form && { parsed: form.f.parsed, ok: form.f.ok, limit: form.max, mode: form.mode };
+  const edit = earnModel(input && { ...input, run: null, live: null, submitted: null });
+  if (!op.run) submitted.current = { fraction: edit.fraction };
+  const model = earnModel(input && { ...input, run: op.run, live: op.live, submitted: submitted.current });
+  let label = "Your deposit";
+  let value = form ? amountText(form.value, form.a) : "—";
+  if (form && op.run && model.phase === "review") [label, value] = [kindLabel(op.run), amountsText(op.run.amounts)];
+  else if (form && !op.run && model.valid && form.f.parsed !== null) {
+    const after = form.mode === "in" ? form.value + form.f.parsed : form.value > form.f.parsed ? form.value - form.f.parsed : 0n;
+    [label, value] = [form.mode === "in" ? "Your deposit after this" : "Your deposit after this withdrawal", amountText(after, form.a)];
+  }
+  useReport("earn", { model, label, value }, p.report);
+
+  if (!pool || !form)
+    return (
+      <DeskLayout p={p} title="Earn" rail={null} railLabel="Balances">
+        <p className="muted">Reading the pool…</p>
+      </DeskLayout>
+    );
+
+  const { a, receipt, mode, note, max, f } = form;
   const submit = () => {
     setShown(true);
     if (!f.ok || f.parsed === null) return;
@@ -302,96 +370,127 @@ export function EarnTab(p: LendProps) {
     );
   };
 
-  return (
-    <div className="stack">
+  const rail = (
+    <>
       <PoolCard pool={pool} />
-      <div className="lend-card mine">
-        <span className="muted small">Your deposit</span>
-        {receipt ? (
-          <>
-            <span className="mine-big num" aria-live="off">
-              <Amount value={value} asset={a} />
-            </span>
-            <span className="muted small">
-              Growing at <span className="good">{pct(pool.supplyAprBps, 2)}</span> a year. Only you and the keeper can see it.
-            </span>
-          </>
-        ) : (
-          <span className="muted">Nothing deposited yet. Your first deposit starts earning as soon as the keeper takes it in.</span>
-        )}
-      </div>
-      <form
-        className="stack"
-        noValidate
-        onSubmit={(e) => {
-          e.preventDefault();
-          submit();
-        }}
-      >
-        <div className="seg seg-small" role="group" aria-label="Earn action">
-          <button type="button" aria-pressed={mode === "in"} onClick={() => { setMode("in"); setShown(false); }}>
-            Deposit
-          </button>
-          <button type="button" aria-pressed={mode === "out"} onClick={() => { setMode("out"); setShown(false); }} disabled={!receipt}>
-            Withdraw
-          </button>
+      <section className="rail-panel mine" aria-label="Your deposit">
+        <div className="rail-head">
+          <h2>Your deposit</h2>
         </div>
-        <Field
-          id="earn-amt"
-          label={mode === "in" ? "Deposit to the pool" : "Withdraw from the pool"}
-          asset={a}
-          text={text}
-          setText={setText}
-          invalid={f.invalid}
-          max={max}
-          maxLabel={mode === "out" ? "Withdraw all" : undefined}
-          hint={
-            max === null ? (
-              "Reading your private balance…"
-            ) : mode === "in" ? (
-              <>
-                Largest private note <Amount value={max} asset={a} />
-              </>
-            ) : (
-              <>
-                Deposit worth <Amount value={max} asset={a} />
-              </>
-            )
-          }
-        />
-        {mode === "in" && note === 0n ? (
-          <p className="empty">You have no private {a.symbol} yet. Move some in from Balances to start earning.</p>
+        {receipt ? (
+          <div className="stat">
+            <span className="mine-big num" aria-live="off">
+              <Amount value={form.value} asset={a} />
+            </span>
+            <span className="rail-foot">
+              Growing at <span className="good">{pct(pool.supplyAprBps, 2)}</span> a year. Lending amounts are visible to you and to Keeler's
+              keeper service.
+            </span>
+          </div>
         ) : (
-          <button className="btn btn-primary" type="submit">
-            {mode === "in" ? "Deposit and earn" : "Withdraw"}
-          </button>
+          <p className="rail-foot">Nothing deposited yet. Your first deposit starts earning as soon as the keeper takes it in.</p>
         )}
-        <p className="muted small">
-          {mode === "in"
-            ? "Your browser proves the deposit and your wallet signs it; the keeper then adds it to the pool. If it isn't added before the request expires, you take it back in one click."
-            : "The keeper builds the withdrawal and your wallet signs it. It is paid into your private balance in that one transaction."}
-        </p>
-      </form>
+      </section>
+    </>
+  );
+
+  return (
+    <DeskLayout p={p} title={op.run ? kindLabel(op.run) : mode === "in" ? `Deposit ${a.symbol}` : `Withdraw ${a.symbol}`} rail={rail} railLabel="Pool and balances">
+      {op.run ? (
+        <Progress
+          p={p}
+          op={op}
+          onDone={() => {
+            op.clear();
+            setText("");
+            setShown(false);
+          }}
+        />
+      ) : (
+        <form
+          className="ticket-flow"
+          noValidate
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
+          <div className="mode-picker" role="group" aria-label="Earn action">
+            <button type="button" aria-pressed={mode === "in"} onClick={() => { setMode("in"); setShown(false); }}>
+              Deposit
+            </button>
+            <button type="button" aria-pressed={mode === "out"} onClick={() => { setMode("out"); setShown(false); }} disabled={!receipt}>
+              Withdraw
+            </button>
+          </div>
+          <Field
+            id="earn-amt"
+            label={mode === "in" ? "Deposit to the pool" : "Withdraw from the pool"}
+            asset={a}
+            text={text}
+            setText={setText}
+            invalid={f.invalid}
+            max={max}
+            maxLabel={mode === "out" ? "Withdraw all" : undefined}
+            hint={
+              max === null ? (
+                "Reading your private balance…"
+              ) : mode === "in" ? (
+                <>
+                  Largest private note <Amount value={max} asset={a} />
+                </>
+              ) : (
+                <>
+                  Deposit worth <Amount value={max} asset={a} />
+                </>
+              )
+            }
+          />
+          <dl className="form-summary">
+            <div>
+              <dt>From</dt>
+              <dd>{mode === "in" ? "Private balance" : `${a.symbol} pool`}</dd>
+            </div>
+            <div>
+              <dt>To</dt>
+              <dd>{mode === "in" ? `${a.symbol} pool` : "Private balance"}</dd>
+            </div>
+            <div>
+              <dt>Supply rate</dt>
+              <dd>{pct(pool.supplyAprBps, 2)} a year, floating</dd>
+            </div>
+          </dl>
+          {mode === "in" && note === 0n ? (
+            <p className="empty">You have no private {a.symbol} yet. Move some in from Balances to start earning.</p>
+          ) : (
+            <button className="button button-primary main-action" type="submit">
+              {mode === "in" ? "Deposit and earn" : "Withdraw"}
+            </button>
+          )}
+          <p className="ticket-foot">
+            {mode === "in"
+              ? "Your browser proves the deposit and your wallet signs it; the keeper then adds it to the pool. If it isn't added before the request expires, you take it back in one click."
+              : "The keeper builds the withdrawal and your wallet signs it. It is paid into your private balance in that one transaction."}
+          </p>
+        </form>
+      )}
       <ErrorNote text={op.formError} />
-    </div>
+    </DeskLayout>
   );
 }
 
 export function PoolCard({ pool }: { pool: Pool }) {
   return (
-    <div className="lend-card pool">
-      <div className="lend-card-head">
-        <span>
-          <span className="pool-name">{pool.asset.symbol} pool</span>
-          <span className="muted small"> · floating rate</span>
-        </span>
-        <span className="tag tag-private">Private amounts</span>
+    <section className="rail-panel pool" aria-label={`${pool.asset.symbol} pool`}>
+      <div className="rail-head">
+        <h2>{pool.asset.symbol} pool</h2>
+        <span className="rail-tag">Floating rate</span>
       </div>
       <div className="apr">
         <span className="apr-big num">{pct(pool.supplyAprBps, 2)}</span>
-        <span className="muted">supply APR</span>
+        <span className="instrument-label">supply APR</span>
       </div>
-      <dl className="kv">
+      <dl className="readings">
         <div>
           <dt>Borrow APR</dt>
           <dd className="num">{pct(pool.borrowAprBps, 2)}</dd>
@@ -406,11 +505,18 @@ export function PoolCard({ pool }: { pool: Pool }) {
             <Amount value={pool.size} asset={pool.asset} />
           </dd>
         </div>
+        <div>
+          <dt>Smallest deposit</dt>
+          <dd>
+            <Amount value={pool.minSupply} asset={pool.asset} />
+          </dd>
+        </div>
       </dl>
       <div className="util" role="meter" aria-label="Utilisation" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pool.utilisationBps / 100}>
         <span style={{ width: `${Math.min(pool.utilisationBps, 10_000) / 100}%` }} />
       </div>
-    </div>
+      <p className="rail-foot">The lending keeper can see your deposit and position amounts.</p>
+    </section>
   );
 }
 
@@ -435,7 +541,7 @@ export function HealthBar({ health, vault, after }: { health: number; vault: Vau
   return (
     <div className="health">
       <div className="health-head">
-        <span className="muted small">Loan-to-value</span>
+        <span className="instrument-label">Loan-to-value</span>
         <span className="num">
           {pct(health)}
           {after !== undefined && after !== health && (
@@ -469,56 +575,35 @@ export function HealthBar({ health, vault, after }: { health: number; vault: Vau
   );
 }
 
-export function BorrowTab(p: LendProps) {
-  const vault = p.market?.vaults[0];
-  const pool = p.market?.pools.find((x) => x.id === vault?.pool);
-  const [action, setAction] = useState<Action>("add");
-  const [text, setText] = useState("");
-  const [shown, setShown] = useState(false);
-  const op = useOperation(p);
-  const now = useChainNow(p.chainOffset);
-
-  if (!vault || !pool) return <p className="muted">Reading the vault…</p>;
+function borrowForm(p: LendProps, vault: Vault, pool: Pool, action: Action, text: string, shown: boolean, now: number | null) {
   const position = p.account?.positions.find((x) => x.vault === vault.id) ?? null;
   // The latest full liquidation in this vault, shown while there is no position.
   const emptied = (p.account?.emptied ?? []).filter((x) => x.vault === vault.id && x.lastLiquidation).sort((a, b) => b.lastLiquidation!.at - a.lastLiquidation!.at)[0];
-  if (op.run)
-    return (
-      <Progress
-        p={p}
-        op={op}
-        onDone={() => {
-          op.clear();
-          setText("");
-          setShown(false);
-        }}
-      />
-    );
-
   const c = position?.collateral ?? 0n;
   const d = position ? grown(position.debt, pool.borrowAprBps, p.account!.asOf, now) : 0n;
   const act: Action = position ? action : "add";
   const asset = act === "add" || act === "withdraw" ? vault.collateral : vault.debt;
   const cf = vault.collateralFactorBps;
   const sym = (a: Asset, v: bigint) => `${formatUnits(v, a.decimals)} ${a.symbol}`;
+  const max = borrowLimits(vault, c, d, p.balances);
   const limits: Record<Action, { max: bigint | null; tooMuch: string; min?: { value: bigint; text: string } }> = {
     add: {
-      max: largest(p.balances, vault.collateral),
-      tooMuch: `One deposit spends one private note, and your largest is ${sym(vault.collateral, largest(p.balances, vault.collateral) ?? 0n)}.`,
+      max: max.add,
+      tooMuch: `One deposit spends one private note, and your largest is ${sym(vault.collateral, max.add ?? 0n)}.`,
       min: position ? undefined : { value: vault.minCollateral, text: `A new position needs at least ${sym(vault.collateral, vault.minCollateral)}.` },
     },
     borrow: {
-      max: maxBorrow(c, d, drawPrice(vault), cf),
-      tooMuch: `That would take you past ${pct(cf, 0)}. You can borrow up to ${sym(vault.debt, maxBorrow(c, d, drawPrice(vault), cf))} now.`,
+      max: max.borrow,
+      tooMuch: `That would take you past ${pct(cf, 0)}. You can borrow up to ${sym(vault.debt, max.borrow)} now.`,
       min: d === 0n ? { value: vault.minDebt, text: `A loan starts at ${sym(vault.debt, vault.minDebt)}.` } : undefined,
     },
     repay: {
-      max: largest(p.balances, vault.debt),
-      tooMuch: `One repayment spends one private note, and your largest is ${sym(vault.debt, largest(p.balances, vault.debt) ?? 0n)}.`,
+      max: max.repay,
+      tooMuch: `One repayment spends one private note, and your largest is ${sym(vault.debt, max.repay ?? 0n)}.`,
     },
     withdraw: {
-      max: maxWithdraw(c, d, drawPrice(vault), cf),
-      tooMuch: `That would take you past ${pct(cf, 0)}. You can withdraw up to ${sym(vault.collateral, maxWithdraw(c, d, drawPrice(vault), cf))} now.`,
+      max: max.withdraw,
+      tooMuch: `That would take you past ${pct(cf, 0)}. You can withdraw up to ${sym(vault.collateral, max.withdraw)} now.`,
     },
   };
   const lim = limits[act];
@@ -529,6 +614,42 @@ export function BorrowTab(p: LendProps) {
   const d2 = act === "borrow" ? d + amt : act === "repay" ? (amt > d ? 0n : d - amt) : d;
   const h = healthBps(c, d, vault.price);
   const h2 = healthBps(c2, d2, vault.price);
+  return { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2 };
+}
+
+export function BorrowTab(p: DeskProps) {
+  const vault = p.market?.vaults[0];
+  const pool = p.market?.pools.find((x) => x.id === vault?.pool);
+  const [action, setAction] = useState<Action>("add");
+  const [text, setText] = useState("");
+  const [shown, setShown] = useState(false);
+  const op = useOperation(p);
+  const now = useChainNow(p.chainOffset);
+  const submitted = useRef<Pick<DeskModel, "fraction" | "ltv"> | null>(null);
+
+  const form = vault && pool ? borrowForm(p, vault, pool, action, text, shown, now) : null;
+  const input =
+    form && vault
+      ? { parsed: form.f.parsed, ok: form.f.ok, limit: form.lim.max, action: form.act, collateral: vault.collateral, health: form.h, projected: form.h2 }
+      : null;
+  const edit = borrowModel(input && { ...input, run: null, live: null, submitted: null });
+  if (!op.run) submitted.current = { fraction: edit.fraction, ltv: edit.ltv };
+  const model = borrowModel(input && { ...input, run: op.run, live: op.live, submitted: submitted.current });
+  const ltvText = (h: number, debt: bigint) => (debt === 0n ? "No debt" : pct(h));
+  let label = "Loan-to-value";
+  let value = form ? (form.position ? ltvText(form.h, form.d) : "No position") : "—";
+  if (form && op.run && model.phase === "review") [label, value] = [kindLabel(op.run, vault?.collateral), amountsText(op.run.amounts)];
+  else if (form && !op.run && model.valid) [label, value] = ["Loan-to-value after", ltvText(form.h2, form.d2)];
+  useReport("borrow", { model, label, value }, p.report);
+
+  if (!vault || !pool || !form)
+    return (
+      <DeskLayout p={p} title="Borrow" rail={null} railLabel="Balances">
+        <p className="muted">Reading the vault…</p>
+      </DeskLayout>
+    );
+
+  const { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2 } = form;
   const lp = liquidationPrice(c, d, vault.liquidationThresholdBps);
   const lp2 = liquidationPrice(c2, d2, vault.liquidationThresholdBps);
   const st = healthState(h, vault);
@@ -556,18 +677,18 @@ export function BorrowTab(p: LendProps) {
     withdraw: `The keeper builds the withdrawal and your wallet signs it. The ${vault.collateral.symbol} is paid into your private balance in that one transaction.`,
   };
 
-  return (
-    <div className="stack">
-      <div className="lend-card">
-        <div className="lend-card-head">
-          <span className="pool-name">
+  const rail = (
+    <>
+      <section className="rail-panel vault" aria-label="Vault">
+        <div className="rail-head">
+          <h2>
             {vault.collateral.symbol} → {vault.debt.symbol} vault
-          </span>
-          <span className="muted small num">
+          </h2>
+          <span className="rail-tag num">
             1 {vault.collateral.symbol} = {priceText(vault.price, vault)} {vault.debt.symbol}
           </span>
         </div>
-        <dl className="kv kv-4">
+        <dl className="readings">
           <div>
             <dt>Borrow up to</dt>
             <dd className="num">{pct(cf, 0)}</dd>
@@ -585,15 +706,17 @@ export function BorrowTab(p: LendProps) {
             <dd className="num">{pct(pool.borrowAprBps, 2)}</dd>
           </div>
         </dl>
-      </div>
-
+        <p className="rail-foot">
+          The borrow limit is {pct(cf, 0)} of collateral value at the draw price: the oracle price less its confidence and a 0.5% margin.
+        </p>
+      </section>
       {position ? (
-        <div className={`lend-card position position-${st}`}>
-          <div className="lend-card-head">
-            <span className="pool-name">Your position</span>
+        <section className={`rail-panel position position-${st}`} aria-label="Your position">
+          <div className="rail-head">
+            <h2>Your position</h2>
             <span className={`badge badge-${st}`}>{STATE_LABEL[st]}</span>
           </div>
-          <dl className="kv kv-2">
+          <dl className="readings">
             <div>
               <dt>Collateral</dt>
               <dd>
@@ -618,115 +741,135 @@ export function BorrowTab(p: LendProps) {
             </div>
           </dl>
           <HealthBar health={h} vault={vault} after={shown || amt > 0n ? h2 : undefined} />
-          {st === "close" && !position.lastLiquidation && (
-            <p className="note note-warn" role="status">
-              Above {pct(cf, 0)} you can't borrow more. Liquidation starts above {pct(vault.liquidationThresholdBps, 0)}, at a{" "}
-              {vault.collateral.symbol} price of {lp === null ? "" : priceText(lp, vault)}. Repaying or adding collateral moves you back.
-            </p>
-          )}
-          {st === "liquidatable" && (
-            <p className="note note-error" role="status">
-              <strong>Past {pct(vault.liquidationThresholdBps, 0)}.</strong> The keeper sells only enough collateral to bring the position back
-              to {pct(vault.liquidationThresholdBps, 0)} (past {pct(vault.liquidationMaxLimitBps, 0)}, to repay the whole loan), plus the{" "}
-              {pct(vault.penaltyBps, 0)} penalty. Repay or add collateral to keep more of it.
-            </p>
-          )}
-          {position.lastLiquidation && <LiquidatedNote position={position} vault={vault} now={now} />}
-        </div>
+        </section>
       ) : (
-        <div className="lend-card mine">
-          <span className="muted small">Your position</span>
-          {emptied && <EmptiedNote position={emptied} vault={vault} now={now} />}
-          <span className="muted">
+        <section className="rail-panel mine" aria-label="Your position">
+          <div className="rail-head">
+            <h2>Your position</h2>
+          </div>
+          <p className="rail-foot">
             No position yet. Add {vault.collateral.symbol} as collateral, then borrow up to {pct(cf, 0)} of its value, with no term.
-          </span>
-        </div>
+          </p>
+        </section>
       )}
+    </>
+  );
 
-      <form
-        className="stack"
-        noValidate
-        onSubmit={(e) => {
-          e.preventDefault();
-          submit();
-        }}
-      >
-        <div className="seg seg-small seg-4" role="group" aria-label="Position action">
-          {ACTIONS.map(([k, label]) => (
-            <button
-              key={k}
-              type="button"
-              aria-pressed={act === k}
-              disabled={!position && k !== "add"}
-              onClick={() => {
-                setAction(k);
-                setText("");
-                setShown(false);
-              }}
-            >
-              {k === "add" ? "Add" : label}
-            </button>
-          ))}
-        </div>
-        <Field
-          id="borrow-amt"
-          label={BUTTON[act]}
-          asset={asset}
-          text={text}
-          setText={setText}
-          invalid={f.invalid}
-          max={act === "repay" ? (lim.max !== null && lim.max < repayAll ? lim.max : repayAll) : lim.max}
-          maxLabel={act === "repay" ? "Repay all" : undefined}
-          hint={
-            lim.max === null ? (
-              "Reading your private balance…"
-            ) : act === "add" ? (
-              <>
-                Largest private note <Amount value={lim.max} asset={asset} />
-              </>
-            ) : act === "repay" ? (
-              <>
-                Debt <Amount value={d} asset={asset} />
-              </>
-            ) : lim.max === 0n ? (
-              `Nothing more while the position is at or above ${pct(cf, 0)}.`
-            ) : (
-              <>
-                Up to <Amount value={lim.max} asset={asset} />
-              </>
-            )
-          }
+  return (
+    <DeskLayout p={p} title={op.run ? kindLabel(op.run, vault.collateral) : "Manage position"} rail={rail} railLabel="Vault, position and balances">
+      {position && st === "close" && !position.lastLiquidation && (
+        <p className="note note-warn" role="status">
+          Above {pct(cf, 0)} you can't borrow more. Liquidation starts above {pct(vault.liquidationThresholdBps, 0)}, at a{" "}
+          {vault.collateral.symbol} price of {lp === null ? "" : priceText(lp, vault)}. Repaying or adding collateral moves you back.
+        </p>
+      )}
+      {position && st === "liquidatable" && (
+        <p className="note note-error" role="status">
+          <strong>Past {pct(vault.liquidationThresholdBps, 0)}.</strong> The keeper sells only enough collateral to bring the position back
+          to {pct(vault.liquidationThresholdBps, 0)} (past {pct(vault.liquidationMaxLimitBps, 0)}, to repay the whole loan), plus the{" "}
+          {pct(vault.penaltyBps, 0)} penalty. Repay or add collateral to keep more of it.
+        </p>
+      )}
+      {position?.lastLiquidation && <LiquidatedNote position={position} vault={vault} now={now} />}
+      {!position && emptied && <EmptiedNote position={emptied} vault={vault} now={now} />}
+      {op.run ? (
+        <Progress
+          p={p}
+          op={op}
+          onDone={() => {
+            op.clear();
+            setText("");
+            setShown(false);
+          }}
         />
-        {(amt > 0n || act === "add") && (
-          <dl className="kv kv-preview" aria-live="polite">
-            <div>
-              <dt>Loan-to-value after</dt>
-              <dd className={`num${healthState(h2, vault) === "healthy" ? "" : " bad"}`}>{d2 === 0n ? "No debt" : pct(h2)}</dd>
+      ) : (
+        <>
+          <form
+            className="ticket-flow"
+            noValidate
+            onSubmit={(e) => {
+              e.preventDefault();
+              submit();
+            }}
+          >
+            <div className="mode-picker" role="group" aria-label="Position action">
+              {ACTIONS.map(([k, label]) => (
+                <button
+                  key={k}
+                  type="button"
+                  aria-pressed={act === k}
+                  disabled={!position && k !== "add"}
+                  onClick={() => {
+                    setAction(k);
+                    setText("");
+                    setShown(false);
+                  }}
+                >
+                  {k === "add" ? "Add" : label}
+                </button>
+              ))}
             </div>
-            <div>
-              <dt>Liquidation price after</dt>
-              <dd className="num">{lp2 === null ? "None" : `${priceText(lp2, vault)} ${vault.debt.symbol}`}</dd>
+            <Field
+              id="borrow-amt"
+              label={BUTTON[act]}
+              asset={asset}
+              text={text}
+              setText={setText}
+              invalid={f.invalid}
+              max={act === "repay" ? (lim.max !== null && lim.max < repayAll ? lim.max : repayAll) : lim.max}
+              maxLabel={act === "repay" ? "Repay all" : undefined}
+              hint={
+                lim.max === null ? (
+                  "Reading your private balance…"
+                ) : act === "add" ? (
+                  <>
+                    Largest private note <Amount value={lim.max} asset={asset} />
+                  </>
+                ) : act === "repay" ? (
+                  <>
+                    Debt <Amount value={d} asset={asset} />
+                  </>
+                ) : lim.max === 0n ? (
+                  `Nothing more while the position is at or above ${pct(cf, 0)}.`
+                ) : (
+                  <>
+                    Up to <Amount value={lim.max} asset={asset} />
+                  </>
+                )
+              }
+            />
+            {(amt > 0n || act === "add") && (
+              <dl className="form-summary kv-preview" aria-live="polite">
+                <div>
+                  <dt>Loan-to-value after</dt>
+                  <dd className={`num${healthState(h2, vault) === "healthy" ? "" : " bad"}`}>{d2 === 0n ? "No debt" : pct(h2)}</dd>
+                </div>
+                <div>
+                  <dt>Liquidation price after</dt>
+                  <dd className="num">{lp2 === null ? "None" : `${priceText(lp2, vault)} ${vault.debt.symbol}`}</dd>
+                </div>
+              </dl>
+            )}
+            <button className="button button-primary main-action" type="submit">
+              {BUTTON[act]}
+            </button>
+            <p className="ticket-foot">{SAYS[act]}</p>
+          </form>
+          {position && d === 0n && c > 0n && (
+            <div className="faucet-box">
+              <button className="button button-secondary" onClick={close}>
+                Close position and take back {formatUnits(c, vault.collateral.decimals)} {vault.collateral.symbol}
+              </button>
+              <p className="ticket-foot close-note">With no debt, your browser proves the close and your wallet signs it. No keeper needed.</p>
             </div>
-          </dl>
-        )}
-        <button className="btn btn-primary" type="submit">
-          {BUTTON[act]}
-        </button>
-        <p className="muted small">{SAYS[act]}</p>
-      </form>
-      {position && d === 0n && c > 0n && (
-        <div className="faucet">
-          <button className="btn btn-ghost" onClick={close}>
-            Close position and take back {formatUnits(c, vault.collateral.decimals)} {vault.collateral.symbol}
-          </button>
-          <p className="muted small close-note">With no debt, your browser proves the close and your wallet signs it. No keeper needed.</p>
-        </div>
+          )}
+        </>
       )}
       <ErrorNote text={op.formError} />
       {import.meta.env.VITE_KEELER_MOCK === "1" && "mock" in p.lend && (
         <MockControls controls={(p.lend as KeelerLend & { mock: MockLendControls }).mock} refresh={p.refreshLend} />
       )}
-    </div>
+    </DeskLayout>
   );
 }
 
@@ -774,13 +917,13 @@ function MockControls({ controls, refresh }: { controls: MockLendControls; refre
   return (
     <div className="mock" role="group" aria-label="Mock controls">
       <span className="muted small">Mock price</span>
-      <button type="button" className="btn btn-ghost btn-small" onClick={() => go(() => controls.movePrice(-800))}>
+      <button type="button" className="button button-secondary button-small" onClick={() => go(() => controls.movePrice(-800))}>
         −8%
       </button>
-      <button type="button" className="btn btn-ghost btn-small" onClick={() => go(() => controls.crash())}>
+      <button type="button" className="button button-secondary button-small" onClick={() => go(() => controls.crash())}>
         Crash to liquidation
       </button>
-      <button type="button" className="btn btn-ghost btn-small" onClick={() => go(() => controls.resetPrice())}>
+      <button type="button" className="button button-secondary button-small" onClick={() => go(() => controls.resetPrice())}>
         Reset
       </button>
     </div>
@@ -819,15 +962,15 @@ export function LendActivity(p: LendProps) {
   };
 
   return (
-    <section className="section section-tight" aria-labelledby="lending-title">
-      <div className="section-head">
+    <section className="activity" aria-labelledby="lending-title">
+      <div className="panel-header">
         <h2 id="lending-title">Your lending</h2>
       </div>
       {p.account?.needsSession && (
         <p className="note">
           The keeper may have news for your lending (a fill, or a change made in another browser).{" "}
           <button
-            className="btn btn-ghost"
+            className="button button-secondary button-small"
             disabled={busy === "session"}
             onClick={() => {
               setBusy("session");
@@ -843,7 +986,9 @@ export function LendActivity(p: LendProps) {
         </p>
       )}
       {ops.length === 0 && liquidations.length === 0 ? (
-        <p className="muted">Nothing yet. Deposit to Earn or open a position from Earn and Borrow above.</p>
+        <p className="activity-empty">
+          Nothing yet. Deposit in <a href="#earn">Earn</a> or open a position in <a href="#borrow">Borrow</a>.
+        </p>
       ) : (
         <ul className="orders lend-ops">
           {vault &&
@@ -891,7 +1036,7 @@ export function LendActivity(p: LendProps) {
                   {o.error && <span className="bad">{o.error}</span>}
                 </span>
                 {o.status === "refundable" && (
-                  <button className="btn btn-primary btn-small" onClick={() => refund(o.id)} disabled={!!busy} aria-busy={busy === o.id}>
+                  <button className="button button-primary button-small" onClick={() => refund(o.id)} disabled={!!busy} aria-busy={busy === o.id}>
                     {busy === o.id ? "Taking funds back…" : "Take funds back"}
                   </button>
                 )}
