@@ -261,7 +261,7 @@ keeper's writer key, checked against the hash on chain (it waits up to 60 s for 
 each one, and refuses to start rather than rebuild without one). A transaction another key paid
 for is never read, so notes made with the public local test keys are never taken up. It keeps the
 unspent reserve, receipts and positions, merged with the file, and moves `scanned` to the newest
-finalized transaction it read. It refuses to start with two unspent reserves. Every pass also
+finalized transaction it read. It refuses to start with two unspent reserves. A first start (no scan mark for a keeper) makes one request per transaction that keeper key ever paid for, of any program: on devnet, a dealer key with about 1,600 earlier transactions took 3.5 minutes. Give a keeper a key with no other history where a fast first start matters; later starts read only what is new. Every pass also
 reads the other keepers' new transactions, so their fills, deposits and liquidations reach its
 book. Tickets are not on chain: after a restart with an empty file the keeper fills no intent
 made before it (their makers refund after expiry) and the account view shows no old intents.
