@@ -216,13 +216,16 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | 422 | `below-minimum` | Under a minimum, or over a cap (pool size, supply per wallet, collateral in all or per position, debt per position) |
 | 423 | `unhealthy` | The position would be unhealthy |
 | 429 | `rate-limited` | Too many requests: tickets or builds per wallet per hour, open tickets per wallet, open intents in all, or the 8 receipts or positions a wallet may hold (open tickets count) |
-| 502, 504 | `keeper-offline` | No keeper answered with its JSON (Worker): no answer, a reply that is not the keeper's, every keeper still starting, or a keeper's own 5xx `{"error": ...}` (such as a build that took over 25 s) |
-| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured, or lending paused (Worker) |
+| 502, 504 | `keeper-offline` | No keeper answered with its JSON (Worker): no answer, a reply that is not the keeper's, or a keeper's own 5xx `{"error": ...}` (such as a build that took over 25 s) |
+| 503 | `keeper-offline` (`paused` if the text says paused) | Keeper not configured, lending paused, or every keeper still starting (Worker) |
 | other | `network` | |
 
 A keeper that is starting, or failing to start, inside the dealer answers 503 with
 `{"starting": "<sentence>"}` and no `error` field. The Worker treats that as no answer and asks the
-next keeper of `LEND_KEEPERS`; when none answers, the page gets a 502. A live keeper's own 5xx with
+next keeper of `LEND_KEEPERS` (up to four, in order); when none is left and the last said
+`starting`, it answers 503 "Lending is starting up. Try again in a minute.", otherwise 502. Keeper
+URLs must be `https://` unless `NETWORK` is `local`; `NETWORK` takes only `local`, `devnet` or
+`mainnet`. A live keeper's own 5xx with
 `{"error": ...}` is its answer: it is not retried and reaches the page as a 502.
 
 ## Layouts the page checks

@@ -149,7 +149,7 @@ them coarse in `/lend/pools`; while the bad debt exceeds the surplus, borrowing 
 | Command | What |
 | --- | --- |
 | `keeler keeper <keeper config>` | The keeper and its HTTP routes without a dealer |
-| `keeler lend-init-reserve <keeper config>` | Creates the pool's reserve once; the keeper pays, `lend.admin_key` co-signs |
+| `keeler lend-init-reserve <keeper config>` | Creates the pool's reserve once; the keeper pays, `lend.admin_key` co-signs (local and devnet; on mainnet the reserve is created by `keeler deploy reserve check` / `create` inside `scripts/deploy-mainnet.sh`, and `lend.network` must be exactly `mainnet` there) |
 | `keeler lend-set-price <keeper config> <vault> <price> <confidence>` | Writes the vault's test price (debt base units per collateral base unit x 1e12, so $10 per tSOL in tUSD is `10000000000`) and saves it as the value a running keeper keeps posting. Refused when `network` is `mainnet` or `price` is not `test`; the program refuses it in a build without `test-price` |
 | `keeler lend-fund <keeper config> <amount>` | Shields `amount` (base units) of the debt token from the keeper key's own token account to the keeper's lend address, where its liquidations pay from. The keeper key pays the fee |
 | `keeler lend-balance <keeper config>` | The debt token and the collateral held privately at the keeper's lend address, and the largest position's debt in its state file (with a note when the funds are short) |

@@ -1268,6 +1268,8 @@ pub fn sweep(chain: &LendChain) -> Result<Vec<String>> {
     // Claimed notes are hidden from the next scan, so each round takes new ones.
     for _ in 0..32 {
         let mut notes = chain.chain.notes(&chain.kp, mint)?;
+        // Empty change notes cannot be withdrawn (ZeroInterfaceTransferAmount); they are left.
+        notes.retain(|u| u.utxo.amount > 0);
         if notes.is_empty() {
             break;
         }
