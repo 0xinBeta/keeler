@@ -207,8 +207,8 @@ fn spawn_dealer(net: &Net, test: u16, actor: u8, t: Terms) -> Dealer {
     spawn_dealer_with(net, test, actor, t, None)
 }
 
-fn spawn_dealer_with(net: &Net, test: u16, actor: u8, t: Terms, http: Option<Http>) -> Dealer {
-    let cfg = DealerConfig {
+fn dealer_cfg(net: &Net, test: u16, actor: u8, t: Terms, http: Option<Http>) -> DealerConfig {
+    DealerConfig {
         common: net.priced(actor, t.spl_price),
         listen: dealer_addr(test, actor),
         spread_bps: t.spread_bps,
@@ -226,7 +226,11 @@ fn spawn_dealer_with(net: &Net, test: u16, actor: u8, t: Terms, http: Option<Htt
         auto_pause_after: None,
         min_fee_lamports: None,
         lend: None,
-    };
+    }
+}
+
+fn spawn_dealer_with(net: &Net, test: u16, actor: u8, t: Terms, http: Option<Http>) -> Dealer {
+    let cfg = dealer_cfg(net, test, actor, t, http);
     cfg.check().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
@@ -422,6 +426,88 @@ fn unquoted_order_is_not_settled() {
         vec![(hex(&order.hash(0).unwrap()), Status::Cancelled)]
     );
     d1.stop();
+}
+
+#[test]
+fn a_declined_last_look_makes_one_split_and_keeps_its_note() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let net = start(10);
+    let chain = net.chain();
+    let cfg = dealer_cfg(&net, 10, 1, HONEST, None);
+    let dealer = shielded(&fixture::actor(1)).unwrap();
+    chain.register(&dealer).unwrap();
+    let trader = shielded(&fixture::actor(0)).unwrap();
+    chain.register(&trader).unwrap();
+    let dealer_pk = fixture::actor(1).pubkey();
+    let want = 1_234_567;
+    let order = chain
+        .lock(
+            &trader,
+            OrderTerms {
+                destination_mint: chain.mint(SOL_MINT).unwrap(),
+                destination_amount: want,
+                maker: trader.shielded_address().unwrap(),
+                expiry: chain.now().unwrap() + 120,
+                taker: Some(identity(&dealer_pk).unwrap()),
+            },
+            100_000_000,
+            chain.notes(&trader, net.spl).unwrap().remove(0),
+            chain.resolve(dealer_pk).unwrap(),
+        )
+        .unwrap();
+    let notes = || {
+        let mut a: Vec<u64> = chain
+            .notes(&dealer, SOL_MINT)
+            .unwrap()
+            .iter()
+            .map(|n| n.utxo.amount)
+            .collect();
+        a.sort_unstable();
+        a
+    };
+    let settle = |looks: &[bool]| {
+        let mut looks = looks.iter().copied();
+        dealer::settle_with(&cfg, &chain, &dealer, &order, &mut || looks.next().unwrap()).unwrap()
+    };
+    assert_eq!(settle(&[false]), dealer::Settle::Wait);
+    assert_eq!(notes(), vec![DEALER_SOL], "declined before any split");
+    assert_eq!(settle(&[true, false]), dealer::Settle::Wait);
+    assert_eq!(
+        notes(),
+        vec![want, DEALER_SOL - want],
+        "one split, given back"
+    );
+    assert_eq!(settle(&[true, false]), dealer::Settle::Wait);
+    assert_eq!(notes(), vec![want, DEALER_SOL - want], "no second split");
+    assert_eq!(settle(&[true, true]), dealer::Settle::Took);
+    assert_eq!(chain.status(&order).unwrap(), Status::Settled);
+    let expiry = chain.now().unwrap() + 20;
+    let late = chain
+        .lock(
+            &trader,
+            OrderTerms {
+                destination_mint: chain.mint(SOL_MINT).unwrap(),
+                destination_amount: want,
+                maker: trader.shielded_address().unwrap(),
+                expiry,
+                taker: Some(identity(&dealer_pk).unwrap()),
+            },
+            100_000_000,
+            chain.notes(&trader, net.spl).unwrap().remove(0),
+            chain.resolve(dealer_pk).unwrap(),
+        )
+        .unwrap();
+    while chain.now().unwrap() <= expiry {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let again = chain.exact_note(&dealer, SOL_MINT, want).unwrap();
+    assert_eq!(notes(), vec![DEALER_SOL - 2 * want], "claimed");
+    assert!(chain.take(&dealer, &late, again).is_err());
+    assert_eq!(
+        notes(),
+        vec![want, DEALER_SOL - 2 * want],
+        "a take refused at its send gives its note back"
+    );
 }
 
 #[test]

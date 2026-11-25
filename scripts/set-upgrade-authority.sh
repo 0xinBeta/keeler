@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Hands a deployed program's upgrade authority to another account. NOT TO BE
-# RUN without the owner: the deploy key cannot take it back.
+# Hands a deployed program's upgrade authority to another account. Run it
+# with care: the deploy key cannot take it back.
 #
 #   scripts/set-upgrade-authority.sh <program> <new-authority> [plan]
 #   scripts/set-upgrade-authority.sh --squads <multisig> <vault-index> <program> [plan]
@@ -13,7 +13,9 @@
 # Without --squads the new authority must be an existing system account,
 # and the plan must not be a mainnet one.
 # With --squads it is vault <vault-index> of that Squads v4 multisig, which
-# must be autonomous with threshold at least 2 (read from chain;
+# must be autonomous with threshold at least 2, at least two members who can
+# initiate and two who can execute, and a time lock no longer than the
+# plan's max_time_lock_secs (default 172800; read from chain;
 # cli/src/deploy.rs `check_squads_vault`); the vault need not be funded.
 # scripts/deploy-mainnet.sh does this step itself on mainnet.
 set -euo pipefail

@@ -124,3 +124,26 @@ describe("constants", () => {
     expect(() => L.debtOf(1n << 64n, L.PRICE_SCALE)).toThrow(L.LendError);
   });
 });
+
+describe("a step that removes no debt share", () => {
+  const curve = L.TUSD_POOL.curve;
+  const borrowPrice = 1_100_000_000_000n;
+  const reserve = { ...L.newReserve(0n, 0n), supplyShares: 10n ** 12n, debtShares: 10n ** 9n, borrowPrice };
+
+  it("a partial repay of one base unit is refused", () => {
+    expect(L.repayShares(10n ** 9n, 1n, borrowPrice).shares).toBe(10n ** 9n);
+    expect(() => L.repay(reserve, 10n ** 9n, 1n, curve)).toThrow(expect.objectContaining({ code: "zero_shares" }));
+  });
+
+  it("a repay that removes one share, and a full repay, still pass", () => {
+    expect(L.repay(reserve, 10n ** 9n, 2n, curve).shares).toBe(10n ** 9n - 1n);
+    expect(L.repay(reserve, 10n ** 9n, L.debtOf(10n ** 9n, borrowPrice), curve).shares).toBe(0n);
+    expect(L.repay(reserve, 0n, 0n, curve).shares).toBe(0n);
+  });
+
+  it("a liquidation that removes no share is refused", () => {
+    expect(() => L.liquidate(1_000_000n, 1_000_000_000_001n, 10_000_000n, 100_000n, L.TSOL_TUSD_VAULT)).toThrow(
+      expect.objectContaining({ code: "nothing_to_liquidate" }),
+    );
+  });
+});

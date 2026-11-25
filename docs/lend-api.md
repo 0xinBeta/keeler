@@ -210,7 +210,7 @@ it through (cut to 200 characters). The page maps the status to its error code:
 | 401 | `network` | Session or signature refused (the page retries once with a new session) |
 | 403 | `paused` | Lending paused at the keeper (new supply, new positions, borrowing), or borrowing halted while the pool's bad debt exceeds its surplus |
 | 404 | `storage` | No such position or receipt |
-| 409 | `busy` | The reserve is in use, or this wallet let its reservation lapse unused within `reservation_secs`; try again shortly |
+| 409 | `busy` | The reserve is in use (another wallet's reservation, a keeper transaction in flight, a liquidation or fill going first), or this wallet let its reservation lapse unused lately (`reservation_secs`, doubled for each earlier lapse in the hour, at most an hour); try again shortly. A 409 does not count toward `builds_per_wallet_hour` |
 | 410 | `no-liquidity` | Not enough in the pool (checked last, at the amount rounded up to two significant figures) |
 | 412 | `price-stale` | The oracle price is missing, unverified or older than 65 s (draws) |
 | 422 | `below-minimum` | Under a minimum, or over a cap (pool size, supply per wallet, collateral in all or per position, debt per position) |
@@ -245,7 +245,7 @@ with the 128-byte compressed proof.
 | cancel_intent args | proof, viewing [33], user_bump, expiry u64 |
 | redeem args | proof, mint [32], pool_viewing [33], pool_bump, owner_viewing [33], user_bump, now u64 |
 | draw args | proof, vault u64, pool_viewing [33], pool_bump, owner_viewing [33], user_bump, now u64, bound u64 |
-| liquidate args | proof, vault u64, pool_viewing [33], pool_bump, owner [32], owner_viewing [33], user_bump, now u64, bound u64 (the page reads only `bound`, to report a liquidation) |
+| liquidate args | proof, vault u64, pool_viewing [33], pool_bump, owner [32], owner_viewing [33], user_bump, now u64, bound u64 (the page reads `now` and `bound`, to report a liquidation) |
 | close args | proof, vault u64, viewing [33], user_bump |
 | Keeper-built account head | keeper (writable signer, fee payer) at 0, owner (read-only signer) at 1; draw always has the price account at 2 |
 | Owner-built account head | intent, cancel_intent and close: the owner (writable signer, fee payer) at 0 |

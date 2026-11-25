@@ -218,7 +218,7 @@ export function borrow(r: Reserve, idle: bigint, amount: bigint, curve: Curve): 
   return { reserve: refreshRate(next, curve), shares };
 }
 
-/** Repays `amount` on a position of `positionShares` debt shares. */
+/** Repays `amount` on a position of `positionShares` debt shares; a partial repay that removes no share is refused (`zero_shares`). */
 export function repay(
   r: Reserve,
   positionShares: bigint,
@@ -229,6 +229,7 @@ export function repay(
   u64(positionShares);
   if (positionShares > r.debtShares) fail("invalid_input");
   const done = repayShares(positionShares, amount, r.borrowPrice);
+  if (done.shares !== 0n && done.shares === positionShares) fail("zero_shares");
   const next = { ...r, debtShares: r.debtShares - (positionShares - done.shares) };
   return { reserve: refreshRate(next, curve), ...done };
 }
@@ -298,10 +299,12 @@ export function liquidate(
   }
   if (x === 0n) fail("nothing_to_liquidate");
   const paid = payoutOf(x, p, price);
+  const shares = repayShares(debtShares, x, borrowPrice).shares;
+  if (shares === debtShares) fail("nothing_to_liquidate");
   return {
     repay: x,
     payout: paid,
-    debtShares: repayShares(debtShares, x, borrowPrice).shares,
+    debtShares: shares,
     collateral: c - paid,
   };
 }

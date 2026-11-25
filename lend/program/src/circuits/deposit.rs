@@ -1,5 +1,5 @@
 //! `deposit`: an intent's collateral opens a position (`DepositOpen`) or is
-//! added to one (`DepositAdd`). A data input cannot be optional (SPIKE.md
+//! added to one (`DepositAdd`). A data input cannot be optional (docs/notes-for-xark-builders.md
 //! item 3), so each case is its own circuit. No reserve and no price: the
 //! keeper builds it and nothing refuses a deposit of at least the minimum.
 use spr_program::{

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deploys Keeler's build of the swap example to devnet and sets up the dealer.
-# NOT TO BE RUN until the owner approves publishing the example's code (see
-# the mainnet gates in docs/plan-web.md). Safe to rerun after any failure:
+# Run it with care: it spends devnet SOL from keeler-devnet-deploy and puts
+# the example's program on devnet (mainnet steps are in
+# docs/mainnet-runbook.md). Safe to rerun after any failure:
 # every step checks what is already on chain and resumes.
 #
 # 1. Creates these Keychain items if absent (Solana keypair JSON arrays, plus

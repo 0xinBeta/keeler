@@ -1,4 +1,4 @@
-//! The spike on a local network: see `../../SPIKE.md`.
+//! The spike on a local network: see `../../../docs/notes-for-xark-builders.md`.
 //!
 //! Run with `ZOLANA_PORT_OFFSET` in 2100..2500 and the matching
 //! `ZOLANA_PROVER_URL` (port 3001 + offset / 100), the tool paths from

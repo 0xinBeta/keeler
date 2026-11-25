@@ -19,6 +19,8 @@ const A: &str = "11111111111111111111111111111111";
 const B: &str = "SysvarRent111111111111111111111111111111111";
 const POOL: &str = "04eff66782e8d5e74f22a134d513919285e4b1b1c1fcee15a7d31e3b4f926cf011";
 const FEED: &str = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SOL_USD: &str = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
 const MARK: &str = "STUB-CARGO-REACHED";
 
 fn repo_root() -> PathBuf {
@@ -79,6 +81,8 @@ impl Sandbox {
             &["add", "-A"],
             &[
                 "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
                 "user.name=t",
                 "-c",
                 "user.email=t@t",
@@ -98,20 +102,37 @@ impl Sandbox {
         }
     }
 
-    /// A manifest of `n` proving keys, written outside the repository, and
-    /// a keys directory holding them.
+    /// A manifest of `n` proving keys of circuits `c0`, `c1`..., written
+    /// outside the repository, and a keys directory holding them.
     fn manifest(&self, n: usize) -> (PathBuf, PathBuf) {
+        self.manifest_of(&numbered(n))
+    }
+
+    fn manifest_of(&self, circuits: &[String]) -> (PathBuf, PathBuf) {
         let keys = self.dir.join("keys");
         let mut lines = String::new();
-        for i in 0..n {
-            let body = format!("pk {i}");
-            fs::create_dir_all(keys.join(format!("c{i}"))).unwrap();
-            fs::write(keys.join(format!("c{i}/pk.bin")), &body).unwrap();
-            lines += &format!("{:x}  c{i}/pk.bin\n", Sha256::digest(body.as_bytes()));
+        for c in circuits {
+            fs::create_dir_all(keys.join(c)).unwrap();
+            fs::write(keys.join(format!("{c}/pk.bin")), pk_body(c)).unwrap();
+            lines += &format!("{}  {c}/pk.bin\n", pk_sha(c));
         }
         let m = self.dir.join("manifest.txt");
         fs::write(&m, lines).unwrap();
         (m, keys)
+    }
+
+    /// Real-setup verifying-key sources in `dir`, one per circuit, each
+    /// naming the proving key `manifest_of` writes for `named[i]`.
+    fn verifying_keys(&self, dir: &str, circuits: &[String], named: &[String]) {
+        for (c, key) in circuits.iter().zip(named) {
+            self.write(
+                &format!("{dir}/{c}.vk.rs"),
+                &format!(
+                    "b\"insecure_test_setup\\x00false\\x00proving_key_sha256\\x00{}\\x00\"",
+                    pk_sha(key)
+                ),
+            );
+        }
     }
 
     /// Runs the script; returns (success, stderr).
@@ -149,6 +170,18 @@ impl Drop for Sandbox {
     }
 }
 
+fn numbered(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("c{i}")).collect()
+}
+
+fn pk_body(circuit: &str) -> String {
+    format!("pk {circuit}")
+}
+
+fn pk_sha(circuit: &str) -> String {
+    format!("{:x}", Sha256::digest(pk_body(circuit).as_bytes()))
+}
+
 fn stub(bin: &Path, name: &str, body: &str) {
     use std::os::unix::fs::PermissionsExt;
     let p = bin.join(name);
@@ -165,8 +198,8 @@ fn lend_args<'a>(over: &[(&'a str, &'a str)]) -> Vec<&'a str> {
         ("--keepers", B),
         ("--pool-viewing", POOL),
         ("--collateral-mint", A),
-        ("--debt-mint", A),
-        ("--price-account", A),
+        ("--debt-mint", USDC),
+        ("--price-account", SOL_USD),
         ("--feed-id", FEED),
     ];
     for (k, v) in over {
@@ -226,6 +259,76 @@ fn refuses_bad_parameters_before_anything_else() {
     both.push("--build-only");
     s.refuses(&both, "not both");
     s.refuses(&lend_args(&[("--multisig", A)]), "missing --manifest");
+    s.refuses(
+        &estimate(&[("--max-time-lock-secs", "2d")]),
+        "--max-time-lock-secs is a number",
+    );
+}
+
+#[test]
+fn lend_refuses_any_vault_but_sol_usdc_before_the_build() {
+    let s = Sandbox::new();
+    let estimate = |over: &[(&'static str, &'static str)]| {
+        let mut v = lend_args(over);
+        v.push("--estimate");
+        v
+    };
+    let other_feed = "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a";
+    s.refuses(
+        &estimate(&[("--feed-id", other_feed)]),
+        &format!("--feed-id must be {FEED}"),
+    );
+    s.refuses(
+        &estimate(&[("--price-account", B)]),
+        &format!("--price-account must be {SOL_USD}"),
+    );
+    s.refuses(
+        &estimate(&[("--collateral-mint", USDC)]),
+        "--collateral-mint must be 11111111111111111111111111111111",
+    );
+    s.refuses(&estimate(&[("--debt-mint", A)]), "--debt-mint must be");
+}
+
+#[test]
+fn refuses_verifying_keys_that_name_another_circuits_proving_key() {
+    let s = Sandbox::new();
+    let circuits = numbered(11);
+    let mut swapped = circuits.clone();
+    swapped.swap(3, 7);
+    s.verifying_keys("lend/program/src/verifier", &circuits, &swapped);
+    s.commit();
+    let (m, keys) = s.manifest(11);
+    let (m, keys) = (m.to_str().unwrap(), keys.to_str().unwrap());
+    let real = [
+        ("--multisig", A),
+        ("--manifest", m),
+        ("--keeper-config", m),
+        ("--keys-dir", keys),
+    ];
+    s.refuses(
+        &lend_args(&real),
+        "c3.vk.rs is not the verifying key of the manifest's c3/pk.bin",
+    );
+    let mut build_only = lend_args(&[("--manifest", m)]);
+    build_only.push("--build-only");
+    s.refuses(&build_only, "c3.vk.rs is not the verifying key");
+}
+
+#[test]
+fn refuses_a_circuit_the_manifest_does_not_list() {
+    let s = Sandbox::new();
+    let circuits = numbered(11);
+    s.verifying_keys("lend/program/src/verifier", &circuits, &circuits);
+    s.verifying_keys(
+        "lend/program/src/verifier",
+        &["extra".to_owned()],
+        &circuits,
+    );
+    s.commit();
+    let (m, _) = s.manifest(11);
+    let mut build_only = lend_args(&[("--manifest", m.to_str().unwrap())]);
+    build_only.push("--build-only");
+    s.refuses(&build_only, "are not the manifest's circuits");
 }
 
 #[test]
@@ -294,10 +397,8 @@ fn refuses_a_test_price_so_and_a_bad_manifest() {
 #[test]
 fn lend_refuses_missing_keys_then_passes_every_check_before_the_build() {
     let s = Sandbox::new();
-    s.write(
-        "lend/program/src/verifier/a.vk.rs",
-        "b\"insecure_test_setup\\x00false\"",
-    );
+    let circuits = numbered(11);
+    s.verifying_keys("lend/program/src/verifier", &circuits, &circuits);
     s.commit();
     let (m, keys) = s.manifest(11);
     let cfg = s.dir.join("keeper.json");
@@ -332,14 +433,10 @@ fn lend_refuses_missing_keys_then_passes_every_check_before_the_build() {
 #[test]
 fn swap_passes_every_check_before_the_build() {
     let s = Sandbox::new();
-    for c in ["make", "take", "cancel"] {
-        s.write(
-            &format!("ceremony/swap/{c}.vk.rs"),
-            "b\"insecure_test_setup\\x00false\"",
-        );
-    }
+    let circuits: Vec<String> = ["make", "take", "cancel"].map(String::from).into();
+    s.verifying_keys("ceremony/swap", &circuits, &circuits);
     s.commit();
-    let (m, _) = s.manifest(3);
+    let (m, _) = s.manifest_of(&circuits);
     let args = [
         "swap",
         "--program-id",

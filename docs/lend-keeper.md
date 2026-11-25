@@ -21,8 +21,8 @@ The keeper runs inside the dealer, on the dealer's HTTP server, when the dealer 
   "pool_key": { "keychain": "keeler-lend-pool" },
   "role": "primary",
   "origins": ["https://keeler.example"],
-  "state_file": "/Users/me/.local/state/keeler/keeper.json",
-  "pause_file": "/Users/me/.local/state/keeler/lend.pause",
+  "state_file": "~/.local/state/keeler/keeper.json",
+  "pause_file": "~/.local/state/keeler/lend.pause",
   "price": "test",
   "price_refresh_secs": 45,
   "limits": {
@@ -104,7 +104,7 @@ not that feature, are what make it a mainnet keeper.
 | `role` | `primary` (default) or `standby`. A standby liquidates a position only once it has been past the threshold for `standby_grace_secs` (default 45, at most 600; the clock restarts when it recovers), and re-posts the test price only `price_refresh_secs` + 15 s after the last post, never over a fresh one (its `price_refresh_secs` is at most 60) |
 | `liquidation_priority_fee` | Micro-lamports per compute unit on liquidations and their funding self-transfer; default `network.priority_fee` (which every other keeper and dealer transaction pays, default 0). Both are at most 5,000,000 |
 | `admin_key` | Only for `keeler lend-init-reserve` |
-| `state_file` | Default `~/.local/state/keeler/keeper-<keeper pubkey>.json` |
+| `state_file` | Default `~/.local/state/keeler/keeper-<keeper pubkey>.json`. A leading `~/` here and in `pause_file` is the home directory |
 | `pause_file` | While this file exists: no new supply tickets or fills, no deposit tickets or fills that open a position, no borrowing |
 | `price` | `test`: the vault's test price account (local networks, devnet). `pyth`: the vault's Pyth `PriceUpdateV2` account compiled into the program |
 | `price_refresh_secs` | `price: "test"` only: how often the keeper re-posts the test price (5 to 80, default 45; the program refuses a price older than 90 s, the keeper's own draws one older than 65 s) |
@@ -188,12 +188,16 @@ transaction may still land. Each pass settles the records first, then runs the m
    the repay, made first when there is none by one self-transfer of exactly that amount (split from
    the smallest larger note, else merged from the four largest) and waited for up to 30 s (an
    empty change slot: see `lend/AGENTS.md`). The funds are the debt-token notes at the keeper's
-   lend address (its key under the pool viewing key). Above the
-   max limit the whole debt is repaid. A position the last liquidation left a hair past the
-   threshold (repay under `min_repay`, or under one debt share) is left. A liquidation that fails
-   is logged and that position waits 60 s, its funds note given back at once; the fills go on
-   meanwhile. Liquidations run even while a wallet holds the reservation, and while a peer's
-   history cannot be read (that is logged and read again next pass).
+   lend address (its key under the pool viewing key). Above the max limit it repays the largest
+   amount up to the whole debt whose payout fits the collateral. A position the last liquidation
+   left a hair past the threshold (repay under `min_repay`, or under one debt share) is left. A
+   liquidation that fails is logged and that position waits 60 s, its funds note given back at
+   once; the fills go on meanwhile. A liquidation that failed because another transaction (an owner build, a peer's
+   fill) spent its reserve or position first is tried again next pass on the new notes, without
+   the 60 s wait; owner builds get 409 until it has run, and no fill runs in the pass that lost
+   the reserve, since its notes are stale. Liquidations run even while a wallet holds the
+   reservation, and while a peer's history cannot be read (that is logged and read again next
+   pass).
 2. Repay fills, then deposit fills (into an existing position, then new positions).
 3. Supply fills, oldest ticket first within each kind. Owner builds (`/lend/build`) take the lane
    between passes.
@@ -213,10 +217,20 @@ share one key) for 3 minutes, so a swap settlement and a liquidation never pick 
 
 An owner build reserves the pool for its wallet for `reservation_secs`: other wallets get 409, the
 keeper's fills wait, liquidations do not. A later build by the same wallet does not extend it. It
-ends when the build lands or the time runs out; a wallet that lets it run out unused gets 409 for
-another `reservation_secs`. An owner build checks, in order: the wallet owns the receipt or
-position (404), `builds_per_wallet_hour` (429), the lane and reservation (409), the minimums
-(422), the price age (412, draws), the vault minimums (422) and health (423), and last the pool's
+ends when the build lands or the time runs out. A wallet that lets it run out unused gets 409 for
+`reservation_secs`, doubled for each earlier reservation it let lapse unused in the last hour (20,
+40, 80 s ... at most an hour). A build that lands after its reservation ran out (an honest user a
+second late) is not counted, nor is a reservation cut short because another transaction (a
+liquidation, a peer's fill) spent the notes its build needed. After any unused lapse, every
+waiting fill, supply included, runs before the next owner build. What remains: N wallets whose
+builds are never sent hold the pool about N x 160 s an hour with the default 20 s; a wallet that
+sends every build just late is forgiven each time, so it can hold one reservation per build, up
+to `builds_per_wallet_hour`. An owner build checks, in order: the wallet owns the receipt or
+position (404), `builds_per_wallet_hour` (429), the lane and reservation (409), then counts
+toward `builds_per_wallet_hour` (the refusals before this point do not; every later one does),
+the minimums (422), the price age (412, draws),
+a borrow against the pool's bad debt at that fresh price (403), the vault minimums (422) and
+health (423), and last the pool's
 liquidity (410) at the amount rounded up to two significant figures, so a refusal tells little
 about the pool's exact size. A build that takes longer than 25 s is answered 503 and not kept.
 
@@ -261,7 +275,17 @@ keeper's writer key, checked against the hash on chain (it waits up to 60 s for 
 each one, and refuses to start rather than rebuild without one). A transaction another key paid
 for is never read, so notes made with the public local test keys are never taken up. It keeps the
 unspent reserve, receipts and positions, merged with the file, and moves `scanned` to the newest
-finalized transaction it read. It refuses to start with two unspent reserves. A first start (no scan mark for a keeper) makes one request per transaction that keeper key ever paid for, of any program: on devnet, a dealer key with about 1,600 earlier transactions took 3.5 minutes. Give a keeper a key with no other history where a fast first start matters; later starts read only what is new. Every pass also
+finalized transaction it read. The scan stops with an error, its mark where it was, when a keeper
+transaction does not show every note its op always makes (a reserve for `init_reserve`; a reserve
+and a receipt for `supply` and `redeem`, a full redeem's empty receipt too; a position for a
+deposit; a reserve and a position for `draw`, `repay` and `liquidate`), when one has no nullifier
+or salt, or when the RPC's signature list stops before the mark (the signature before the oldest
+one read must be the mark, or none on a first read). Outputs the keeper cannot open by design (the
+user's payout and change, its own liquidation proceeds) are skipped as before. Such an error is
+read again next pass; on start it keeps the keeper from starting until the RPC and indexer give
+the whole history (a dry run over a deployment's history:
+`KEELER_KEEPER_CONFIG=<config> cargo test -p keeler --lib -- --ignored strict_history`, with the
+deployment's build parameters in the environment; it reads only, from no mark, and writes nothing). It refuses to start with two unspent reserves. A first start (no scan mark for a keeper) makes one request per transaction that keeper key ever paid for, of any program: on devnet, a dealer key with about 1,600 earlier transactions took 3.5 minutes. Give a keeper a key with no other history where a fast first start matters; later starts read only what is new. Every pass also
 reads the other keepers' new transactions, so their fills, deposits and liquidations reach its
 book. Tickets are not on chain: after a restart with an empty file the keeper fills no intent
 made before it (their makers refund after expiry) and the account view shows no old intents.
@@ -279,8 +303,12 @@ that position id does not open a new position for 2 minutes.
 
 - Run two processes with one keeper key. The state file's lock stops two processes on one file,
   not two state files (or two machines). Two keepers of the set may run on one pool, one
-  `primary` and the others `standby`: they race only when the primary is slow, and the loser's
-  build is dropped (it cannot land on a spent reserve).
+  `primary` and the others `standby`: they race only when the primary is slow. A loser's build
+  that spends the reserve is dropped (it cannot land on a spent reserve). Deposits spend no
+  reserve, so two keepers filling deposits at once can both land and together pass
+  `max_total_collateral`: each merges its peers' fills every pass and checks the cap again at the
+  fill, so the overrun is at most one `max_position_collateral` per extra keeper. The caps are a
+  canary's soft limit per keeper, not the program's.
 - Delete or edit the state file while the keeper runs, or restore an old copy. It is the only
   record of tickets and of builds in flight. (An empty file is recoverable from the chain; a wrong
   one is not.)

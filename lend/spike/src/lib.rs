@@ -1,4 +1,4 @@
-//! The lend spike: see `../SPIKE.md`. Forgeable test keys, local network only.
+//! The lend spike: see `../../../docs/notes-for-xark-builders.md`. Forgeable test keys, local network only.
 #[cfg(all(not(feature = "build-circuits"), not(feature = "insecure-test-setup")))]
 compile_error!("the spike verifying keys require the insecure-test-setup feature");
 

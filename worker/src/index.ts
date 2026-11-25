@@ -8,6 +8,7 @@ export interface Env {
   NETWORK: string;
   DEALERS?: unknown;
   UPSTREAM_RPC?: string;
+  PRICE_RPC_URL?: string;
   UPSTREAM_SPR?: string;
   UPSTREAM_INDEXER?: string;
   UPSTREAM_PROVER?: string;
@@ -390,8 +391,8 @@ async function prices(env: Env): Promise<Record<string, Quoted>> {
 async function pyth(env: Env, feeds: Record<string, PythAccount>, symbol: (mint: string) => string, now: number): Promise<Record<string, Quoted>> {
   const maxAge = limitVar(env.PYTH_MAX_AGE_SECS, "PYTH_MAX_AGE_SECS");
   const maxConf = limitVar(env.PYTH_MAX_CONF_BPS, "PYTH_MAX_CONF_BPS");
-  const base = rpcBase(env);
-  const key = JSON.stringify([base, feeds]);
+  const target = priceRpc(env);
+  const key = JSON.stringify([target, feeds]);
   // Age is re-checked on every read; a cached price that went stale is read again.
   const fresh = (p: Record<string, Quoted>) => Object.values(p).every((q) => now - q.publishTime <= maxAge);
   if (priceCache?.key === key && Date.now() - priceCache.at < PRICE_CACHE_MS && fresh(priceCache.prices)) return priceCache.prices;
@@ -403,7 +404,7 @@ async function pyth(env: Env, feeds: Record<string, PythAccount>, symbol: (mint:
   });
   let value: unknown;
   try {
-    const response = await fetch(withKey(base, env), {
+    const response = await fetch(target, {
       method: "POST", headers: { "content-type": "application/json" }, body, redirect: "manual", signal: AbortSignal.timeout(PRICE_TIMEOUT_MS),
     });
     const bytes = response.ok ? await readCapped(response.body, 64 * 1024) : null;
@@ -458,6 +459,47 @@ export function checkPriceAccount(account: unknown, feedId: string, symbol: stri
 // ---- upstreams ----
 
 const rpcBase = (env: Env) => env.UPSTREAM_RPC ?? (env.NETWORK === "local" ? LOCAL.rpc : helius(env, "/"));
+
+const HELIUS_DOMAINS = ["helius-rpc.com", "helius.xyz", "helius.dev"];
+const isHeliusHost = (raw: string) => {
+  const host = raw.replace(/\.+$/, "");
+  return HELIUS_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`));
+};
+
+/**
+ * The RPC the reference prices are read through: `PRICE_RPC_URL`, else the page's RPC. Required on mainnet, and there
+ * never a Helius host: the dealer reads its prices through Helius, so one provider cannot show both the same false price.
+ */
+function priceRpc(env: Env): string {
+  const raw = env.PRICE_RPC_URL;
+  if (raw === undefined || raw === "") {
+    if (env.NETWORK === "mainnet") throw new Fail(500, "The server setting PRICE_RPC_URL is required on mainnet.");
+    return withKey(rpcBase(env), env);
+  }
+  const url = URL.canParse(raw) ? new URL(raw) : undefined;
+  const scheme = url?.protocol === "https:" || (env.NETWORK === "local" && url?.protocol === "http:");
+  if (!url || !scheme) throw new Fail(500, "The server setting PRICE_RPC_URL must be an https:// URL.");
+  if (env.NETWORK === "mainnet" && isHeliusHost(url.hostname)) throw new Fail(500, "The server setting PRICE_RPC_URL must not be a Helius host on mainnet.");
+  return withKey(raw, env);
+}
+
+/** Values no response may carry: the Helius key, and the credentials a `PRICE_RPC_URL` may hold in its user, path or query. */
+function secrets(env: Env): string[] {
+  const out = env.HELIUS_API_KEY ? [env.HELIUS_API_KEY] : [];
+  const raw = env.PRICE_RPC_URL ?? "";
+  if (!URL.canParse(raw)) return out;
+  const u = new URL(raw);
+  const parts = [...[u.username, u.password, ...u.pathname.split("/")].map(decoded), ...u.searchParams.values()];
+  return [...out, ...parts.filter((p) => p.length >= 16)];
+}
+
+function decoded(part: string): string {
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    return part;
+  }
+}
 
 function helius(env: Env, path: string): string {
   if (env.NETWORK !== "devnet" && env.NETWORK !== "mainnet") throw new Fail(503, "This network has no upstream configured.");
@@ -602,7 +644,8 @@ async function spr(request: Request, env: Env, url: URL): Promise<Response> {
   const length = Number(response.headers.get("content-length") ?? 0);
   const bytes = length > cap ? null : await readCapped(response.body, cap);
   if (bytes === null) throw new Fail(502, `The upstream reply is larger than ${isIndexer ? 10 : 1} MiB.`);
-  if (env.HELIUS_API_KEY && new TextDecoder().decode(bytes).includes(env.HELIUS_API_KEY)) {
+  const text = new TextDecoder().decode(bytes);
+  if (secrets(env).some((secret) => text.includes(secret))) {
     throw new Fail(502, "The upstream service returned an error.");
   }
   const out = new Headers({ "cache-control": "no-store" });

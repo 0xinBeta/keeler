@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs the devnet dealer behind a cloudflared quick tunnel, restarts either
 # one with backoff when it exits, and writes the tunnel's URL to the Worker
-# as DEALERS whenever it changes. NOT TO BE RUN until the owner approves
-# publishing (it changes the deployed Worker). Ctrl-C stops everything.
+# as DEALERS whenever it changes. Run it with care: it changes the deployed
+# Worker's variables. Ctrl-C stops everything.
 #
 #   scripts/run-dealer.sh [--standby] [dealer-config]
 #       (default target/devnet/dealer-config.json)

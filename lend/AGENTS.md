@@ -1,37 +1,34 @@
-# Keeler Lend: notes for agents
+# Keeler Lend: notes for contributors and coding agents
 
-The plan is `docs/plan-lend.md`; the spike results are `SPIKE.md`. `lend/` is
-its own Cargo workspace (members `program`, `sdk`, `spike`), outside the root
-one. Never touch `.tools/` or the main checkout's `target/`; read
-`.tools/env` only.
+Paths are relative to `lend/`. The design is `../docs/plan-lend.md`; the toolkit notes are
+`../docs/notes-for-xark-builders.md`. `lend/` is its own Cargo workspace (members `program`, `sdk`, `spike`), outside the root one.
+`../scripts/setup-lend.sh` reads the tool paths from the main checkout's `.tools/env` and writes
+under `target` (or `KEELER_LEND_OUT`), into `../web/public/lend` (the browser package it replaces
+there), and with `--update-checksums` into `lend-keys.CHECKSUM`.
 
-## Who owns which files
+## Layout
 
-| Piece | Files |
+| Part | Files |
 |---|---|
-| Program core | `program/src/{lib.rs,error.rs,client.rs,wasm.rs}`, `program/src/instructions/{mod.rs,init_reserve.rs,intent.rs,cancel_intent.rs}`, `program/src/circuits/{mod.rs,notes.rs,math.rs,init_reserve.rs,intent.rs,cancel_intent.rs}`, `sdk/src/{lib.rs,proof.rs}` and the three core builders, `scripts/setup-lend.sh` |
-| Earn | `supply` and `redeem`: `program/src/circuits/{supply,redeem}.rs`, `program/src/instructions/{supply,redeem}.rs`, their verifier slots, error ranges 20400 and 20500, their SDK builders and tests |
-| Vault | `deposit`, `draw`, `repay`, `liquidate`, `close`: the same files for each, error ranges 20600-21000, the oracle check and the test price account |
+| Program | `program/src/lib.rs` (tags, seeds, ids), `error.rs`, `vaults.rs` (vault parameters, the price account), `instructions/` (one file per instruction; `mod.rs` holds the shared checks), `verifier/` (generated) |
+| Circuits | `program/src/circuits/` (one file per circuit; `math.rs` accrual and shares, `vault.rs` health and liquidation rules, `notes.rs` note layouts) |
+| SDK | `sdk/src/` (builders, proof ids, the keeper keypair), `sdk/tests/` (native, compiled and local-chain tests) |
+| Spike | `spike/`: the prototype that proved the toolkit could do this (`../docs/notes-for-xark-builders.md`) |
 
-Each later instruction already has a tag (`tag::*`), a module that returns its
-`*NotBuilt` error, a doc-only circuit file, a commented verifier slot in
-`program/src/verifier/mod.rs` and an error range of 100 codes
-(`error.rs`). Replace the stub, uncomment the slot, add the circuit to
-`circuits/mod.rs`, its id to `sdk/src/proof.rs`, and its files to
-`lend-keys.CHECKSUM` (`scripts/setup-lend.sh --update-checksums`). Edits to
-shared files (`mod.rs`, `error.rs`, `proof.rs`) are one line each; keep them
-to that so pieces merge cleanly. Vault may split `deposit` into
-`deposit_open` and `deposit_add` (an optional data input does not compile,
-see `SPIKE.md`); take tag 11 for the second one.
+Adding an instruction: a tag in `lib.rs`, an instruction module, a circuit in
+`circuits/mod.rs`, its verifier in `program/src/verifier/mod.rs`, an error
+range in `error.rs`, its id in `sdk/src/proof.rs`, and its files in
+`lend-keys.CHECKSUM` (`../scripts/setup-lend.sh --update-checksums`). A change to
+a circuit changes its keys: the checksum check fails until they are
+regenerated, and a deployed program needs the new verifying key.
 
 ## Reuse
 
 - `instructions::{parse, Pda, cpi, check_now, clock, verified,
   require_keeper, require_admin, identity, mint_halves}`. Every instruction
   that spends a reserve calls `require_keeper` on its keeper account and
-  `check_now(now)` on its public `now`. The price check is in
-  `spike/src/instructions.rs` (`check_price`): move it into
-  `instructions/mod.rs` when Vault needs it.
+  `check_now(now)` on its public `now`. The price check is
+  `instructions::vault::quote`.
 - `circuits::{reserve_seed, reserve_address, assert_mint, assert_note,
   assert_intent}`: every circuit that spends a reserve rebuilds its address
   from the mint, never takes it as a witness.
@@ -39,7 +36,7 @@ see `SPIKE.md`); take tag 11 for the second one.
   `refresh(state, pool, salt)`, which only stores the new rate and salt: it
   does not accrue, so every circuit that spends a reserve calls `accrue`
   itself first. Also share conversions, `assert_borrow_cap`, `VaultParams`. It passes
-  `web/tests/fixtures/lend-vectors.json` (`cargo test -p keeler-lend
+  `../web/tests/fixtures/lend-vectors.json` (`cargo test -p keeler-lend
   --features build-circuits --lib`).
 
 ## Xark rules learnt the hard way
@@ -79,7 +76,7 @@ scripts/run-chain-test.sh                 # local network, port offset 2100
 ```
 
 Features: exactly one of `insecure-test-setup` (the default) and `mainnet`.
-`test-price` is not a default: `scripts/setup-lend.sh` passes it for the
+`test-price` is not a default: `../scripts/setup-lend.sh` passes it for the
 local and devnet `.so`, and it cannot build with `mainnet`; such a `.so`
 contains the string `KEELER_LEND_TEST_PRICE_BUILD`. A `mainnet` build needs
 every build parameter set and refuses public test keys
@@ -92,5 +89,5 @@ as the keeper; every `pool_viewing` argument must be `POOL_VIEWING`
 nullifier keys under the pool viewing key. Local tests use the fixture
 keepers (actor 0 and the payer) and `fixture_keeper_keypair`.
 
-Local networks: a port offset in 2100-2700 (`ZOLANA_PORT_OFFSET`, prover on
+Local networks: a port offset of your own (`ZOLANA_PORT_OFFSET`, prover on
 3001 + offset / 100), and stop what you start.

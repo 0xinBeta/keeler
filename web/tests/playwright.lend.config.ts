@@ -6,12 +6,12 @@ import { defineConfig } from "@playwright/test";
 
 const root = new URL("../..", import.meta.url).pathname;
 export const LEND_STACK = `${root}target/localnet/lend-web-2400/stack.json`;
-type Stack = { programId: string; keeper: string; keepers?: string[]; poolViewing?: string };
+type Stack = { programId: string; keeper: string; keepers?: string[]; poolViewing?: string; tusd: string };
 const stack = existsSync(LEND_STACK) ? (JSON.parse(readFileSync(LEND_STACK, "utf8")) as Stack) : undefined;
 // Without a stack the page builds without lend; the spec skips before it opens a page. Without poolViewing in the
 // stack (an older lend-web-stack.sh) the page hides lending too.
 const lendEnv = stack
-  ? `VITE_LEND_PROGRAM_ID=${stack.programId} VITE_LEND_KEEPERS='${JSON.stringify(stack.keepers ?? [stack.keeper])}' VITE_LEND_POOL_VIEWING=${stack.poolViewing ?? ""}`
+  ? `VITE_LEND_PROGRAM_ID=${stack.programId} VITE_LEND_KEEPERS='${JSON.stringify(stack.keepers ?? [stack.keeper])}' VITE_LEND_POOL_VIEWING=${stack.poolViewing ?? ""} VITE_ASSETS='${JSON.stringify([{ mint: "11111111111111111111111111111111", symbol: "SOL", decimals: 9 }, { mint: stack.tusd, symbol: "tUSD", decimals: 6 }])}'`
   : "";
 
 export default defineConfig({

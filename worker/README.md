@@ -47,11 +47,12 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `NETWORK` | var | `local`, `devnet` or `mainnet`; any other value makes every `/api/` route a 500 |
 | `DEALERS` | var | JSON `[{"url","pubkey"}]`. Each `url` is `https://`; `http://` only on `local` (`DEALER_KEY` goes with every request) |
 | `UPSTREAM_RPC` | var | RPC URL. Default: `https://<network>.helius-rpc.com/`, or `http://127.0.0.1:8899` on `local` |
+| `PRICE_RPC_URL` | secret (or var) | RPC URL used only to read the Pyth price accounts behind `/api/prices`. Required on `mainnet`, where it must be `https://` and not a Helius host (the dealer reads its prices through Helius; two providers keep one from showing both the same false price). Elsewhere optional (`http://` only on `local`); unset, the prices are read through the page's RPC. It may carry its provider's key in its path or query: that URL stays in the Worker, and an upstream reply that echoes a credential of it is refused (502). Set it as a secret when it holds a key |
 | `UPSTREAM_SPR` | var | Base URL for both indexer and prover paths. Default: `https://<network>.helius-rpc.com/v1/spr` |
 | `UPSTREAM_INDEXER` | var | Overrides `UPSTREAM_SPR` for the indexer paths. Default on `local`: `http://127.0.0.1:8784` |
 | `UPSTREAM_PROVER` | var | Overrides `UPSTREAM_SPR` for the prover paths. Default on `local`: `http://127.0.0.1:3001` |
 | `PROGRAM_ID` | var | Swap program ID |
-| `ASSETS` | var | JSON `[{"mint","symbol","decimals"}]` |
+| `ASSETS` | var | JSON `[{"mint","symbol","decimals"}]`, each optionally with `maxSell` (a decimal string of base units). The site carries its own copy in `VITE_ASSETS` (required on `mainnet`) and refuses an asset it was not built with or with another symbol or decimals; of each asset it takes only `maxSell` from here |
 | `BAND_BPS`, `MIN_TTL_SECS`, `MAX_TTL_SECS` | var | Numbers |
 | `REFERENCE` | var | JSON `{"<mint>":{"price","expo"}}`: fixed prices for mints without a Pyth account. Ignored on `mainnet` |
 | `FAUCET` | var | `"1"` turns on `/api/faucet` |
@@ -60,7 +61,7 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `PYTH_MAX_AGE_SECS`, `PYTH_MAX_CONF_BPS` | var | Required with `PYTH_ACCOUNTS`. A price older than this (or newer than now plus this), non-positive, or with confidence wider than this many bps of the price fails the whole call with 503 |
 | `LEND_PROGRAM_ID` | var | Lend program ID (base58) |
 | `LEND_POOLS` | var | JSON `[{"mint","curve":[{"utilisationBps","rateBps"}],"feeBps","maxUtilisationBps","minSupply"}]`. The curve has 2 to 8 points, utilisation strictly rising from 0 to 10000 |
-| `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps`. Every pool mint and collateral mint must also be in `ASSETS` (the page reads lend amounts with its decimals) |
+| `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps`. The page refuses a vault whose `id` and risk parameters are not the ones compiled into it (vault 1: 8000, 8500, 9000, 100). Every pool mint and collateral mint must also be in `ASSETS` (the page reads lend amounts with its decimals) |
 | `LEND_KEEPERS` | var | Optional JSON `[{"url","pubkey"}]`, 1 to 4 keepers in the order to ask them, no repeated `pubkey`, each `url` `https://` (`http://` only on `local`). Unset: one keeper, at `LEND_KEEPER_URL` (or the first `DEALERS` entry's `url`) with the first `DEALERS` entry's `pubkey` |
 | `LEND_KEEPER_URL` | var | Optional `https://` (on `local` also `http://`) base URL of the lending keeper, used only without `LEND_KEEPERS`. Default: the first `DEALERS` entry's `url` |
 | `LEND_PAUSED` | var | `"1"` refuses `supply` tickets (new deposits into Earn) with a 503, and sends everything else (`pools`, `account`, `repay` and `deposit` tickets, every `build`) with `x-keeler-paused: 1`: the keeper then refuses a deposit that opens a position and any build that borrows. Repaying, topping up, withdrawing from Earn and withdrawing collateral keep working, and tickets issued before the switch still fill |
@@ -101,7 +102,7 @@ own signed requests, is in the Worker's tests.
 
 | Route | Request | Reply |
 | --- | --- | --- |
-| `pools` | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps}]}`, at most 8 |
+| `pools` | none | `{pools: [{mint, at, size, utilisationBps, supplyRateBps, borrowRateBps, surplus, badDebt}]}`, at most 8 |
 | `account` | signed fields, `tickets`: up to 8 open tickets as the page holds them, `{id, expiry, signature, keeper, purpose, amount, pool?, vault?, position?}`; not covered by `signature` (each is signed by its keeper) | `{receipts: [{pool, shares, message}], positions: [{vault, position, collateral, debtShares, message}], intents: [{id, purpose, amount, expiry, status}]}`, each at most 8; `message` is base64 up to 512 characters; `status` is `waiting`, `filled` or `refundable`; optional `index: {supply, borrow, at}` (decimal strings, chain time) |
 | `ticket` | signed fields, `purpose` (`supply`, `deposit`, `repay`), `amount`, optional `pool`, `vault`, `position` | `{id (32 hex), expiry, signature (128 hex), keeper}`; `keeper` must be the keeper asked |
 | `build` | signed fields, `op` (`redeem`, `draw`), optional `pool`, `vault`, `position`, `amount`, `shares`, `borrow`, `withdraw`, `receipt` (64 hex); a redeem has exactly one of `amount` and `shares`, and only a redeem takes `shares` or `receipt` | `{transaction (base64, at most 5,464 characters = 4,096 bytes), outputs: [64 hex] (1 to 8), now, bound?, index?, keeper}`; `keeper` must be the keeper asked, and is the transaction's fee payer; `index` is the pool's price index (1e12-scaled) the transaction used |
@@ -193,12 +194,12 @@ stay open (wallets need them) and count under the RPC limits.
 ## Run locally against a local network
 
 `scripts/dev.sh [offset] [port]` does all of this in one command: it starts the local network,
-builds the site with `VITE_DEALERS`, writes `worker/.dev.vars` from the network's
+builds the site with `VITE_DEALERS` and `VITE_ASSETS`, writes `worker/.dev.vars` from the network's
 `target/localnet/keeler-web-<offset>.json` and runs `wrangler dev`; Ctrl-C stops it all.
 
 By hand: start the local network (`scripts/localnet.sh`), build the site
-(`cd ../web && VITE_NETWORK=local VITE_DEALERS='["<dealer pubkey>"]' pnpm build`; the site refuses a
-service whose `NETWORK` differs from `VITE_NETWORK`), then put this in
+(`cd ../web && VITE_NETWORK=local VITE_DEALERS='["<dealer pubkey>"]' VITE_ASSETS='[{"mint":"REPLACE_MINT_A","symbol":"tUSD","decimals":6},{"mint":"REPLACE_MINT_B","symbol":"tSOL","decimals":9}]' pnpm build`;
+the site refuses a service whose `NETWORK` differs from `VITE_NETWORK`, or whose `ASSETS` differ from `VITE_ASSETS`), then put this in
 `worker/.dev.vars` (git-ignored; placeholder values):
 
 ```sh

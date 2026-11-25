@@ -89,6 +89,24 @@ fn shares_round_for_the_pool() {
 }
 
 #[test]
+fn a_partial_repay_must_remove_a_share() {
+    let bp = PRICE_SCALE + 1;
+    let r = reserve(10_000_000, 1_000_000, PRICE_SCALE, bp, 0);
+    assert_eq!(repay(&r, 1_000_000, 1, &C), Err(ZeroShares));
+    assert_eq!(repay(&r, 1_000_000, 0, &C), Err(ZeroShares));
+    let (_, done) = repay(&r, 1_000_000, 2, &C).unwrap();
+    assert_eq!(done.shares, 999_999);
+    let (_, done) = repay(&r, 0, 1, &C).unwrap();
+    assert_eq!(
+        done,
+        Repaid {
+            shares: 0,
+            change: 1
+        }
+    );
+}
+
+#[test]
 fn borrow_cap_and_liquidity() {
     let r = reserve(1_000_000, 0, PRICE_SCALE, PRICE_SCALE, 0);
     let (after, shares) = borrow(&r, 1_000_000, 950_000, &C).unwrap();

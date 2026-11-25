@@ -1,5 +1,5 @@
-// The landing sections below the hero. Copy follows docs/plan-landing.md; every claim there was checked
-// against the code, so wording changes here must not add or strengthen one.
+// The landing sections below the hero. Every claim here must hold for the code (docs/plan-lend.md, README.md);
+// wording changes must not add or strengthen one.
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { BUILD_NETWORK } from "../keeler/network";

@@ -105,14 +105,19 @@ fn above(debt: u64, value: u64, factor_bps: u64) -> bool {
     (f(debt) * f(BPS)).gt::<80>(f(factor_bps) * f(value))
 }
 
+/// `debt x 1e4 <= cf x value`: a draw may leave the position at most at
+/// the collateral factor.
 pub fn can_draw(debt: u64, value: u64, v: &VaultParams) -> bool {
     !above(debt, value, v.cf_bps)
 }
 
+/// `debt x 1e4 > lt x value`: past the liquidation threshold.
 pub fn is_liquidatable(debt: u64, value: u64, v: &VaultParams) -> bool {
     above(debt, value, v.lt_bps)
 }
 
+/// `debt x 1e4 > lml x value`: past the max limit, where a liquidation may
+/// take all of the debt and leave the position healthier than the threshold.
 pub fn above_max_limit(debt: u64, value: u64, v: &VaultParams) -> bool {
     above(debt, value, v.lml_bps)
 }

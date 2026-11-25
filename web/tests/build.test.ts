@@ -60,7 +60,7 @@ describe("a mainnet build", () => {
   const served = { network: "mainnet", rpcPath: "/api/rpc", sprPath: "/v1/spr", programId: PROGRAM, assets: [], dealers: [], bandBps: 0, minTtlSecs: 0, maxTtlSecs: 0, faucet: true, paused: false };
 
   it("offers no faucet, whatever the service says", () => {
-    expect(parseConfig(served, "mainnet").faucet).toBe(false);
+    expect(parseConfig(served, "mainnet", JSON.stringify([{ mint: PROGRAM, symbol: "SOL", decimals: 9 }])).faucet).toBe(false);
     expect(parseConfig({ ...served, network: "devnet" }, "devnet").faucet).toBe(true);
   });
 

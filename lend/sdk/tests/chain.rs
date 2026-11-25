@@ -5,6 +5,8 @@
 //! Run through `lend/scripts/run-chain-test.sh` (port offset 2100, the tool
 //! paths from `.tools/env`, the SBF build in `lend/target/deploy`). Ignored in
 //! a plain `cargo test`.
+#[path = "measure.rs"]
+mod measure;
 #[path = "tamper.rs"]
 mod tamper;
 #[path = "wallet.rs"]
@@ -75,9 +77,11 @@ fn indexed(
 #[test]
 #[ignore = "needs a local network: lend/scripts/run-chain-test.sh"]
 fn reserve_intent_and_cancel() -> Result<()> {
+    let ports = LocalnetPorts::for_test(0)?;
+    let rpc_url = ports.rpc_url();
     let localnet = FixtureLocalnet::start(
         "keeler-lend",
-        LocalnetPorts::for_test(0)?,
+        ports,
         vec![(
             keeler_lend_sdk::ID,
             root().join("target/deploy/keeler_lend.so"),
@@ -187,6 +191,7 @@ fn reserve_intent_and_cancel() -> Result<()> {
         refund.amount == INTENT_AMOUNT && refund.owner_address == Some(user.shielded_address()?),
         "refund {refund:?}"
     );
+    measure::lend_proof("cancel_intent", &cancel)?;
     let ix = cancel.prove(indexer, tree, &user)?;
     ensure!(
         chain_now(&localnet)? <= expiry,
@@ -220,9 +225,10 @@ fn reserve_intent_and_cancel() -> Result<()> {
         ),
         INVALID_SEEDS,
     )?;
-    let sig = send(rpc, &[&user_key], ix)?;
+    let sig = send(rpc, &[&user_key], ix.clone())?;
     println!("cancel_intent: {sig}");
     wait_for_merkle_proof(indexer, tree, refund.hash(tree_id).map_err(err)?)?;
+    measure::report(&rpc_url, "cancel_intent", &user_key.pubkey(), &ix, &sig)?;
     println!("refund indexed");
     Ok(())
 }

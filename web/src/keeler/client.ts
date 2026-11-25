@@ -45,6 +45,7 @@ import { nextRecord, refreshAll, refundRefusal, type ChainReads } from "./status
 import { orderStore, type OrderRecord } from "./storage";
 import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
 import { createLend, type LendServerConfig } from "./lend";
+import { TSOL_TUSD_VAULT } from "./lend-math";
 import { fromHex, sessionSeed } from "./lend-auth";
 import { createLendSeams } from "./lend-chain";
 import { lendStore } from "./lend-store";
@@ -92,23 +93,75 @@ function compiledDealers(): string[] | undefined {
   }
 }
 
-/** `/api/config` as served, with `maxSell` decimal strings; refused unless it is for the network this site was built for. */
-export function parseConfig(raw: Record<string, unknown>, built = BUILD_NETWORK): ServerConfig {
+/**
+ * The assets compiled into the site (`VITE_ASSETS`, a JSON array of `{mint, symbol, decimals}`). Required on mainnet;
+ * a test build without it takes the served list.
+ */
+export function pinnedAssets(raw: unknown, network: string): Asset[] | undefined {
+  if (raw === undefined || raw === "") {
+    if (network === "mainnet") throw err("network", "This mainnet site was built without VITE_ASSETS, so it cannot check token decimals. It will not start; rebuild it with VITE_ASSETS set.");
+    return undefined;
+  }
+  let list: unknown;
+  try {
+    list = typeof raw === "string" ? JSON.parse(raw) : undefined;
+  } catch {
+    list = undefined;
+  }
+  const isAsset = (a: unknown): a is Asset => {
+    const { mint, symbol, decimals } = (a ?? {}) as Record<string, unknown>;
+    return typeof mint === "string" && isAddress(mint) && typeof symbol === "string" && symbol !== "" && Number.isInteger(decimals) && (decimals as number) >= 0 && (decimals as number) <= 18;
+  };
+  if (!Array.isArray(list) || list.length === 0 || !list.every(isAsset) || new Set(list.map((a) => a.mint)).size !== list.length) {
+    throw err("network", "This site was built with a malformed VITE_ASSETS. It will not start; rebuild it.");
+  }
+  return list.map(({ mint, symbol, decimals }) => ({ mint, symbol, decimals }));
+}
+
+const sameVault = (served: LendServerConfig["vaults"][number], v: typeof TSOL_TUSD_VAULT) => {
+  try {
+    return BigInt(served.cfBps) === v.cfBps && BigInt(served.ltBps) === v.ltBps && BigInt(served.lmlBps) === v.lmlBps && BigInt(served.penaltyBps) === v.penaltyBps;
+  } catch {
+    return false;
+  }
+};
+
+/** Vault risk parameters compiled into the site, by vault id; the program carries the same. */
+const COMPILED_VAULTS: Record<number, typeof TSOL_TUSD_VAULT> = { 1: TSOL_TUSD_VAULT };
+
+/**
+ * `/api/config` as served, with `maxSell` decimal strings; refused unless it is for the network this site was built
+ * for, lists only the compiled assets with their compiled symbols and decimals, and serves the compiled vault parameters.
+ * Of each asset only `maxSell` comes from the service.
+ */
+export function parseConfig(raw: Record<string, unknown>, built = BUILD_NETWORK, assetsBuilt: unknown = import.meta.env.VITE_ASSETS): ServerConfig {
   const c = raw as unknown as ServerConfig & { assets: (Config["assets"][number] & { maxSell?: unknown })[] };
   if (!built) throw err("network", "This site was built without VITE_NETWORK, so it cannot tell which network it is for. It will not start; rebuild it with VITE_NETWORK set.");
   if (c.network !== built) {
     throw err("network", `This site was built for ${built}, but the service runs ${String(c.network)}. Do not use it; reload, and report it if this persists.`);
+  }
+  const pinned = pinnedAssets(assetsBuilt, built);
+  const differs = (what: string) => err("network", `The service's ${what} differ from the ones this site was built with. Do not use it; reload, and report it if this persists.`);
+  if (new Set(c.assets.map((a) => a.mint)).size !== c.assets.length) throw differs("assets");
+  const assets = c.assets.map(({ maxSell, ...served }) => {
+    const a = pinned ? pinned.find((p) => p.mint === served.mint && p.symbol === served.symbol && p.decimals === served.decimals) : served;
+    if (!a) throw differs(`settings for ${String(served.symbol)}`);
+    if (maxSell === undefined || maxSell === null) return a;
+    if (typeof maxSell !== "string" || !/^\d+$/.test(maxSell)) throw err("network", `The service sent a bad maxSell for ${a.symbol}.`);
+    return { ...a, maxSell: BigInt(maxSell) };
+  });
+  if (c.lend) {
+    const vaultsOk = c.lend.vaults.every((v) => COMPILED_VAULTS[v.id] !== undefined && sameVault(v, COMPILED_VAULTS[v.id]!));
+    if (!vaultsOk) throw differs("lending vault parameters");
+    const mints = [...c.lend.pools.map((p) => p.mint), ...c.lend.vaults.flatMap((v) => [v.collateralMint, v.debtMint])];
+    if (!mints.every((m) => assets.some((a) => a.mint === m))) throw differs("lending assets");
   }
   return {
     ...c,
     paused: c.paused === true,
     // A mainnet build never offers a faucet, whatever the service says.
     faucet: c.faucet === true && built !== "mainnet",
-    assets: c.assets.map(({ maxSell, ...a }) => {
-      if (maxSell === undefined || maxSell === null) return a;
-      if (typeof maxSell !== "string" || !/^\d+$/.test(maxSell)) throw err("network", `The service sent a bad maxSell for ${a.symbol}.`);
-      return { ...a, maxSell: BigInt(maxSell) };
-    }),
+    assets,
   };
 }
 

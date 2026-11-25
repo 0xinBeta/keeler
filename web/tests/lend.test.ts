@@ -473,19 +473,35 @@ describe("the keeper account view", () => {
    * then lists `next` (its latest note, which may come after later operations), or nothing, as the real keeper does
    * for a position left empty.
    */
-  async function liquidated(bound: bigint, next?: [bigint, bigint], at = T0 - 20) {
+  async function liquidated(bound: bigint, next?: [bigint, bigint], at = T0 - 20, nextWrittenByIt = false) {
     await W.lend.supply(TUSD, 1_000000n, () => {}); // opens the session
     const held = await givePosition(W, 42n, 4_000000000n, 100_000000n);
     await W.lend.lendAccount();
+    W.keeper.account.positions = [];
+    const after = next ? await givePosition(W, 42n, next[0], next[1]) : undefined;
     const sig = "7".repeat(88);
     const args = new Uint8Array(ARGS.liquidate.length);
     args.set(u64Bytes(BigInt(at)), ARGS.liquidate.now);
     args.set(u64Bytes(bound), ARGS.liquidate.bound);
-    W.txs.set(sig, wire(W.KEEPER, [{ programAddress: PROGRAM, accounts: [ws(W.KEEPER)], data: Uint8Array.of(TAG.liquidate, ...args) }]));
+    const transfer = nextWrittenByIt && after ? liquidationTransfer(after.hash) : new Uint8Array();
+    W.txs.set(sig, wire(W.KEEPER, [{ programAddress: PROGRAM, accounts: [ws(W.KEEPER)], data: Uint8Array.of(TAG.liquidate, ...args, ...transfer) }]));
     W.notes.set(hex(held.hash), { leafIndex: 9n, spentBy: sig });
-    W.keeper.account.positions = [];
-    return next ? givePosition(W, 42n, next[0], next[1]) : undefined;
+    return after;
   }
+  const liquidationTransfer = (position: Uint8Array) =>
+    encodeTransactInstructionData({
+      expiryUnixTs: BigInt(T0),
+      txViewingPk: new Uint8Array(33).fill(2),
+      salt: new Uint8Array(16),
+      interfaceTransfers: [],
+      outputs: [sha("reserve"), position].map((utxoHash) => ({ utxoHash, ownerTag: { kind: "inline" as const, value: new Uint8Array(32) } })),
+      messages: [],
+      privateTxHash: new Uint8Array(32),
+      circuit: { kind: "confidentialSigner", inputs: 2, outputs: 2, publicAssetSlots: 0 },
+      proof: { a: new Uint8Array(32), b: new Uint8Array(128), c: new Uint8Array(32) },
+      inputs: [{ nullifierHash: new Uint8Array(32).fill(1), treeIndex: 0 }, { nullifierHash: RESERVE_NF, treeIndex: 0 }],
+      treeContexts: [{ utxoTreeRootIndex: 0, nullifierTreeRootIndex: 0 }],
+    } as never);
   // At $28.50 a tSOL, as lend-math's `liquidate` (the program's) computes it.
   const PARTIAL = { at: T0 - 20, price: 28_500_000_000n, collateralSold: 776_393192n, debtRepaid: 21_908125n, collateralLeft: 3_223_606808n, debtLeft: 78_091875n };
 
@@ -498,6 +514,12 @@ describe("the keeper account view", () => {
     W.keeper.account.positions = [];
     await givePosition(W, 42n, PARTIAL.collateralLeft, 0n);
     expect((await W.lend.lendAccount()).positions).toEqual([{ vault: 1, id: "42", collateral: PARTIAL.collateralLeft, debt: 0n, lastLiquidation: PARTIAL }]);
+  });
+
+  it("shows a liquidation smaller than the largest with its own figures, read from the position it wrote", async () => {
+    await liquidated(PARTIAL.price, [3_500000000n, 90_000000n], T0 - 20, true);
+    const [p] = (await W.lend.lendAccount()).positions;
+    expect(p!.lastLiquidation).toEqual({ at: T0 - 20, price: PARTIAL.price, collateralSold: 500_000000n, debtRepaid: 10_000000n, collateralLeft: 3_500000000n, debtLeft: 90_000000n });
   });
 
   it("says what the liquidation did even when a top-up landed before the page read", async () => {

@@ -1,7 +1,7 @@
 # Deploying Keeler Lend to devnet
 
 `scripts/deploy-lend-devnet.sh [--estimate] [name]` deploys the lend program as deployment `name`
-(default `lend`). It needs the owner's go-ahead for the SOL: run `--estimate` first, which sends
+(default `lend`). It spends SOL from the deploy key: run `--estimate` first, which sends
 nothing.
 
 ## Before
@@ -50,11 +50,10 @@ fresh buffer key); its rent stays locked until it is closed by hand.
 
 ## Cost
 
-The devnet build of 2026-11-24 was 151,056 bytes. `--estimate` gave a peak of 1.538139120 SOL:
-0.768202680 SOL of buffer rent, which comes back when the deploy closes the buffer, plus
-0.768243320 SOL of program data rent, 0.000833120 SOL of program rent and 0.000860000 SOL of fees.
-About 0.77 SOL stays spent. A rebuild changes the size, so run `--estimate` again before asking
-for SOL.
+Rent scales with the size of the `.so`, so the cost changes with every build: `--estimate` prints
+the peak for the build at hand. That peak is the buffer rent, which comes back when the deploy
+closes the buffer, plus the program data rent, the program account's rent and the fees; the
+program data rent stays spent, about half the peak. Run `--estimate` again after every rebuild.
 
 ## The price on devnet
 
@@ -117,7 +116,9 @@ others see or use. Nothing here is done by the deploy script.
    the `LEND_*_LIMIT` rate limits. Deploy the Worker.
 8. **Site build** (**public**): `VITE_NETWORK=devnet`, `VITE_DEALERS`, `VITE_LEND_PROGRAM_ID` (the
    program ID), `VITE_LEND_KEEPERS` (the JSON list of keeper pubkeys from `build-params.json`) and
-   `VITE_LEND_POOL_VIEWING` (its `pool_viewing`); the script prints all three at the end. Then `pnpm build` in `web/` and
+   `VITE_LEND_POOL_VIEWING` (its `pool_viewing`), and `VITE_ASSETS` (tUSD and tSOL with their mints
+   and decimals, from the swap deploy's summary; the symbols must equal the Worker's `ASSETS`); the
+   script prints all four at the end. Then `pnpm build` in `web/` and
    deploy. The page reads the pools and vaults from `/api/config`.
 9. **Check**: open the Earn tab (the pool shows its figures and the price), make a small deposit,
    borrow, repay all and close from a second wallet.
