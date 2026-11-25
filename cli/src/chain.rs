@@ -55,7 +55,8 @@ pub enum Cluster {
 }
 
 pub const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
-pub const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VL2xqa1wcae8vDXMa1d";
+// Each checked against the cluster's public RPC (`getGenesisHash`), 2026-11-25.
+pub const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const TESTNET_GENESIS: &str = "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY";
 
 impl Cluster {
