@@ -248,10 +248,9 @@ dirty tree and a single-key upgrade authority).
   signature, the price bound, keeper-built transactions and liquidation sizing.
 - `docs/notes-for-xark-builders.md`: Xark pitfalls hit here and the spike's measurements.
 - `docs/audit-2026-11-25.md`: the internal audit and its decisions.
-- `docs/plan-lend.md`, `docs/plan-mainnet.md`: the design and the keeper set.
+- `docs/plan-lend.md`: the lending design, the keeper set and the pool key.
 - `docs/lend-keeper.md`, `docs/lend-api.md`: running the keeper; the page-keeper contract.
 - `docs/mainnet-runbook.md`, `docs/lend-deploy.md`: deploys.
-- `docs/plan.md`, `docs/plan-web.md`: the swap and the web app.
 
 ## Known limits
 
@@ -275,7 +274,7 @@ program (`helius-labs/privacy-ring-examples`, `swap/xark`), built from `.tools/`
 `scripts/setup.sh` with its own test keys. Amounts and the price stay inside shielded notes and
 order terms encrypted to the trader and the chosen dealer; both wallets, both asset ids, and that
 a swap was made and later taken or cancelled are public; every dealer asked learns the pair, the
-size and the trader's public key. Design: `docs/plan.md`.
+size and the trader's public key.
 
 <details>
 <summary>Swap commands and configuration</summary>

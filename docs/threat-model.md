@@ -76,8 +76,8 @@ Sees the public chain (table in `README.md`). Can call every instruction, but ev
 that spends a reserve or fills an intent requires a keeper signer (program, `require_keeper`), and
 note spends need openings it does not have (SPP). Can post a fully verified, newer Pyth update to
 the push account (Pyth's `update_price_feed`), which makes the 90 s age limit a window for choosing
-among recent prices (`docs/plan-mainnet.md`); it cannot post an unverified or older one (program
-checks owner, discriminator, verification level, feed id, age).
+among recent prices (`docs/plan-lend.md`, "Prices"); it cannot post an unverified or older one
+(program checks owner, discriminator, verification level, feed id, age).
 
 ### A keeper
 
