@@ -66,6 +66,7 @@ const problems: string[] = [];
 
 async function open() {
   await page.goto("/#swap");
+  await page.reload();
   const p = panel(page);
   await p.getByRole("button", { name: /Browser test wallet/ }).click();
   await p.getByRole("button", { name: "Sign to unlock" }).click();
@@ -122,7 +123,7 @@ test.beforeAll(async ({ browser }) => {
   await open();
   const p = panel(page);
   await p.getByRole("button", { name: "Register" }).click();
-  await expect(p.getByRole("heading", { name: "Swap privately" })).toBeVisible({ timeout: 60_000 });
+  await expect(page.locator("#sell-amt")).toBeVisible({ timeout: 60_000 });
   await expect.poll(() => privateBalance("tUSD", 6), { timeout: 60_000 }).toBe(50_000_000n);
 });
 

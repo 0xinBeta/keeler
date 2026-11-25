@@ -326,6 +326,7 @@ export function App({ keeler }: { keeler: Keeler }) {
         </main>
         <footer className="wrap app-footer">
           <a href="#top">Back to Keeler</a>
+          <NetworkPill config={config} />
           <span>Built on Helius Privacy Rings</span>
         </footer>
       </div>

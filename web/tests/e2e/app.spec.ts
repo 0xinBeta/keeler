@@ -23,7 +23,7 @@ const DECIMALS: Record<string, number> = { tUSD: 6, tSOL: 9 };
 
 async function balances(page: Page) {
   await view(page, "Balances");
-  const table = panel(page).getByRole("table");
+  const table = panel(page).locator("table.bal");
   await expect(table.getByText("Reading balances…")).toHaveCount(0);
   const out: Record<string, { public: bigint; private: bigint }> = {};
   for (const row of await table.locator("tbody tr").all()) {
@@ -95,7 +95,7 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
   await panel(page).getByRole("button", { name: "Get test tokens" }).click();
   await expect(panel(page).getByText("Test tokens sent to your public balance.")).toBeVisible({ timeout: 60_000 });
   await panel(page).getByRole("button", { name: "Register" }).click();
-  await expect(panel(page).getByRole("heading", { name: "Swap privately" })).toBeVisible({ timeout: 120_000 });
+  await expect(page.locator("#sell-amt")).toBeVisible({ timeout: 120_000 });
 
   // 500 tUSD into the private balance.
   const funded = await balances(page);
@@ -126,7 +126,7 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
     });
     await startSwap(page, "100");
     await page.unroute("**/api/quotes");
-    expect((await balances(page)).tUSD!.private).toBe(250_000_000n);
+    await expect.poll(async () => (await balances(page)).tUSD!.private, { timeout: 30_000 }).toBe(250_000_000n);
 
     // Lose this browser's order records (the in-page wallet key stays), reload, find the order on chain.
     const removed = await page.evaluate(() => {
@@ -137,7 +137,8 @@ test("swap, settle, withdraw, an unsettled swap taken back, and orders found aga
     expect(removed).toBeGreaterThan(0);
     await page.reload();
     await connectAndUnlock(page);
-    await expect(panel(page).getByRole("heading", { name: "Swap privately" })).toBeVisible({ timeout: 60_000 });
+    await view(page, "Swap");
+    await expect(page.locator("#sell-amt")).toBeVisible({ timeout: 60_000 });
     await view(page, "Activity");
     const orders = ordersSection(page);
     await orders.getByRole("button", { name: "Find my orders" }).click();

@@ -38,7 +38,7 @@ async function setUp(page: Page, search = "") {
   await p.getByRole("button", { name: "Get test tokens" }).click();
   await expect(p.getByText("Test tokens sent to your public balance.")).toBeVisible();
   await p.getByRole("button", { name: "Register" }).click();
-  await expect(p.getByRole("heading", { name: "Swap privately" })).toBeVisible();
+  await expect(page.locator("#sell-amt")).toBeVisible();
   // 600 tUSD and 5 tSOL into the private balance.
   for (const [amount, symbol] of [["600", "tUSD"], ["5", "tSOL"]] as const) {
     await open(page, "Balances");
