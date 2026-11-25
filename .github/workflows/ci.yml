@@ -33,7 +33,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
-      - name: Cache Agave, platform tools and Zolana downloads
+      - name: Cache Agave, wasm-pack and Zolana downloads, and the swap example's build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -41,7 +41,8 @@ jobs:
             ~/.cache/solana
             ~/.config/zolana/cache
             ~/.cache/.wasm-pack
-          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('scripts/setup.sh') }}
+            .tools
+          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('scripts/setup.sh', 'patches/swap.patch') }}
       - name: Install Agave
         run: |
           bin=$HOME/.local/share/solana/install/active_release/bin
@@ -62,10 +63,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          shared-key: rust
           workspaces: |
             . -> target
             lend -> target
-            .tools/privacy-ring-examples/swap/xark -> target
           cache-workspace-crates: true
       - run: scripts/setup.sh
       - run: scripts/setup-lend.sh
