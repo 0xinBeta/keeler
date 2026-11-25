@@ -77,32 +77,41 @@ others see or use. Nothing here is done by the deploy script.
 
 1. **Keeper config.** Add a `lend` section to the dealer config (`docs/lend-keeper.md`):
    `program_id` from `target/devnet-<name>/summary.json`, `network` equal to the Worker's
-   `NETWORK` (`devnet`), `key` the dealer's Keychain item, `admin_key` the `keeler-devnet-deploy`
-   item, `state_file`, `pause_file`, `price: "test"`, `price_refresh_secs` (45), `limits`. Check
-   that `limits.min_*` are not below the vault's minimums in `LEND_VAULTS`. A standby keeper gets
-   its own config with `key` its Keychain item, `role: "standby"`, and its own `state_file` and
-   `pause_file`.
+   `NETWORK` (`devnet`), `pool_key` `{"keychain": "keeler-devnet-<name>-pool"}` (required:
+   `scripts/run-dealer.sh` refuses any other), `origins` (required: the site's origin, for example
+   `["https://<your site>"]`), `admin_key` the `keeler-devnet-deploy` item, `state_file`,
+   `pause_file`, `price: "test"`, `price_refresh_secs` (45), `limits`. No `lend.key`: the devnet
+   keeper is the dealer key (the config's `key`). Check that `limits.min_*` are not below the
+   vault's minimums in `LEND_VAULTS`. A standby needs no config of its own:
+   `scripts/run-dealer.sh --standby` writes it (`target/devnet/standby-keeper.json`: this `lend`
+   section with `role: "standby"`, the key `keeler-devnet-<name>-standby`, its own default state
+   file and the same `pause_file`, so one `touch` pauses both).
 2. **Reserve** (**SOL**, once): `keeler lend-init-reserve <keeper config>`. This command and
    `lend-set-price` take a keeper config, not the dealer config (which they refuse): a file with
    only the dealer config's `network`, `key`, `http` and `lend`, and the same `state_file`, run with
    the binary and `KEELER_LEND_KEYS_DIR` that `scripts/run-dealer.sh` uses
-   (`target/devnet-<name>/dealer-cargo/release/keeler`, `target/devnet-<name>/keys`). The keeper pays the fee and the
-   admin co-signs. A second run refuses: the reserve exists.
+   (`target/devnet-<name>/dealer-cargo/release/keeler`, `target/devnet-<name>/keys`; run
+   `scripts/run-dealer.sh` once to build it). The keeper pays the fee and the admin co-signs. A
+   second run is refused by the program (the reserve's address is taken), so it costs only a fee.
 3. **First test price** (**SOL**: the account's rent and a fee): `keeler lend-set-price <keeper config> 1
    <price> <confidence>`, for example `150000000000 150000000` for 150 tUSD per tSOL with 0.1 %
    confidence. It also writes the control file the keeper keeps posting.
 4. **Start the keeper** (**SOL**: a fee per price refresh, about one every 45 s, and the fees of
    its fills and liquidations): `scripts/run-dealer.sh <config>`. Check its log shows the price
    being posted and `GET /health` answers.
-5. **Fund the keeper's debt token** (moves tokens): shield enough tUSD to the keeper for
-   liquidations (at least the largest position's debt) and keep its SOL topped up.
+5. **Fund every keeper's debt token** (moves tokens): each keeper liquidates from notes at its own
+   lend address, so the dealer's keeper and the standby each need enough tUSD for liquidations (at
+   least the largest position's debt): `keeler lend-fund <keeper config> <amount>` shields it,
+   `keeler lend-balance <keeper config>` shows it, and `keeler lend-sweep <keeper config>`
+   unshields the tSOL liquidations paid. Keep each keeper's SOL topped up too.
 6. **Seed the pool** (**SOL**, moves tokens, **public**: the pool's figures change): a first
    supply from a lender wallet through the page or the SDK, at least `minSupply`, so there is
    something to borrow.
 7. **Worker variables** (**public**): set `LEND_PROGRAM_ID`, `LEND_POOLS` and `LEND_VAULTS`
    (`worker/README.md`; the pool's curve, fee, max utilisation and minimum, and the vault's
    factors and minimums exactly as compiled into the program), `LEND_KEEPERS` (a JSON list of
-   `{"url","pubkey"}`, in the compiled order; the script prints its shape), keep the keeper as the
+   `{"url","pubkey"}`, in the compiled order, each `https://`; the script prints its shape, and
+   `scripts/run-dealer.sh` keeps it current), keep the keeper as the
    first `DEALERS` entry, and `REFERENCE` or `PYTH_ACCOUNTS` for the page's fallback price. Optionally
    the `LEND_*_LIMIT` rate limits. Deploy the Worker.
 8. **Site build** (**public**): `VITE_NETWORK=devnet`, `VITE_DEALERS`, `VITE_LEND_PROGRAM_ID` (the
