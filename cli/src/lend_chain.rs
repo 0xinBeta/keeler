@@ -1,6 +1,6 @@
 //! The keeper's [`Ledger`] on a real network, through the lend SDK's
 //! builders, `spr-client` and plain JSON-RPC for the keeper's history.
-use std::{str::FromStr, time::Duration};
+use std::{str::FromStr, sync::Mutex, time::Duration};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use keeler_lend::{
@@ -40,7 +40,7 @@ use spr_transaction::{
 };
 
 use crate::{
-    chain::{budget, Chain},
+    chain::{budget, shielded, Chain},
     config::Network,
     keeper::{
         Built, Intent, Job, Ledger, LendPrice, Note, Op, Pending, Quote, Rejected, KIND_INTENT,
@@ -67,6 +67,12 @@ pub struct LendChain {
     debt: Mint,
     /// Micro-lamports per compute unit on liquidations.
     liquidation_fee: u64,
+    /// The same network at the liquidation fee, for the funding
+    /// self-transfer; `None` when the fees are equal.
+    fee_chain: Option<Chain>,
+    /// The funds notes the last liquidation build claimed: given back when
+    /// it fails or is refused.
+    claims: Mutex<Vec<[u8; 32]>>,
 }
 
 impl LendChain {
@@ -82,8 +88,16 @@ impl LendChain {
             kp.pubkey() == key.pubkey(),
             "the lend keypair is not the keeper key's"
         );
-        let chain = Chain::connect(network, &[TSOL_TUSD.debt_mint, TSOL_TUSD.collateral_mint])?;
+        let mints = [TSOL_TUSD.debt_mint, TSOL_TUSD.collateral_mint];
+        let chain = Chain::connect(network, &mints)?;
         let debt = chain.mint(TSOL_TUSD.debt_mint)?;
+        let fee_chain = if liquidation_fee == network.priority_fee {
+            None
+        } else {
+            let mut at_fee = network.clone();
+            at_fee.priority_fee = liquidation_fee;
+            Some(Chain::connect(&at_fee, &mints)?)
+        };
         Ok(Self {
             kp,
             key: key.insecure_clone(),
@@ -92,7 +106,25 @@ impl LendChain {
             price,
             debt,
             liquidation_fee,
+            fee_chain,
+            claims: Mutex::default(),
         })
+    }
+
+    fn claim(&self, note: &WalletUtxo) {
+        self.chain.claim(note);
+        if let Ok(mut c) = self.claims.lock() {
+            c.push(note.utxo_hash);
+        }
+    }
+
+    /// Gives back what the last liquidation build claimed.
+    fn release_claims(&self) {
+        if let Ok(mut c) = self.claims.lock() {
+            for h in c.drain(..) {
+                self.chain.release(&h);
+            }
+        }
     }
 
     fn rpc(&self) -> &impl Rpc {
@@ -240,7 +272,7 @@ impl LendChain {
         let amounts: Vec<u64> = notes.iter().map(|u| u.utxo.amount).collect();
         let inputs: Vec<WalletUtxo> = match plan_funds(&amounts, need)? {
             Funding::Exact(i) => {
-                self.chain.claim(&notes[i]);
+                self.claim(&notes[i]);
                 return Ok(notes[i].clone());
             }
             Funding::Split(i) => vec![notes[i].clone()],
@@ -250,7 +282,7 @@ impl LendChain {
             "lend: making a note of exactly {need} from {} keeper notes for a liquidation",
             inputs.len()
         );
-        inputs.iter().for_each(|n| self.chain.claim(n));
+        inputs.iter().for_each(|n| self.claim(n));
         let payer = self.kp.pubkey();
         let me = self.kp.shielded_address().map_err(err)?;
         let mut tx = ConfidentialTransaction::new(inputs, payer).map_err(err)?;
@@ -259,8 +291,10 @@ impl LendChain {
             transaction: tx.encrypt(&self.kp).map_err(err)?,
             settlement_transfers: Vec::new(),
         };
+        // At the liquidation's fee: it is half of the liquidation.
+        let client = &self.fee_chain.as_ref().unwrap_or(&self.chain).client;
         spr_client::Submission::new(&signed, payer, &self.kp)
-            .send_sync(&self.chain.client, &[&self.kp])
+            .send_sync(client, &[&self.kp])
             .map_err(|e| anyhow!("funding self-transfer: {e:?}"))?;
         // The indexer may lag the landed transfer by a few seconds.
         for _ in 0..30 {
@@ -270,7 +304,7 @@ impl LendChain {
                 .into_iter()
                 .find(|u| u.utxo.amount == need)
             {
-                self.chain.claim(&n);
+                self.claim(&n);
                 return Ok(n);
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -298,7 +332,7 @@ impl LendChain {
             &self.key.pubkey(),
             std::slice::from_ref(&ix),
             blockhash,
-            budget(BUDGET, fee),
+            budget(BUDGET, fee)?,
         )?;
         let keys = message.static_account_keys();
         ensure!(
@@ -695,8 +729,50 @@ impl Ledger for LendChain {
         set_test_price(self, vault, price, confidence)
     }
 
-    #[allow(clippy::type_complexity)]
     fn build(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built> {
+        if let Ok(mut c) = self.claims.lock() {
+            c.clear();
+        }
+        let out = self.build_job(job, reserve, now);
+        if out.is_err() {
+            self.release_claims();
+        }
+        out
+    }
+
+    fn send(&self, tx: &[u8]) -> Result<String> {
+        let tx: VersionedTransaction = wincode::deserialize(tx)?;
+        match self.rpc().process_transaction(tx) {
+            Ok(sig) => {
+                if let Ok(mut c) = self.claims.lock() {
+                    c.clear();
+                }
+                Ok(sig.to_string())
+            }
+            Err(e) => {
+                let text = format!("{e:?}");
+                Err(if never_lands(&text) {
+                    self.release_claims();
+                    anyhow::Error::new(Rejected(text))
+                } else {
+                    anyhow!("{text}")
+                })
+            }
+        }
+    }
+
+    fn debt_held(&self) -> Result<u64> {
+        self.chain.balance(&self.kp, TSOL_TUSD.debt_mint)
+    }
+
+    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+        self.history_of(payer, after)
+    }
+}
+
+impl LendChain {
+    #[allow(clippy::type_complexity)]
+    fn build_job(&self, job: &Job, reserve: Option<&Note>, now: u64) -> Result<Built> {
         let salt = u128::from_le_bytes({
             let mut b = [0; 16];
             getrandom::getrandom(&mut b).map_err(|e| anyhow!("randomness: {e}"))?;
@@ -967,28 +1043,20 @@ impl Ledger for LendChain {
         })
     }
 
-    fn send(&self, tx: &[u8]) -> Result<String> {
-        let tx: VersionedTransaction = wincode::deserialize(tx)?;
-        match self.rpc().process_transaction(tx) {
-            Ok(sig) => Ok(sig.to_string()),
-            Err(e) => {
-                let text = format!("{e:?}");
-                Err(if never_lands(&text) {
-                    anyhow::Error::new(Rejected(text))
-                } else {
-                    anyhow!("{text}")
-                })
-            }
-        }
-    }
-
-    fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
+    fn history_of(
+        &self,
+        payer: &Address,
+        after: Option<&str>,
+    ) -> Result<(Vec<Note>, Option<String>)> {
         let mut sigs = Vec::new();
         // The mark moves only to a finalized signature: one merely confirmed
         // could still be dropped, and is read again next time.
         let mut newest = None;
         let mut before: Option<String> = None;
-        loop {
+        // A node that does not know the mark ignores `until` and pages the
+        // whole history: past the first page, stop below the mark's slot.
+        let mut floor: Option<u64> = None;
+        'pages: loop {
             let mut opts = json!({ "limit": 1000, "commitment": "confirmed" });
             if let Some(b) = &before {
                 opts["before"] = json!(b);
@@ -1000,6 +1068,11 @@ impl Ledger for LendChain {
                 self.rpc_call("getSignaturesForAddress", json!([payer.to_string(), opts]))?;
             let page = page.as_array().context("no signatures")?.clone();
             for s in &page {
+                if after.is_some_and(|a| s["signature"] == a)
+                    || floor.is_some_and(|f| s["slot"].as_u64().is_some_and(|x| x < f))
+                {
+                    break 'pages;
+                }
                 if newest.is_none() && s["confirmationStatus"] == "finalized" {
                     newest = s["signature"].as_str().map(str::to_owned);
                 }
@@ -1012,6 +1085,13 @@ impl Ledger for LendChain {
             match page.last().and_then(|s| s["signature"].as_str()) {
                 Some(last) if page.len() == 1000 => before = Some(last.to_owned()),
                 _ => break,
+            }
+            if let (Some(a), None) = (after, floor) {
+                floor = self.rpc_call(
+                    "getSignatureStatuses",
+                    json!([[a], { "searchTransactionHistory": true }]),
+                )?["value"][0]["slot"]
+                    .as_u64();
             }
         }
         let mut found = Vec::new();
@@ -1083,7 +1163,7 @@ pub fn init_reserve(chain: &LendChain, admin: &Keypair) -> Result<String> {
         std::slice::from_ref(&ix),
         chain.key.pubkey(),
         &[&chain.key, admin],
-        budget(BUDGET, chain.chain.priority_fee),
+        budget(BUDGET, chain.chain.priority_fee)?,
     )?;
     Ok(sig.to_string())
 }
@@ -1101,9 +1181,115 @@ pub fn set_test_price(
         std::slice::from_ref(&ix),
         chain.key.pubkey(),
         &[&chain.key],
-        budget(200_000, chain.chain.priority_fee),
+        budget(200_000, chain.chain.priority_fee)?,
     )?;
     Ok(sig.to_string())
+}
+
+/// Whether the keeper's lend address is its plain shielded wallet (no
+/// separate pool key: the swap dealer's wallet).
+fn lend_address_is_wallet(chain: &LendChain) -> Result<bool> {
+    Ok(shielded(&chain.key)?.viewing_pubkey() == chain.kp.viewing_pubkey())
+}
+
+/// `keeler lend-fund`: shields `amount` of the debt token from `from` (the
+/// keeper key's token account) to the keeper's lend address, where its
+/// liquidations pay from.
+pub fn fund(chain: &LendChain, amount: u64, from: Address) -> Result<String> {
+    use spr_interface::pda;
+    use spr_program::instruction::{AssetDeposit, Deposit, DepositAsset, DepositSplAccounts};
+    ensure!(amount > 0, "nothing to fund");
+    let mint = TSOL_TUSD.debt_mint;
+    ensure!(
+        mint != spr_transaction::SOL_MINT,
+        "the debt token is not an SPL token"
+    );
+    let to = chain.kp.shielded_address().map_err(err)?;
+    let ix = Deposit {
+        tree: chain.chain.tree,
+        depositor: chain.key.pubkey(),
+        deposits: vec![AssetDeposit {
+            asset: DepositAsset::Spl(DepositSplAccounts {
+                mint,
+                user_token: from,
+                token_program: pda::spl_token_program_id(),
+            }),
+            view_tag: to.viewing_pubkey.u(),
+            owner: to.owner_hash().map_err(err)?,
+            amount,
+            memo: None,
+        }],
+    }
+    .instruction()
+    .map_err(err)?;
+    let sig = chain.rpc().create_and_send_transaction(
+        &[ix],
+        chain.key.pubkey(),
+        &[&chain.key],
+        budget(200_000, chain.chain.priority_fee)?,
+    )?;
+    chain
+        .chain
+        .client
+        .confirm_private_transaction_sync(sig)
+        .map_err(err)?;
+    Ok(sig.to_string())
+}
+
+/// The keeper key's associated token account of the debt token.
+pub fn debt_token_account(chain: &LendChain) -> Address {
+    spr_interface::pda::associated_token_address(&chain.key.pubkey(), &TSOL_TUSD.debt_mint)
+}
+
+/// `keeler lend-balance`: the debt token and the collateral held privately
+/// at the keeper's lend address.
+pub fn balances(chain: &LendChain) -> Result<(u64, u64)> {
+    Ok((
+        chain.chain.balance(&chain.kp, TSOL_TUSD.debt_mint)?,
+        chain.chain.balance(&chain.kp, TSOL_TUSD.collateral_mint)?,
+    ))
+}
+
+/// `keeler lend-sweep`: unshields the collateral liquidations paid to the
+/// keeper's lend address to the keeper key's public account, a few notes per
+/// transaction; the signatures.
+pub fn sweep(chain: &LendChain) -> Result<Vec<String>> {
+    use spr_client::{SignedPrivateTransaction, Submission};
+    ensure!(
+        !lend_address_is_wallet(chain)?,
+        "the lend address is the keeper key's own wallet (no separate lend.pool_key): \
+         its collateral is the swap dealer's inventory, not swept"
+    );
+    let mint = TSOL_TUSD.collateral_mint;
+    let me = chain.key.pubkey();
+    let token_program =
+        (mint != spr_transaction::SOL_MINT).then(spr_interface::pda::spl_token_program_id);
+    let mut sigs = Vec::new();
+    // Claimed notes are hidden from the next scan, so each round takes new ones.
+    for _ in 0..32 {
+        let mut notes = chain.chain.notes(&chain.kp, mint)?;
+        if notes.is_empty() {
+            break;
+        }
+        notes.sort_by_key(|u| std::cmp::Reverse(u.utxo.amount));
+        notes.truncate(MAX_MERGE);
+        let total: u64 = notes.iter().map(|u| u.utxo.amount).sum();
+        notes.iter().for_each(|n| chain.chain.claim(n));
+        let mut tx = ConfidentialTransaction::new(notes, me).map_err(err)?;
+        let accounts = tx
+            .withdraw_to(mint, total, me, token_program)
+            .map_err(err)?;
+        let signed = SignedPrivateTransaction {
+            transaction: tx.encrypt(&chain.kp).map_err(err)?,
+            settlement_transfers: vec![accounts],
+        };
+        let sig = Submission::new(&signed, me, &chain.kp)
+            .send_sync(&chain.chain.client, &[&chain.kp])
+            .map_err(|e| anyhow!("sweep: {e:?}"))?;
+        log!("lend: swept {total} of {mint} to {me}: {sig}");
+        sigs.push(sig.to_string());
+    }
+    Ok(sigs)
 }
 
 #[cfg(test)]

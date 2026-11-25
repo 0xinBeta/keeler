@@ -59,6 +59,12 @@ const PRICE_FRESH: u64 = 65;
 const PRICE_LIQUIDATE: u64 = 80;
 /// A liquidation that could not be built or sent waits this long.
 const LIQUIDATION_BACKOFF: u64 = 60;
+/// The keeper's own debt-token balance is checked this often.
+const FUNDS_CHECK_SECS: u64 = 60;
+/// After a position of a wallet left the book with no successor in it, no
+/// new position of that id is opened for this long: the peer's note may
+/// still be on its way.
+const DROPPED_SECS: u64 = 120;
 /// Indexer pages of one wallet's intents read per pass.
 const INTENT_PAGES: usize = 4;
 const HOUR: u64 = 3_600;
@@ -273,7 +279,27 @@ impl Lend {
             !self.origins.is_empty() && self.origins.iter().all(|o| origin_ok(o)),
             "lend.origins must list the page origins, each like https://host or http://127.0.0.1:5300"
         );
+        ensure!(
+            self.liquidation_priority_fee
+                .is_none_or(|f| f <= crate::config::MAX_PRIORITY_FEE),
+            "lend.liquidation_priority_fee must be at most {}",
+            crate::config::MAX_PRIORITY_FEE
+        );
+        // A standby re-posts the test price 15 s late; a liquidation needs it
+        // under PRICE_LIQUIDATE.
+        ensure!(
+            self.role == Role::Primary || self.price_refresh() + 15 <= 75,
+            "a standby's lend.price_refresh_secs must be at most 60"
+        );
         if self.mainnet() {
+            ensure!(
+                self.origins.iter().all(|o| o.starts_with("https://")),
+                "on mainnet every lend.origins entry must be https://"
+            );
+            ensure!(
+                l.min_position_debt > 0,
+                "on mainnet lend.limits.min_position_debt must be set"
+            );
             let caps = [
                 l.max_pool_size,
                 l.max_total_collateral,
@@ -788,6 +814,9 @@ pub trait Ledger: Sync {
     /// Sends a keeper-built transaction; the signature. A [`Rejected`] error
     /// means it can never land; any other may still.
     fn send(&self, tx: &[u8]) -> Result<String>;
+    /// The debt token the keeper holds privately at its lend address: what
+    /// its liquidations pay from.
+    fn debt_held(&self) -> Result<u64>;
     /// Every reserve, receipt and position the transactions `payer` (a
     /// keeper of the set) paid for, newer than signature `after`, created,
     /// recovered from the chain with the pool viewing key and the writer
@@ -830,6 +859,14 @@ pub struct Keeper<'a, L> {
     price_logged: Mutex<u64>,
     /// The last (surplus, bad debt) logged, and whether borrowing halts.
     solvency: Mutex<Option<Solvency>>,
+    /// Chain time of the last check of the keeper's own debt-token balance.
+    funds_checked: Mutex<u64>,
+    /// The receipts and positions do not add up to the reserve's shares:
+    /// the book may be missing a note, so nothing new is let in.
+    incomplete: AtomicBool,
+    /// Positions (wallet and id) that left the book with no successor, since
+    /// when.
+    dropped: Mutex<HashMap<(String, u64), Instant>>,
     /// Held while the keeper runs: one keeper per state file.
     _lock: std::fs::File,
 }
@@ -933,6 +970,48 @@ pub fn solvency(book: &Book, idle: u64, r: &core::Reserve, low: u64) -> Result<S
     })
 }
 
+/// The largest debt of a position in `book`, at the reserve `r` accrued.
+pub fn largest_debt(book: &Book, r: &core::Reserve) -> Result<u64> {
+    let mut most = 0;
+    for p in &book.positions {
+        let s: PositionState = p.state()?;
+        most = most.max(core::debt_of(s.debt_shares, r.borrow_price).map_err(|e| anyhow!("{e}"))?);
+    }
+    Ok(most)
+}
+
+/// The largest position's debt in the state file at `path` of the keeper
+/// `keeper`, at chain time `now`; `None` without a reserve.
+pub fn largest_debt_in(path: &Path, keeper: &Address, now: u64) -> Result<Option<u64>> {
+    let mut keepers = vec![*keeper];
+    keepers.extend(keeler_lend::KEEPERS.iter().filter(|k| *k != keeper));
+    let book = load_book(path, &keepers, &keeler_lend::ID)?;
+    let Some(r) = &book.reserve else {
+        return Ok(None);
+    };
+    Ok(Some(largest_debt(&book, &accrued(r, now)?)?))
+}
+
+/// Whether the receipts' shares sum to the reserve's supply shares and the
+/// positions' debt shares to its debt shares; `None` without a reserve.
+fn shares_add_up(book: &Book) -> Result<Option<bool>> {
+    let Some(reserve) = &book.reserve else {
+        return Ok(None);
+    };
+    let r: ReserveState = reserve.state()?;
+    let mut supply = 0u128;
+    for n in &book.receipts {
+        supply += u128::from(n.state::<ReceiptState>()?.supply_shares);
+    }
+    let mut debt = 0u128;
+    for n in &book.positions {
+        debt += u128::from(n.state::<PositionState>()?.debt_shares);
+    }
+    Ok(Some(
+        supply == u128::from(r.supply_shares) && debt == u128::from(r.debt_shares),
+    ))
+}
+
 fn purpose_name(p: u8) -> &'static str {
     match p {
         purpose::SUPPLY => "supply",
@@ -1025,6 +1104,9 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             past: Mutex::default(),
             price_logged: Mutex::new(0),
             solvency: Mutex::new(None),
+            funds_checked: Mutex::new(0),
+            incomplete: AtomicBool::new(false),
+            dropped: Mutex::default(),
             _lock: lock,
         };
         k.recover()?;
@@ -1080,7 +1162,8 @@ impl<'a, L: Ledger> Keeper<'a, L> {
     /// last scan made, keeps the unspent notes, and saves with the new scan
     /// marks. Unless `force`, a scan that found nothing new changes nothing.
     fn merge_history(&self, who: &[Address], force: bool) -> Result<()> {
-        let marks = self.snapshot()?.scanned;
+        let snapshot = self.snapshot()?;
+        let marks = snapshot.scanned.clone();
         let mut found = Vec::new();
         let mut next = marks.clone();
         for k in who {
@@ -1097,12 +1180,13 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         if !force && found.is_empty() && next == marks {
             return Ok(());
         }
-        let mut book = self.book()?;
-        let mut all: Vec<Note> = book
+        // Only this thread changes the notes, so the chain is read before
+        // the lock, as `resolve` does.
+        let mut all: Vec<Note> = snapshot
             .reserve
             .iter()
-            .chain(&book.receipts)
-            .chain(&book.positions)
+            .chain(&snapshot.receipts)
+            .chain(&snapshot.positions)
             .cloned()
             .collect();
         for n in found {
@@ -1125,7 +1209,9 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             reserves.len() <= 1,
             "more than one unspent reserve; the state file and the chain disagree"
         );
-        book.reserve = reserves.first().map(|n| (*n).clone());
+        let reserve = reserves.first().map(|n| (*n).clone());
+        let mut book = self.book()?;
+        book.reserve = reserve;
         book.receipts = live
             .iter()
             .filter(|n| n.kind == KIND_RECEIPT)
@@ -1137,7 +1223,71 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             .cloned()
             .collect();
         book.scanned = next;
-        self.save(&book)
+        self.note_dropped(&snapshot.positions, &book.positions);
+        self.save(&book)?;
+        self.check_shares(&book);
+        Ok(())
+    }
+
+    /// Records the positions of `before` with no position of the same
+    /// wallet and id in `after`.
+    fn note_dropped(&self, before: &[Note], after: &[Note]) {
+        let key = |p: &Note| {
+            p.state::<PositionState>()
+                .ok()
+                .map(|s| (p.wallet.clone().unwrap_or_default(), s.position_id))
+        };
+        let left: Vec<(String, u64)> = after.iter().filter_map(key).collect();
+        if let Ok(mut d) = self.dropped.lock() {
+            d.retain(|_, at| at.elapsed() < Duration::from_secs(DROPPED_SECS));
+            for k in before.iter().filter_map(key) {
+                if !left.contains(&k) {
+                    d.insert(k, Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Whether a position of `wallet` with id `id` left the book lately with
+    /// no successor: a peer may have spent it and its note not be here yet.
+    fn dropped_lately(&self, wallet: &str, id: u64) -> bool {
+        self.dropped.lock().is_ok_and(|d| {
+            d.get(&(wallet.to_owned(), id))
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(DROPPED_SECS))
+        })
+    }
+
+    /// Sets [`Keeper::incomplete`] from whether the book's shares add up to
+    /// the reserve's, logging each change. Not while a build is pending: its
+    /// spent inputs may have left the book before its outputs joined.
+    fn check_shares(&self, book: &Book) {
+        if !book.pending.is_empty() {
+            return;
+        }
+        let ok = match shares_add_up(book) {
+            Ok(Some(ok)) => ok,
+            Ok(None) => return,
+            Err(e) => {
+                log!("lend: the book's shares cannot be read: {e:#}");
+                false
+            }
+        };
+        let was = self.incomplete.swap(!ok, Ordering::Relaxed);
+        if !ok && !was {
+            log!(
+                "lend: WARNING: the receipts and positions do not add up to the reserve's shares; \
+                 the book may be missing a note. New supply, new positions and new borrowing \
+                 are refused until it adds up (repays, top-ups, redeems and withdrawals go on)"
+            );
+        } else if ok && was {
+            log!("lend: the book adds up to the reserve again; lending is open");
+        }
+    }
+
+    /// The pause for one request: the pause file, the Worker's header, or a
+    /// book that does not add up.
+    fn paused_now(&self, header: bool) -> bool {
+        self.cfg.paused_for(header) || self.incomplete.load(Ordering::Relaxed)
     }
 
     /// Settles every pending build the chain has decided: the one whose
@@ -1209,6 +1359,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         }
         let mut book = self.book()?;
         let before = book.clone();
+        let positions_before = book.positions.clone();
         for (p, outs) in landed {
             if book.pending.contains(&p) {
                 apply(&mut book, &p, &outs);
@@ -1261,13 +1412,24 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         if lost_reserve {
             book.reserve = None;
         }
+        self.note_dropped(&positions_before, &book.positions);
         if *book != before {
             self.save(&book)?;
         }
+        self.check_shares(&book);
         drop(book);
         if lost_reserve {
             log!("lend: the reserve was spent outside any record; rebuilding from the chain");
             self.merge_history(&self.keepers, true)?;
+            if self.snapshot()?.reserve.is_none() {
+                // The marks went past the reserve's spender: read it all again.
+                log!("lend: no reserve past the scan marks; reading every keeper's history again");
+                let mut b = self.book()?;
+                b.scanned.clear();
+                self.save(&b)?;
+                drop(b);
+                self.merge_history(&self.keepers, true)?;
+            }
         }
         Ok(())
     }
@@ -1278,8 +1440,12 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         self.resolve()?;
         // The peers' new transactions, every pass: a deposit by one of them
         // spends no reserve, so nothing else would show it.
+        // One that fails (an RPC without a just-landed transaction, a slow
+        // indexer) is read again next pass; liquidations do not wait for it.
         if !self.peers().is_empty() {
-            self.merge_history(self.peers(), false)?;
+            if let Err(e) = self.merge_history(self.peers(), false) {
+                log!("lend: the peers' history: {e:#}; the book stands as it is");
+            }
         }
         let now = self.ledger.now()?;
         let book = self.snapshot()?;
@@ -1292,6 +1458,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             return Ok(false);
         }
         let r = accrued(&reserve, now)?;
+        self.check_funds(&book, &r, now);
         let indebted = book
             .positions
             .iter()
@@ -1352,6 +1519,36 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             }
         }
         Ok(false)
+    }
+
+    /// Once a minute: warns when the keeper's own debt token would not cover
+    /// a liquidation of the largest debt in the book.
+    fn check_funds(&self, book: &Book, r: &core::Reserve, now: u64) {
+        let Ok(mut at) = self.funds_checked.lock() else {
+            return;
+        };
+        if now < *at + FUNDS_CHECK_SECS {
+            return;
+        }
+        *at = now;
+        drop(at);
+        let largest = match largest_debt(book, r) {
+            Ok(0) => return,
+            Ok(d) => d,
+            Err(e) => {
+                log!("lend: debts unreadable: {e:#}");
+                return;
+            }
+        };
+        match self.ledger.debt_held() {
+            Ok(held) if held < largest => log!(
+                "lend: WARNING: the keeper holds {held} of the debt token at its lend address, \
+                 under the largest position's debt {largest}; it cannot liquidate that \
+                 position. Fund it with `keeler lend-fund`"
+            ),
+            Ok(_) => {}
+            Err(e) => log!("lend: the keeper's own balance: {e:#}"),
+        }
     }
 
     /// The price for this pass's liquidation watch and figures: none when
@@ -1546,16 +1743,29 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         let mut wallets: Vec<&str> = open.iter().map(|t| t.wallet.as_str()).collect();
         wallets.sort_unstable();
         wallets.dedup();
-        let paused = self.cfg.paused();
-        // The size cap again at fill: a supply that no longer fits waits out
-        // its expiry and is refunded.
+        let paused = self.paused_now(false);
+        // The caps again at fill: a supply or deposit that no longer fits
+        // waits out its expiry and is refunded.
         let pool = book
             .reserve
             .as_ref()
             .and_then(|n| accrued(n, now).ok())
             .and_then(|r| core::total_supply(&r).ok())
             .map_or(0, u128::from);
-        let fits = |amount: u64| within(self.cfg.limits.max_pool_size, pool + u128::from(amount));
+        let l = &self.cfg.limits;
+        let fits = |amount: u64| within(l.max_pool_size, pool + u128::from(amount));
+        let collateral: u128 = book.positions.iter().map(|p| u128::from(p.amount)).sum();
+        // A top-up is never held to the vault's total.
+        let opens = |amount: u64| {
+            within(l.max_total_collateral, collateral + u128::from(amount))
+                && within(l.max_position_collateral, u128::from(amount))
+        };
+        let tops = |position: &Note, amount: u64| {
+            within(
+                l.max_position_collateral,
+                u128::from(position.amount) + u128::from(amount),
+            )
+        };
         let mut jobs = Vec::new();
         let mut seen = Vec::new();
         for w in wallets {
@@ -1586,8 +1796,16 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 let intent = intent.clone();
                 let job = match (t.purpose, position) {
                     (purpose::REPAY, Some(position)) => Job::Repay { position, intent },
-                    (purpose::DEPOSIT, Some(position)) => Job::DepositAdd { position, intent },
-                    (purpose::DEPOSIT, None) if !paused => Job::DepositOpen { intent },
+                    (purpose::DEPOSIT, Some(position)) if tops(&position, t.amount) => {
+                        Job::DepositAdd { position, intent }
+                    }
+                    // Not where a peer has just spent a position of that id:
+                    // its successor would be a second position with that id.
+                    (purpose::DEPOSIT, None)
+                        if !paused && opens(t.amount) && !self.dropped_lately(w, t.target) =>
+                    {
+                        Job::DepositOpen { intent }
+                    }
                     (purpose::SUPPLY, _) if !paused && fits(t.amount) => Job::Supply { intent },
                     _ => continue,
                 };
@@ -1703,11 +1921,15 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             } else {
                 0
             };
-        let current = have.is_some_and(|q| {
-            q.low == price.saturating_sub(confidence)
-                && q.high == price.saturating_add(confidence)
-                && (now as i64).saturating_sub(q.published) < refresh as i64
-        });
+        let fresh = have.is_some_and(|q| (now as i64).saturating_sub(q.published) < refresh as i64);
+        // A standby never posts over a fresh price: the primary's control
+        // file, not the standby's, says what it is.
+        let current = fresh
+            && (self.cfg.role == Role::Standby
+                || have.is_some_and(|q| {
+                    q.low == price.saturating_sub(confidence)
+                        && q.high == price.saturating_add(confidence)
+                }));
         if current {
             return Ok(false);
         }
@@ -1989,7 +2211,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             &["purpose", "amount", "pool", "vault", "position"],
         )?;
         let amount = decimal(fields.get("amount")).ok_or((400, "bad amount".to_owned()))?;
-        let paused = self.cfg.paused_for(header);
+        let paused = self.paused_now(header);
         let l = &self.cfg.limits;
         let w = wallet.to_string();
         // Checked and issued under the book lock: racing requests cannot
@@ -2083,15 +2305,45 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                     if amount < l.min_repay {
                         return refuse(422, "below the minimum repayment");
                     }
+                    // A part repayment leaves no dust debt under the limit.
+                    if l.min_position_debt > 0 {
+                        let r = book
+                            .reserve
+                            .as_ref()
+                            .map(|n| accrued(n, now))
+                            .transpose()
+                            .map_err(internal)?
+                            .ok_or((503, "the pool is not open yet".to_owned()))?;
+                        let shares = book
+                            .positions
+                            .iter()
+                            .find(|p| {
+                                p.owned_by(&wallet)
+                                    && p.state::<PositionState>()
+                                        .is_ok_and(|s| s.position_id == id)
+                            })
+                            .and_then(|p| p.state::<PositionState>().ok())
+                            .map_or(0, |s| s.debt_shares);
+                        let debt = core::debt_of(shares, r.borrow_price)
+                            .map_err(|e| internal(anyhow!("{e}")))?;
+                        if amount < debt && debt - amount < l.min_position_debt {
+                            return refuse(
+                                422,
+                                "a part repayment must leave at least the minimum debt; repay it all",
+                            );
+                        }
+                    }
                     (purpose::REPAY, id)
                 }
                 _ => return refuse(400, "bad purpose"),
             };
-            // Caps count the open tickets too: each may still fill.
+            // Caps count the open tickets too: each may still fill. Across
+            // wallets only those whose intent is on chain: unfunded tickets
+            // must not fill a cap for others. A wallet's own all count.
             let open: Vec<&Ticket> = book
                 .tickets
                 .iter()
-                .filter(|t| t.open(now) && t.purpose == purpose)
+                .filter(|t| t.open(now) && t.purpose == purpose && (t.seen || t.wallet == w))
                 .collect();
             let tickets = |f: &dyn Fn(&Ticket) -> bool| -> u128 {
                 open.iter()
@@ -2133,7 +2385,10 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             }
             if purpose == purpose::DEPOSIT {
                 let total: u128 = book.positions.iter().map(|p| u128::from(p.amount)).sum();
-                if !within(l.max_total_collateral, total + tickets(&|_| true) + a) {
+                // A top-up may save a position: never held to the total.
+                if !has_position(&w, target)
+                    && !within(l.max_total_collateral, total + tickets(&|_| true) + a)
+                {
                     return refuse(422, "the vault is at its collateral limit");
                 }
                 let this: u128 = book
@@ -2279,7 +2534,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             Some("draw") => Some(num("position")?),
             _ => None,
         };
-        if borrow > 0 && self.cfg.paused_for(header) {
+        if borrow > 0 && self.paused_now(header) {
             return refuse(403, "lending is paused: no new borrowing");
         }
         if borrow > 0 && self.halted() {
@@ -2463,7 +2718,14 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             if left != 0 && left < v.min_collateral {
                 return refuse(422, "below the vault's minimum collateral");
             }
-            if debt != 0 && debt < v.min_debt.max(l.min_position_debt) {
+            // The keeper's own floor binds a borrow only: a withdrawal from a
+            // position left under it (a part liquidation, a raised limit) goes on.
+            let floor = if borrow > 0 {
+                v.min_debt.max(l.min_position_debt)
+            } else {
+                v.min_debt
+            };
+            if debt != 0 && debt < floor {
                 return refuse(422, "below the vault's minimum debt");
             }
             if borrow > 0 && !within(l.max_position_debt, u128::from(debt)) {
@@ -2567,7 +2829,8 @@ fn apply(book: &mut Book, p: &Pending, outs: &[([u8; 32], u64)]) {
         // A recovery may have found it on chain already.
         let known = |list: &[Note]| list.iter().any(|m| m.nullifier == n.nullifier);
         match n.kind {
-            KIND_RESERVE => book.reserve = Some(n),
+            // A merge may have installed a newer one already (its spender's).
+            KIND_RESERVE if book.reserve.is_none() => book.reserve = Some(n),
             KIND_RECEIPT if holds_something(&n) && !known(&book.receipts) => book.receipts.push(n),
             KIND_POSITION if holds_something(&n) && !known(&book.positions) => {
                 book.positions.push(n)
@@ -2621,8 +2884,18 @@ impl KeeperConfig {
             cfg.http.listen.ip().is_loopback(),
             "http.listen must be a loopback address"
         );
-        cfg.lend.check()?;
+        cfg.check()?;
         Ok(cfg)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.network.check()?;
+        self.lend.check()?;
+        ensure!(
+            !self.lend.mainnet() || !self.http.key.is_file(),
+            "on mainnet the HTTP key comes from the Keychain, not a file"
+        );
+        Ok(())
     }
 }
 
@@ -2654,14 +2927,16 @@ pub fn connect(
     let signer = key_source.keypair()?;
     ensure!(
         keeler_lend::KEEPERS.contains(&signer.pubkey()),
-        "the keeper key {} is not one of the program's KEEPERS",
-        signer.pubkey()
+        "the keeper key {} is not one of the program's KEEPERS; {}",
+        signer.pubkey(),
+        built_with()
     );
     let pool = pool_source.keypair()?;
     let kp = keeler_lend_sdk::keeper_keypair(&signer, &pool)?;
     ensure!(
         kp.viewing_pubkey().as_bytes() == &keeler_lend::POOL_VIEWING,
-        "the pool key does not give the program's POOL_VIEWING"
+        "the pool key does not give the program's POOL_VIEWING; {}",
+        built_with()
     );
     ensure!(
         !lend.mainnet() || !keeler_lend::KEEPERS.contains(&pool.pubkey()),
@@ -2679,6 +2954,22 @@ pub fn connect(
         chain,
         state,
     })
+}
+
+/// What this binary was compiled with, for a refusal: the keeper builds
+/// with the program's parameters (`build-params.json`) in its environment.
+fn built_with() -> String {
+    let keepers: Vec<String> = keeler_lend::KEEPERS
+        .iter()
+        .map(Address::to_string)
+        .collect();
+    format!(
+        "this binary was built with KEELER_LEND_PROGRAM_ID={} KEELER_LEND_KEEPERS={} \
+         KEELER_LEND_POOL_VIEWING={}; rebuild it with the deployed program's build parameters",
+        keeler_lend::ID,
+        keepers.join(","),
+        to_hex(&keeler_lend::POOL_VIEWING)
+    )
 }
 
 /// Refuses a chain whose genesis hash is not the network `lend.network`
@@ -2748,16 +3039,18 @@ impl<L: Ledger> LendRoutes for Keeper<'_, L> {
     }
 }
 
-/// A keeper that may still be starting: 503 until it is up.
+/// A keeper that may still be starting: 503 until it is up, with a body the
+/// Worker retries on the next keeper.
 pub struct Slot<'a, L>(pub &'a OnceLock<Keeper<'a, L>>);
 
 impl<L: Ledger> LendRoutes for Slot<'_, L> {
     fn lend(&self, method: &str, url: &str, body: &[u8], paused: bool) -> (u16, Value) {
         match self.0.get() {
             Some(k) => k.http(method, url, body, paused),
+            // No `error` field: the Worker tries the next keeper.
             None => (
                 503,
-                json!({ "error": "the keeper could not do this right now" }),
+                json!({ "starting": "the keeper is starting or cannot start yet" }),
             ),
         }
     }

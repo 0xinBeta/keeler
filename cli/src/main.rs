@@ -5,6 +5,7 @@ use keeler::{
     config::{parse_address, DealerConfig, TraderConfig},
     dealer, keeper, lend_chain, trader,
 };
+use solana_signer::Signer;
 
 const USAGE: &str = "usage: keeler swap <config> <sell_mint> <buy_mint> <amount>
        keeler dealer <config>
@@ -12,6 +13,9 @@ const USAGE: &str = "usage: keeler swap <config> <sell_mint> <buy_mint> <amount>
        keeler keeper <keeper config>
        keeler lend-init-reserve <keeper config>
        keeler lend-set-price <keeper config> <vault> <price x1e12> <confidence x1e12>
+       keeler lend-fund <keeper config> <amount>
+       keeler lend-balance <keeper config>
+       keeler lend-sweep <keeper config>
        keeler deploy viewing-key <item> | check <plan> | program <plan> <out> | hand-over <plan> <program> <multisig> <index>";
 
 fn main() -> ExitCode {
@@ -80,6 +84,45 @@ fn run(args: &[String]) -> Result<()> {
             let sig =
                 lend_chain::set_test_price(&p.chain, want.vault, want.price, want.confidence)?;
             println!("test price set: {sig}");
+        }
+        [cmd, cfg, amount] if cmd == "lend-fund" => {
+            let cfg = keeper::KeeperConfig::load(cfg)?;
+            let amount: u64 = amount.parse()?;
+            let p = keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
+            let from = lend_chain::debt_token_account(&p.chain);
+            let sig = lend_chain::fund(&p.chain, amount, from)?;
+            println!("shielded {amount} of the debt token to the keeper's lend address: {sig}");
+        }
+        [cmd, cfg] if cmd == "lend-balance" => {
+            let cfg = keeper::KeeperConfig::load(cfg)?;
+            let p = keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
+            let (debt, collateral) = lend_chain::balances(&p.chain)?;
+            println!("debt token at the lend address: {debt}");
+            println!("collateral at the lend address: {collateral}");
+            let now = p.chain.chain.now()?;
+            match keeper::largest_debt_in(&p.state, &p.signer.pubkey(), now) {
+                Ok(Some(most)) => {
+                    println!("largest position's debt: {most}");
+                    if debt < most {
+                        println!("too little to liquidate it: fund with `keeler lend-fund`");
+                    }
+                }
+                Ok(None) => {
+                    println!("largest position's debt: unknown (no reserve in the state file)")
+                }
+                Err(e) => println!("largest position's debt: unknown ({e:#})"),
+            }
+        }
+        [cmd, cfg] if cmd == "lend-sweep" => {
+            let cfg = keeper::KeeperConfig::load(cfg)?;
+            let p = keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
+            let sigs = lend_chain::sweep(&p.chain)?;
+            if sigs.is_empty() {
+                println!("no collateral at the lend address");
+            }
+            for sig in sigs {
+                println!("swept: {sig}");
+            }
         }
         [cmd, rest @ ..] if cmd == "deploy" => keeler::deploy::cli(rest)?,
         [cmd, cfg] if cmd == "refund" => {

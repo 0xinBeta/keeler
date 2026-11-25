@@ -51,6 +51,10 @@ pub enum Prover {
     Helius { keychain: String },
 }
 
+/// The highest priority fee a config may set, micro-lamports per compute
+/// unit: 7,000,000 lamports (0.007 SOL) on a 1.4M-unit transaction.
+pub const MAX_PRIORITY_FEE: u64 = 5_000_000;
+
 #[derive(Clone, Deserialize)]
 pub struct Network {
     pub rpc_url: String,
@@ -89,7 +93,11 @@ impl Network {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    pub fn check(&self) -> Result<()> {
+        ensure!(
+            self.priority_fee <= MAX_PRIORITY_FEE,
+            "network.priority_fee must be at most {MAX_PRIORITY_FEE} micro-lamports per compute unit"
+        );
         if let Prover::Helius { .. } = self.prover {
             for url in [&self.rpc_url, &self.indexer_url] {
                 ensure!(

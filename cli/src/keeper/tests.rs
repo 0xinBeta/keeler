@@ -44,6 +44,13 @@ struct World {
     /// The `after` of each history and intents read.
     history_after: Vec<Option<String>>,
     intents_after: Vec<Option<String>>,
+    /// The keeper's own debt token, and how often it was read.
+    held: u64,
+    held_reads: u32,
+    /// History reads of peers fail.
+    peer_history_fails: bool,
+    /// This keeper's own history read past its mark ("mark") is empty.
+    history_honours_mark: bool,
 }
 
 #[derive(Default)]
@@ -316,7 +323,11 @@ impl Ledger for Fake {
                     vec![res.nullifier.clone(), receipt.nullifier.clone()],
                     vec![
                         new_reserve(res.amount - amount, -(*amount as i64), 0)?,
-                        receipt_note(&wallet, 0, n + 2),
+                        receipt_note(
+                            &wallet,
+                            receipt.state::<ReceiptState>()?.supply_shares - amount,
+                            n + 2,
+                        ),
                     ],
                 )
             }
@@ -393,9 +404,17 @@ impl Ledger for Fake {
         }
         Ok("sig".into())
     }
+    fn debt_held(&self) -> Result<u64> {
+        let mut w = self.w();
+        w.held_reads += 1;
+        Ok(w.held)
+    }
     fn history(&self, payer: &Address, after: Option<&str>) -> Result<(Vec<Note>, Option<String>)> {
         let mut w = self.w();
         if let Some(list) = w.peer_history.get(payer) {
+            if w.peer_history_fails {
+                bail!("the RPC does not have a peer's transaction");
+            }
             // A peer's mark moves with each note it adds.
             let mark = format!("peer-{}", list.len());
             let new = if after == Some(mark.as_str()) {
@@ -406,6 +425,9 @@ impl Ledger for Fake {
             return Ok((new, Some(mark)));
         }
         w.history_after.push(after.map(str::to_owned));
+        if w.history_honours_mark && after == Some("mark") {
+            return Ok((Vec::new(), Some("mark".into())));
+        }
         Ok((w.history.clone(), Some("mark".into())))
     }
 }
@@ -1712,7 +1734,14 @@ fn the_slot_answers_503_until_the_keeper_is_up() {
     let s = Setup::new("slot", "");
     let cell = OnceLock::new();
     let slot = Slot(&cell);
-    assert_eq!(slot.lend("GET", "/lend/pools", b"", false).0, 503);
+    let (st, v) = slot.lend("GET", "/lend/pools", b"", false);
+    // No `error` field: the Worker tries the next keeper.
+    assert_eq!(st, 503);
+    assert_eq!(
+        v.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["starting"]
+    );
+    assert!(v["starting"].is_string());
     assert!(cell.set(s.keeper()).is_ok());
     assert_eq!(slot.lend("GET", "/lend/pools", b"", false).0, 200);
 }
@@ -1886,65 +1915,6 @@ fn bad_debt_beyond_the_surplus_halts_borrowing() {
 }
 
 #[test]
-fn caps_hold_tickets_and_draws() {
-    let s = Setup::new(
-        "caps",
-        r#","limits":{"max_pool_size":110000000,"max_supply_per_wallet":105000000,"max_total_collateral":3000000000,"max_position_collateral":2000000000,"max_position_debt":6000000,"min_position_debt":2000000}"#,
-    );
-    let k = s.keeper();
-    let lender = with_liquidity(&s, &k);
-    // Pool 100 of 110; the lender has 100 of 105.
-    assert_eq!(supply_ticket(&k, &lender, 6 * USD).0, 422, "per wallet");
-    assert_eq!(supply_ticket(&k, &lender, 5 * USD).0, 200);
-    let other = s.user();
-    assert_eq!(
-        supply_ticket(&k, &other, 6 * USD).0,
-        422,
-        "the open ticket counts"
-    );
-    assert_eq!(supply_ticket(&k, &other, 5 * USD).0, 200);
-    let a = s.user();
-    assert_eq!(
-        deposit_ticket(&k, &a, 1, 2 * SOL + 1).0,
-        422,
-        "per position"
-    );
-    fund_intent(&s, &k, &a, purpose::DEPOSIT, 1, 2 * SOL);
-    assert_eq!(deposit_ticket(&k, &a, 2, SOL + 1).0, 422, "in total");
-    assert_eq!(drain(&k), vec![Op::DepositOpen]);
-    assert_eq!(draw(&k, &a, 1, USD).0, 422, "below the minimum debt");
-    assert_eq!(draw(&k, &a, 1, 7 * USD).0, 422, "above the most debt");
-    assert_eq!(draw(&k, &a, 1, 6 * USD).0, 200);
-}
-
-#[test]
-fn the_workers_pause_header_stops_new_money() {
-    let s = Setup::new("paused-header", "");
-    let k = s.keeper();
-    let lender = with_liquidity(&s, &k);
-    let req = |paused: bool| {
-        let f = lender.signed(
-            "POST",
-            "/lend/ticket",
-            &[
-                ("purpose", "supply".into()),
-                ("pool", vault1().debt_mint.to_string()),
-                ("amount", USD.to_string()),
-            ],
-            now_of(&k),
-        );
-        k.http("POST", "/lend/ticket", &body(&f), paused).0
-    };
-    assert_eq!(req(true), 403);
-    assert_eq!(req(false), 200);
-    assert_eq!(
-        draw(&k, &lender, 1, USD).0,
-        404,
-        "no position, but not paused"
-    );
-}
-
-#[test]
 fn an_old_single_scan_mark_is_this_keepers() {
     let s = Setup::new("old-mark", "");
     let old = json!({"reserve":null,"receipts":[],"positions":[],"tickets":[],
@@ -1971,16 +1941,473 @@ fn the_chain_must_be_the_network_named() {
 }
 
 #[test]
+fn caps_count_funded_tickets_and_hold_at_fill() {
+    let s = Setup::new(
+        "caps",
+        r#","limits":{"max_pool_size":110000000,"max_supply_per_wallet":105000000,"max_total_collateral":3000000000,"max_position_collateral":2000000000,"max_position_debt":6000000,"min_position_debt":2000000}"#,
+    );
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    // Pool 100 of 110; the lender has 100 of 105, and its own tickets count.
+    assert_eq!(supply_ticket(&k, &lender, 6 * USD).0, 422, "per wallet");
+    fund_intent(&s, &k, &lender, purpose::SUPPLY, 1, 5 * USD);
+    assert_eq!(
+        supply_ticket(&k, &lender, USD).0,
+        422,
+        "its own open ticket"
+    );
+    // Another wallet's ticket with no intent on chain blocks nobody.
+    let other = s.user();
+    let (st, idle) = supply_ticket(&k, &other, 6 * USD);
+    assert_eq!(st, 200, "{idle}");
+    // Once the lender's intent is seen, its ticket counts for everyone.
+    s.pause(true);
+    k.step().unwrap();
+    s.pause(false);
+    assert_eq!(
+        supply_ticket(&k, &s.user(), 6 * USD).0,
+        422,
+        "a funded ticket"
+    );
+    assert_eq!(drain(&k), vec![Op::Supply]);
+    // At 105, the other's 6, funded late, no longer fits.
+    let expiry = idle["expiry"].as_u64().unwrap();
+    s.fake
+        .add_intent(&other.addr(), purpose::SUPPLY, 1, 6 * USD, expiry);
+    assert!(drain(&k).is_empty(), "the pool size at fill");
+
+    let a = s.user();
+    assert_eq!(
+        deposit_ticket(&k, &a, 1, 2 * SOL + 1).0,
+        422,
+        "per position"
+    );
+    fund_intent(&s, &k, &a, purpose::DEPOSIT, 1, 2 * SOL);
+    assert_eq!(
+        deposit_ticket(&k, &a, 2, SOL + 1).0,
+        422,
+        "its own tickets, in total"
+    );
+    let b = s.user();
+    let (st, late) = deposit_ticket(&k, &b, 1, SOL + 1);
+    assert_eq!(st, 200, "another's unfunded ticket does not count: {late}");
+    assert_eq!(drain(&k), vec![Op::DepositOpen]);
+    let c = s.user();
+    fund_intent(&s, &k, &c, purpose::DEPOSIT, 1, SOL);
+    assert_eq!(drain(&k), vec![Op::DepositOpen]);
+    // The vault holds its 3 SOL: no new position, but a top-up, which may
+    // save a position, is never held to the total.
+    assert_eq!(
+        deposit_ticket(&k, &s.user(), 1, SOL / 10).0,
+        422,
+        "in total"
+    );
+    fund_intent(&s, &k, &c, purpose::DEPOSIT, 1, SOL / 2);
+    assert_eq!(drain(&k), vec![Op::DepositAdd]);
+    // b's, funded now, no longer fits at fill.
+    let expiry = late["expiry"].as_u64().unwrap();
+    s.fake
+        .add_intent(&b.addr(), purpose::DEPOSIT, 1, SOL + 1, expiry);
+    assert!(drain(&k).is_empty(), "the collateral caps at fill");
+    assert_eq!(draw(&k, &a, 1, USD).0, 422, "below the minimum debt");
+    assert_eq!(draw(&k, &a, 1, 7 * USD).0, 422, "above the most debt");
+    assert_eq!(draw(&k, &a, 1, 6 * USD).0, 200);
+}
+
+#[test]
+fn the_minimum_debt_binds_borrows_and_part_repays_only() {
+    let mut s = Setup::new("min-debt", r#","limits":{"min_position_debt":2000000}"#);
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    let a = borrower(&s, &k, SOL, 3 * USD);
+    // 1.5 of 3 would leave 1.5, under the 2 floor; 1, or all of it, is fine.
+    assert_eq!(repay_ticket(&k, &a, 1, 3 * USD / 2).0, 422);
+    assert_eq!(repay_ticket(&k, &a, 1, USD).0, 200);
+    assert_eq!(repay_ticket(&k, &a, 1, 3 * USD).0, 200);
+    // The floor raised past the debt: borrowing a little more is refused,
+    // withdrawing collateral is not.
+    drop(k);
+    s.cfg = lend_cfg(r#","limits":{"min_position_debt":5000000}"#);
+    let k = s.keeper();
+    assert_eq!(draw(&k, &a, 1, USD).0, 422);
+    let (st, v) = build_req(
+        &k,
+        &a,
+        &[
+            ("op", "draw".into()),
+            ("vault", "1".into()),
+            ("position", "1".into()),
+            ("borrow", "0".into()),
+            ("withdraw", (SOL / 10).to_string()),
+        ],
+    );
+    assert_eq!(st, 200, "{v}");
+}
+
+/// A setup whose keeper set has one peer, with a history of its own.
+fn with_peer(name: &str, extra: &str) -> (Setup, Address) {
+    let mut s = Setup::new(name, extra);
+    let peer = Keypair::new().pubkey();
+    s.set = vec![peer];
+    s.fake.w().peer_history.insert(peer, Vec::new());
+    (s, peer)
+}
+
+#[test]
+fn each_keeper_has_its_own_mark_and_a_peers_notes_join_the_book() {
+    let (s, peer) = with_peer("peer-marks", "");
+    let u = s.user();
+    // The peer opened u's position 1 (a deposit spends no reserve).
+    s.fake
+        .w()
+        .peer_history
+        .insert(peer, vec![position_note(&u.addr(), 1, SOL, 0, 900)]);
+    let k = s.keeper();
+    let b = k.snapshot().unwrap();
+    assert_eq!(b.positions.len(), 1, "the peer's note");
+    let mark = |b: &Book, k: &Address| b.scanned.get(&k.to_string()).cloned();
+    assert_eq!(mark(&b, &s.signer.pubkey()).as_deref(), Some("mark"));
+    assert_eq!(mark(&b, &peer).as_deref(), Some("peer-1"));
+    // Nothing new: nothing changes, nothing is saved.
+    std::fs::remove_file(&s.state).unwrap();
+    k.merge_history(&[peer], false).unwrap();
+    assert!(!s.state.exists(), "a scan with nothing new saves nothing");
+    assert_eq!(k.snapshot().unwrap(), b);
+    // The peer tops it up: the old note is spent, the new one is in the
+    // peer's history, and the reserve is untouched.
+    {
+        let mut w = s.fake.w();
+        w.spent.insert(b.positions[0].nullifier().unwrap());
+        w.peer_history
+            .get_mut(&peer)
+            .unwrap()
+            .push(position_note(&u.addr(), 1, 2 * SOL, 0, 901));
+    }
+    k.step().unwrap();
+    let after = k.snapshot().unwrap();
+    assert_eq!(after.reserve, b.reserve);
+    let amounts: Vec<u64> = after.positions.iter().map(|p| p.amount).collect();
+    assert_eq!(amounts, [2 * SOL]);
+    assert_eq!(mark(&after, &peer).as_deref(), Some("peer-2"));
+    assert_eq!(mark(&after, &s.signer.pubkey()).as_deref(), Some("mark"));
+}
+
+#[test]
+fn no_second_position_while_a_peers_successor_is_on_its_way() {
+    let (s, peer) = with_peer("peer-topup", "");
+    let k = s.keeper();
+    let u = s.user();
+    fund_intent(&s, &k, &u, purpose::DEPOSIT, 1, SOL);
+    assert_eq!(drain(&k), vec![Op::DepositOpen]);
+    let old = k.snapshot().unwrap().positions[0].clone();
+    // A top-up; a peer spends the position before its new note is here.
+    let id = fund_intent(&s, &k, &u, purpose::DEPOSIT, 1, SOL / 10);
+    s.fake.w().spent.insert(old.nullifier().unwrap());
+    assert!(drain(&k).is_empty(), "no second position 1");
+    s.fake
+        .w()
+        .peer_history
+        .get_mut(&peer)
+        .unwrap()
+        .push(position_note(&u.addr(), 1, 2 * SOL, 0, 900));
+    assert_eq!(drain(&k), vec![Op::DepositAdd], "the top-up goes into it");
+    assert_eq!(
+        ticket_of(&k.snapshot().unwrap(), &id).status,
+        TicketStatus::Filled
+    );
+}
+
+#[test]
+fn a_failed_read_of_a_peers_history_does_not_stop_a_liquidation() {
+    let (s, _) = with_peer("peer-fail", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    s.fake.w().peer_history_fails = true;
+    s.fake.w().quote = Some(Quote {
+        low: 8 * DOLLAR,
+        high: 8 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    assert_eq!(drain(&k), vec![Op::Liquidate]);
+}
+
+#[test]
+fn a_book_that_does_not_add_up_lets_nothing_new_in() {
+    let s = Setup::new("shares", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let u = borrower(&s, &k, SOL, 3 * USD);
+    let other = s.user();
+    fund_intent(&s, &k, &other, purpose::SUPPLY, 1, 5 * USD);
+    assert_eq!(drain(&k), vec![Op::Supply]);
+    // The book loses a receipt: its shares no longer add up to the reserve's.
+    let lost = {
+        let mut b = k.book().unwrap();
+        let i = b
+            .receipts
+            .iter()
+            .position(|r| r.owned_by(&other.addr()))
+            .unwrap();
+        b.receipts.remove(i)
+    };
+    k.resolve().unwrap();
+    assert_eq!(supply_ticket(&k, &lender, 2 * USD).0, 403, "supply");
+    assert_eq!(
+        deposit_ticket(&k, &s.user(), 2, SOL).0,
+        403,
+        "a new position"
+    );
+    assert_eq!(draw(&k, &u, 1, USD).0, 403, "borrowing");
+    // Repays, top-ups, withdrawals and redeems go on.
+    fund_intent(&s, &k, &u, purpose::REPAY, 1, USD);
+    fund_intent(&s, &k, &u, purpose::DEPOSIT, 1, SOL / 10);
+    assert_eq!(drain(&k), vec![Op::Repay, Op::DepositAdd]);
+    let (st, v) = build_req(
+        &k,
+        &u,
+        &[
+            ("op", "draw".into()),
+            ("vault", "1".into()),
+            ("position", "1".into()),
+            ("borrow", "0".into()),
+            ("withdraw", (SOL / 10).to_string()),
+        ],
+    );
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    s.fake.advance(21);
+    let (st, v) = redeem(&k, &lender, USD);
+    assert_eq!(st, 200, "{v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    // The receipt back: lending opens again.
+    k.book().unwrap().receipts.push(lost);
+    k.resolve().unwrap();
+    assert_eq!(supply_ticket(&k, &lender, 2 * USD).0, 200);
+}
+
+#[test]
+fn a_reserve_lost_past_the_marks_is_found_by_reading_everything_again() {
+    let s = Setup::new("lost-reserve", "");
+    let k = s.keeper();
+    let old = k.snapshot().unwrap().reserve.unwrap();
+    let newer = reserve_note(&fresh_reserve(0, 0), 0, 77);
+    {
+        // Spent by a transaction older than the mark that this book missed.
+        let mut w = s.fake.w();
+        w.spent.insert(old.nullifier().unwrap());
+        w.history = vec![old, newer.clone()];
+        w.history_honours_mark = true;
+        w.history_after.clear();
+    }
+    k.resolve().unwrap();
+    assert_eq!(k.snapshot().unwrap().reserve, Some(newer));
+    assert_eq!(s.fake.w().history_after, [Some("mark".into()), None]);
+}
+
+#[test]
+fn a_landed_build_does_not_replace_a_newer_reserve() {
+    let r1 = reserve_note(&fresh_reserve(0, 0), 0, 1);
+    let r2 = reserve_note(&fresh_reserve(5, 0), 5, 2);
+    let r3 = reserve_note(&fresh_reserve(9, 0), 9, 3);
+    let p = Pending {
+        op: Op::Supply,
+        wallet: Keypair::new().pubkey().to_string(),
+        spends: Some(r1.nullifier.clone()),
+        inputs: vec![r1.nullifier.clone()],
+        outputs: vec![r2.hash.clone()],
+        notes: vec![r2.clone()],
+        now: T0,
+        ticket: None,
+        owner_signed: false,
+        signature: None,
+    };
+    // A merge already put r3, built on r2 by a peer, in the book.
+    let mut book = Book {
+        reserve: Some(r3.clone()),
+        pending: vec![p.clone()],
+        ..Book::default()
+    };
+    apply(&mut book, &p, &[]);
+    assert_eq!(book.reserve, Some(r3));
+    // Over the reserve it spent, its own output is taken.
+    let mut book = Book {
+        reserve: Some(r1),
+        pending: vec![p.clone()],
+        ..Book::default()
+    };
+    apply(&mut book, &p, &[]);
+    assert_eq!(book.reserve.map(|r| r.hash), Some(r2.hash));
+}
+
+#[test]
+fn the_workers_pause_header_stops_new_money_only() {
+    let s = Setup::new("paused-header", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    let a = borrower(&s, &k, SOL, 3 * USD);
+    let paused = |u: &User, path: &str, extra: &[(&str, String)]| {
+        let f = u.signed("POST", path, extra, now_of(&k));
+        k.http("POST", path, &body(&f), true)
+    };
+    let supply: Vec<(&str, String)> = vec![
+        ("purpose", "supply".into()),
+        ("pool", vault1().debt_mint.to_string()),
+        ("amount", USD.to_string()),
+    ];
+    let deposit = |position: u64| -> Vec<(&str, String)> {
+        vec![
+            ("purpose", "deposit".into()),
+            ("vault", "1".into()),
+            ("position", position.to_string()),
+            ("amount", (SOL / 10).to_string()),
+        ]
+    };
+    let repay: Vec<(&str, String)> = vec![
+        ("purpose", "repay".into()),
+        ("vault", "1".into()),
+        ("position", "1".into()),
+        ("amount", USD.to_string()),
+    ];
+    let draw_of = |borrow: u64, withdraw: u64| -> Vec<(&str, String)> {
+        vec![
+            ("op", "draw".into()),
+            ("vault", "1".into()),
+            ("position", "1".into()),
+            ("borrow", borrow.to_string()),
+            ("withdraw", withdraw.to_string()),
+        ]
+    };
+    assert_eq!(paused(&lender, "/lend/ticket", &supply).0, 403, "supply");
+    assert_eq!(
+        paused(&a, "/lend/ticket", &deposit(2)).0,
+        403,
+        "a new position"
+    );
+    assert_eq!(paused(&a, "/lend/ticket", &deposit(1)).0, 200, "a top-up");
+    assert_eq!(paused(&a, "/lend/ticket", &repay).0, 200, "a repay");
+    assert_eq!(
+        paused(&a, "/lend/build", &draw_of(USD, 0)).0,
+        403,
+        "a borrow"
+    );
+    let (st, v) = paused(&a, "/lend/build", &draw_of(0, SOL / 10));
+    assert_eq!(st, 200, "a withdrawal: {v}");
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    s.fake.advance(21);
+    let redeem: Vec<(&str, String)> = vec![
+        ("op", "redeem".into()),
+        ("pool", vault1().debt_mint.to_string()),
+        ("amount", USD.to_string()),
+    ];
+    let (st, v) = paused(&lender, "/lend/build", &redeem);
+    assert_eq!(st, 200, "a redeem: {v}");
+    // Without the header, supply goes.
+    assert_eq!(supply_ticket(&k, &lender, USD).0, 200);
+}
+
+#[test]
+fn a_standby_posts_the_test_price_only_once_it_has_gone_stale() {
+    let s = Setup::new(
+        "standby-price",
+        r#","role":"standby","price_refresh_secs":45"#,
+    );
+    let k = s.keeper();
+    // Its own control file names another price: not posted over a fresh one.
+    let want = TestPrice {
+        vault: 1,
+        price: 6 * DOLLAR,
+        confidence: 1_000,
+    };
+    write_private(&price_file(&s.state), &serde_json::to_vec(&want).unwrap()).unwrap();
+    assert!(!k.refresh_price().unwrap());
+    s.fake.advance(59);
+    assert!(!k.refresh_price().unwrap(), "the primary has 15 s more");
+    s.fake.advance(1);
+    assert!(k.refresh_price().unwrap());
+}
+
+#[test]
+fn the_keepers_own_funds_are_checked_once_a_minute() {
+    let s = Setup::new("funds", "");
+    let k = s.keeper();
+    with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 3 * USD);
+    let book = k.snapshot().unwrap();
+    let r = accrued(book.reserve.as_ref().unwrap(), now_of(&k)).unwrap();
+    assert_eq!(largest_debt(&book, &r).unwrap(), 3 * USD);
+    let reads = || s.fake.w().held_reads;
+    k.step().unwrap();
+    assert_eq!(reads(), 0, "checked at the first pass, with nothing owed");
+    s.fake.advance(FUNDS_CHECK_SECS);
+    k.step().unwrap();
+    k.step().unwrap();
+    assert_eq!(reads(), 1);
+    s.fake.advance(FUNDS_CHECK_SECS - 1);
+    k.step().unwrap();
+    assert_eq!(reads(), 1);
+    s.fake.advance(1);
+    k.step().unwrap();
+    assert_eq!(reads(), 2);
+}
+
+/// A mainnet lend section, with `origins` and `min_position_debt`.
+fn mainnet_lend(origins: &str, min_debt: u64) -> Value {
+    serde_json::from_str(&format!(
+        r#"{{"program_id":"{}","network":"mainnet","origins":{origins},"price":"pyth",
+        "limits":{{"max_pool_size":1,"max_total_collateral":1,"max_position_collateral":1,
+        "max_position_debt":1,"max_supply_per_wallet":1,"min_position_debt":{min_debt}}}}}"#,
+        keeler_lend::ID
+    ))
+    .unwrap()
+}
+
+#[test]
 fn mainnet_role_and_origin_settings_are_checked() {
-    let caps = r#","price":"pyth","limits":{"max_pool_size":1,"max_total_collateral":1,"max_position_collateral":1,"max_position_debt":1,"max_supply_per_wallet":1}"#;
-    let mut main = lend_cfg(caps);
-    main.network = "mainnet".into();
+    let lend = |v: Value| serde_json::from_value::<Lend>(v).unwrap();
+    let main = lend(mainnet_lend(r#"["https://keeler.example"]"#, 1));
     assert!(main.check().is_ok(), "{:?}", main.check());
-    let mut uncapped = lend_cfg(r#","price":"pyth""#);
-    uncapped.network = "mainnet".into();
-    assert!(uncapped.check().is_err(), "a cap left at 0 on mainnet");
+    assert!(
+        lend(mainnet_lend(r#"["http://keeler.example"]"#, 1))
+            .check()
+            .is_err(),
+        "http on mainnet"
+    );
+    assert!(
+        lend(mainnet_lend(r#"["https://keeler.example"]"#, 0))
+            .check()
+            .is_err(),
+        "no minimum debt on mainnet"
+    );
+    let mut uncapped = mainnet_lend(r#"["https://keeler.example"]"#, 1);
+    uncapped["limits"]["max_pool_size"] = json!(0);
+    assert!(
+        lend(uncapped).check().is_err(),
+        "a cap left at 0 on mainnet"
+    );
     assert!(lend_cfg(r#","standby_grace_secs":601"#).check().is_err());
     assert!(lend_cfg(r#","role":"standby""#).check().is_ok());
+    assert!(
+        lend_cfg(r#","role":"standby","price_refresh_secs":61"#)
+            .check()
+            .is_err(),
+        "a standby 15 s late would let the price pass 75 s"
+    );
+    let fee = crate::config::MAX_PRIORITY_FEE;
+    assert!(lend_cfg(&format!(r#","liquidation_priority_fee":{fee}"#))
+        .check()
+        .is_ok());
+    assert!(
+        lend_cfg(&format!(r#","liquidation_priority_fee":{}"#, fee + 1))
+            .check()
+            .is_err()
+    );
     let with = |rest: &str| {
         serde_json::from_str::<Lend>(&format!(
             r#"{{"program_id":"{}","network":"{NET}"{rest}}}"#,
@@ -2001,4 +2428,24 @@ fn mainnet_role_and_origin_settings_are_checked() {
         let c = with(&format!(r#","origins":{bad}"#)).unwrap();
         assert!(c.check().is_err(), "origins {bad}");
     }
+}
+
+#[test]
+fn a_mainnet_keeper_takes_its_http_key_from_the_keychain_and_bounds_its_fee() {
+    let cfg = |http_key: Value, fee: u64| -> KeeperConfig {
+        serde_json::from_value(json!({
+            "network": {"rpc_url": "http://127.0.0.1:8899", "indexer_url": "http://127.0.0.1:8784",
+                "prover": "local", "priority_fee": fee},
+            "key": {"keychain": "keeper"},
+            "http": {"listen": "127.0.0.1:47000", "key": http_key},
+            "lend": mainnet_lend(r#"["https://keeler.example"]"#, 1),
+        }))
+        .unwrap()
+    };
+    let keychain = json!({"keychain": "http"});
+    assert!(cfg(keychain.clone(), 0).check().is_ok());
+    assert!(cfg(json!({"file": "/tmp/key"}), 0).check().is_err());
+    let max = crate::config::MAX_PRIORITY_FEE;
+    assert!(cfg(keychain.clone(), max).check().is_ok());
+    assert!(cfg(keychain, max + 1).check().is_err());
 }

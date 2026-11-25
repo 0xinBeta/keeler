@@ -101,13 +101,16 @@ pub fn cluster_at(rpc_url: &str) -> Result<Cluster> {
 }
 
 /// A compute budget of `cu_limit` with `micro_lamports` per unit on top.
-pub fn budget(cu_limit: u32, micro_lamports: u64) -> ComputeBudgetConfig {
+pub fn budget(cu_limit: u32, micro_lamports: u64) -> Result<ComputeBudgetConfig> {
     let b = ComputeBudgetConfig::new(cu_limit);
-    match u64::try_from((u128::from(cu_limit) * u128::from(micro_lamports)).div_ceil(1_000_000)) {
-        Ok(0) => b,
-        Ok(fee) => b.with_priority_fee(fee),
-        Err(_) => b.with_priority_fee(u64::MAX),
-    }
+    let fee =
+        u64::try_from((u128::from(cu_limit) * u128::from(micro_lamports)).div_ceil(1_000_000))
+            .map_err(|_| anyhow!("the priority fee overflows"))?;
+    Ok(if fee == 0 {
+        b
+    } else {
+        b.with_priority_fee(fee)
+    })
 }
 
 pub struct Chain {
@@ -154,6 +157,13 @@ impl Chain {
         if let Ok(mut c) = CLAIMED.lock() {
             c.retain(|(_, _, at)| at.elapsed() < CLAIM);
             c.push((self.scope, note.utxo_hash, Instant::now()));
+        }
+    }
+
+    /// Gives back a claim whose spend failed before it could land.
+    pub fn release(&self, hash: &[u8; 32]) {
+        if let Ok(mut c) = CLAIMED.lock() {
+            c.retain(|(scope, h, _)| !(*scope == self.scope && h == hash));
         }
     }
 
@@ -204,7 +214,7 @@ impl Chain {
             }
         };
         // The client's own sends (self-transfers) pay the same rate.
-        let client = match budget(client.compute_budget().cu_limit, network.priority_fee)
+        let client = match budget(client.compute_budget().cu_limit, network.priority_fee)?
             .priority_fee_lamports
         {
             Some(fee) => client.with_priority_fee(fee),
@@ -459,7 +469,7 @@ impl Chain {
             std::slice::from_ref(&ix),
             kp.pubkey(),
             &[kp],
-            budget(COMPUTE_UNIT_LIMIT, self.priority_fee),
+            budget(COMPUTE_UNIT_LIMIT, self.priority_fee)?,
         )?;
         self.client
             .confirm_private_transaction_sync(sig)
@@ -646,9 +656,16 @@ mod tests {
 
     #[test]
     fn priority_fee_is_per_compute_unit() {
-        assert_eq!(budget(1_400_000, 0).priority_fee_lamports, None);
+        assert_eq!(budget(1_400_000, 0).unwrap().priority_fee_lamports, None);
         // 1,000 micro-lamports a unit over 1.4M units: 1,400 lamports.
-        assert_eq!(budget(1_400_000, 1_000).priority_fee_lamports, Some(1_400));
-        assert_eq!(budget(200_000, 1).priority_fee_lamports, Some(1));
+        assert_eq!(
+            budget(1_400_000, 1_000).unwrap().priority_fee_lamports,
+            Some(1_400)
+        );
+        assert_eq!(budget(200_000, 1).unwrap().priority_fee_lamports, Some(1));
+        assert!(
+            budget(u32::MAX, u64::MAX).is_err(),
+            "an overflow is an error"
+        );
     }
 }
