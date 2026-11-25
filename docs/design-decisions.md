@@ -1,8 +1,7 @@
 # Design decisions
 
-Short reasons for the choices a reviewer asks about first. The full design is
-`docs/plan-lend.md`; the keeper set is `docs/plan-mainnet.md`; the threat model is
-`docs/threat-model.md`.
+Short reasons for the choices a reviewer asks about first. The full design, the keeper set
+included, is `docs/plan-lend.md`; the threat model is `docs/threat-model.md`.
 
 ## The reserve is one `UniqueDataUtxo`
 
@@ -108,7 +107,7 @@ leaves the position still liquidatable and costs the keeper, never the owner.
 
 ## What Custom Rings would change
 
-From the Privacy Rings documentation we read (`docs/plan-lend.md`, "Facts checked"): in the
+From the Privacy Rings documentation (`docs/plan-lend.md`, "Background: Privacy Rings"): in the
 Default Ring owners are public signers, output owner tags and counts are public, and ciphertexts
 are unchecked; custom rings were in audit until December 2026. With a custom ring:
 

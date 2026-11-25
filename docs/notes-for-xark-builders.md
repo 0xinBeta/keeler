@@ -140,8 +140,8 @@ fails.
 
 - **Observed.** `draw` needs pool owner, user owner, owner identity, two mint halves for each of
   two mints, vault, `now`, price bound and first nullifier: eleven, the most a proof takes
-  (`docs/plan-lend.md`, "Facts checked"). Byte arrays are not public inputs; a 32-byte mint is two
-  `u128` halves (`mint_halves` in `lend/program/src/instructions/mod.rs`).
+  (`docs/plan-lend.md`, "Background: Privacy Rings"). Byte arrays are not public inputs; a
+  32-byte mint is two `u128` halves (`mint_halves` in `lend/program/src/instructions/mod.rs`).
 - **Workaround.** `DrawPublicInputs` in `lend/program/src/circuits/draw.rs` is exactly eleven
   fields; the program recomputes every one from accounts and arguments before verifying.
 - **Classification.** Limit of the program-proof interface in `spr-program` 0.10.0.

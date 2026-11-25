@@ -1,0 +1,45 @@
+# gitleaks false positives, by fingerprint (commit:file:rule:line).
+# lend/{program,spike}/src/verifier/*.vk.rs: generated Groth16 verifying keys (public by design).
+# web/tests/fixtures/lend-requests.json: signed requests made from fixed, public test seeds.
+3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_accrue.vk.rs:generic-api-key:12
+3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_fund.vk.rs:generic-api-key:12
+3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_init.vk.rs:generic-api-key:12
+3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_move.vk.rs:generic-api-key:12
+3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_touch.vk.rs:generic-api-key:12
+cb284372f09583b1d16eae83a4c7573795e33a9a:lend/program/src/verifier/redeem.vk.rs:generic-api-key:12
+cb284372f09583b1d16eae83a4c7573795e33a9a:lend/program/src/verifier/supply.vk.rs:generic-api-key:12
+cdab522fdf0ae5f7d23ba8e9f22e816e57ebcb51:lend/program/src/verifier/close.vk.rs:generic-api-key:12
+cdab522fdf0ae5f7d23ba8e9f22e816e57ebcb51:lend/program/src/verifier/deposit_add.vk.rs:generic-api-key:12
+cdab522fdf0ae5f7d23ba8e9f22e816e57ebcb51:lend/program/src/verifier/deposit_open.vk.rs:generic-api-key:12
+cdab522fdf0ae5f7d23ba8e9f22e816e57ebcb51:lend/program/src/verifier/draw.vk.rs:generic-api-key:12
+cdab522fdf0ae5f7d23ba8e9f22e816e57ebcb51:lend/program/src/verifier/liquidate.vk.rs:generic-api-key:12
+cdab522fdf0ae5f7d23ba8e9f22e816e57ebcb51:lend/program/src/verifier/repay.vk.rs:generic-api-key:12
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:13
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:15
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:16
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:24
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:26
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:31
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:31
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:42
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:44
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:49
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:49
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:62
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:64
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:69
+d0827d0ec046e07d37c0dfd72ae09d01cdb1354f:web/tests/fixtures/lend-requests.json:generic-api-key:69
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:16
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:17
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:28
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:44
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:44
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:58
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:63
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:63
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:79
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:84
+d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:generic-api-key:84
+fac9e9aaff3a2c8194b67da0d2abcc87128e3072:lend/program/src/verifier/cancel_intent.vk.rs:generic-api-key:12
+fac9e9aaff3a2c8194b67da0d2abcc87128e3072:lend/program/src/verifier/init_reserve.vk.rs:generic-api-key:12
+fac9e9aaff3a2c8194b67da0d2abcc87128e3072:lend/program/src/verifier/intent.vk.rs:generic-api-key:12
