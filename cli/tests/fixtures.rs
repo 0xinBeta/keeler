@@ -288,7 +288,7 @@ fn quote_signature() {
         );
         assert!(signed_by(&dealer.pubkey(), net, &rfq, &q));
     }
-    let mut wire = serde_json::to_value(&q).unwrap();
+    let mut wire = serde_json::to_value(q).unwrap();
     wire["buy_amount"] = json!(buy_amount.to_string());
     write_or_compare(
         "quote-sig.json",
