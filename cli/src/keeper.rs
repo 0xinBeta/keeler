@@ -1413,6 +1413,15 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 );
             }
         }
+        if book.reservation.as_ref().is_some_and(|r| {
+            r.until > now
+                && !book
+                    .pending
+                    .iter()
+                    .any(|q| q.owner_signed && q.wallet == r.wallet)
+        }) {
+            book.reservation = None;
+        }
         // Notes spent outside any record.
         let held: Vec<Note> = book
             .reserve
@@ -1489,7 +1498,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             self.merge_history(&self.keepers, false)?;
             return Ok(false);
         };
-        self.strike_lapsed(book.reservation.as_ref(), now);
+        self.strike_lapsed(now);
         if book.in_flight() {
             return Ok(false);
         }
@@ -1513,7 +1522,6 @@ impl<'a, L: Ledger> Keeper<'a, L> {
             Some(q) => self.liquidation(&book, &r, q, now)?,
             None => None,
         };
-        let mut liquidation_retries = false;
         if let Some(job) = job {
             let position = match &job {
                 Job::Liquidate { position, .. } => position.nullifier.clone(),
@@ -1524,7 +1532,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
                 Ok(ran) => return Ok(ran),
                 Err(e) if self.taken_elsewhere(&reserve, &position) => {
                     log!("lend: liquidation lost its reserve or position to another transaction; retry next pass: {e:#}");
-                    liquidation_retries = true;
+                    return Ok(false);
                 }
                 // That one waits; the rest of the queue goes on.
                 Err(e) => {
@@ -1544,7 +1552,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         self.fills_waiting
             .store(!fills.is_empty(), Ordering::Relaxed);
         self.priority_waiting.store(
-            liquidation_retries || fills.iter().any(|(_, j)| !matches!(j, Job::Supply { .. })),
+            fills.iter().any(|(_, j)| !matches!(j, Job::Supply { .. })),
             Ordering::Relaxed,
         );
         if book.reserved(now) {
@@ -2532,8 +2540,15 @@ impl<'a, L: Ledger> Keeper<'a, L> {
     /// Counts `r`, once it has lapsed, as a strike against its wallet; a
     /// first count also lets every waiting fill go before the next owner
     /// build.
-    fn strike_lapsed(&self, r: Option<&Reservation>, now: u64) {
-        let Some(r) = r.filter(|r| r.until <= now && r.until + HOUR > now) else {
+    fn strike_lapsed(&self, now: u64) {
+        let Ok(book) = self.book() else {
+            return;
+        };
+        let Some(r) = book
+            .reservation
+            .as_ref()
+            .filter(|r| r.until <= now && r.until + HOUR > now)
+        else {
             return;
         };
         let Ok(mut strikes) = self.strikes.lock() else {
@@ -2695,7 +2710,7 @@ impl<'a, L: Ledger> Keeper<'a, L> {
         };
         let now = self.ledger.now().map_err(internal)?;
         let book = self.snapshot().map_err(internal)?;
-        self.strike_lapsed(book.reservation.as_ref(), now);
+        self.strike_lapsed(now);
         if book.in_flight()
             || book.reserved_for_other(&w, now)
             || self.priority_waiting.load(Ordering::Relaxed)

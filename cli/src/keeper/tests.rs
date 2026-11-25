@@ -1071,10 +1071,9 @@ fn a_liquidation_preempts_a_reservation() {
     });
     assert_eq!(
         drain(&k),
-        vec![Op::Liquidate],
-        "the deposit waits for b's reservation"
+        vec![Op::Liquidate, Op::DepositAdd],
+        "b's build lost the reserve to the liquidation: its reservation goes"
     );
-    // b's build lost the reserve to the liquidation: it is dropped.
     let book = k.snapshot().unwrap();
     assert!(book.pending.is_empty(), "{:?}", book.pending);
 }
@@ -1724,6 +1723,26 @@ fn a_build_that_lands_late_is_no_strike() {
 }
 
 #[test]
+fn a_strike_is_counted_from_the_book_not_a_stale_snapshot() {
+    let s = Setup::new("strike-race", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    let p = k.snapshot().unwrap().pending[0].clone();
+    s.fake.advance(21);
+    let stale = k.snapshot().unwrap();
+    assert!(stale.reservation.is_some());
+    s.fake.land(&p);
+    k.resolve().unwrap();
+    k.strike_lapsed(now_of(&k));
+    let w = lender.addr().to_string();
+    assert!(
+        !k.cooling(&w, now_of(&k)).unwrap(),
+        "forgiven, not struck again"
+    );
+}
+
+#[test]
 fn rotating_wallets_hold_the_lane_little_of_an_hour() {
     let s = Setup::new("rotate", r#","limits":{"builds_per_wallet_hour":100000}"#);
     let k = s.keeper();
@@ -1792,23 +1811,74 @@ fn a_liquidation_beaten_to_the_reserve_by_an_owner_build_retries_at_once() {
     borrower(&s, &k, SOL, 7 * USD);
     assert_eq!(redeem(&k, &lender, USD).0, 200);
     let owner_build = k.snapshot().unwrap().pending[0].clone();
+    s.fake.advance(20);
     s.fake.w().quote = Some(Quote {
         low: 8 * DOLLAR,
         high: 8 * DOLLAR + 1,
         published: now_of(&k) as i64,
     });
+    let u = s.user();
+    let id = fund_intent(&s, &k, &u, purpose::SUPPLY, 1, 2 * USD);
     s.fake.w().race = Some(owner_build);
     assert!(k.step().is_ok());
     assert_eq!(
         s.fake.w().sent,
         vec![Op::Supply, Op::DepositOpen, Op::Liquidate]
     );
+    let book = k.snapshot().unwrap();
+    let t = ticket_of(&book, &id);
+    assert_eq!(
+        (t.attempts, t.retry_at),
+        (0, 0),
+        "no fill on the stale book"
+    );
     assert_eq!(
         redeem(&k, &lender, USD).0,
         409,
         "the liquidation keeps its turn"
     );
-    assert_eq!(drain(&k), vec![Op::Liquidate], "no 60 s wait");
+    assert_eq!(drain(&k), vec![Op::Liquidate, Op::Supply], "no 60 s wait");
+}
+
+#[test]
+fn a_late_build_landing_under_anothers_reservation_frees_the_lane() {
+    let s = Setup::new("freed", "");
+    let k = s.keeper();
+    let a = with_liquidity(&s, &k);
+    let b = with_liquidity(&s, &k);
+    assert_eq!(redeem(&k, &a, USD).0, 200);
+    let held = k.snapshot().unwrap().pending[0].clone();
+    s.fake.advance(20);
+    assert_eq!(redeem(&k, &a, USD).0, 409, "a lapsed");
+    s.fake.advance(1);
+    assert_eq!(redeem(&k, &b, USD).0, 200);
+    s.fake.advance(19);
+    s.fake.land(&held);
+    k.resolve().unwrap();
+    let book = k.snapshot().unwrap();
+    assert!(book.pending.is_empty() && book.reservation.is_none());
+    s.fake.advance(1);
+    assert_eq!(redeem(&k, &b, USD).0, 200, "b is not cooling");
+}
+
+#[test]
+fn a_liquidation_under_a_reservation_frees_the_lane() {
+    let s = Setup::new("freed-liq", "");
+    let k = s.keeper();
+    let lender = with_liquidity(&s, &k);
+    borrower(&s, &k, SOL, 7 * USD);
+    assert_eq!(redeem(&k, &lender, USD).0, 200);
+    s.fake.w().quote = Some(Quote {
+        low: 8 * DOLLAR,
+        high: 8 * DOLLAR + 1,
+        published: now_of(&k) as i64,
+    });
+    assert_eq!(drain(&k), vec![Op::Liquidate]);
+    let book = k.snapshot().unwrap();
+    assert!(book.pending.is_empty() && book.reservation.is_none());
+    s.fake.advance(20);
+    let (st, v) = redeem(&k, &lender, USD);
+    assert_eq!(st, 200, "the lender is not cooling: {v}");
 }
 
 #[test]
