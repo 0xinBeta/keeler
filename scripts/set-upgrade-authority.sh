@@ -10,7 +10,8 @@
 # genesis hash and the current authority's Keychain item. You type the new
 # authority's address again to confirm.
 #
-# Without --squads the new authority must be an existing system account.
+# Without --squads the new authority must be an existing system account,
+# and the plan must not be a mainnet one.
 # With --squads it is vault <vault-index> of that Squads v4 multisig, which
 # must be autonomous with threshold at least 2 (read from chain;
 # cli/src/deploy.rs `check_squads_vault`); the vault need not be funded.
@@ -43,6 +44,11 @@ fi
 [[ $# -eq 2 || $# -eq 3 ]] || usage
 plan=${3:-$root/target/devnet/deploy-plan.json}
 [[ -f $plan ]] || { echo "no plan at $plan; run scripts/deploy-devnet.sh first" >&2; exit 1; }
+# On mainnet the authority goes only to a checked Squads vault.
+if grep -q '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d' "$plan"; then
+    echo "refusing: $plan is a mainnet plan; on mainnet use --squads" >&2
+    exit 1
+fi
 cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --example deploy
 # stdin stays the terminal, for the typed confirmation.
 "$target/release/examples/deploy" set-authority "$plan" "$1" "$2"
