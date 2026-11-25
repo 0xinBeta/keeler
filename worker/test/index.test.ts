@@ -1046,7 +1046,7 @@ describe("/api/prices", () => {
     const missing = await call(req("/api/prices"), main());
     expect(missing.res.status).toBe(500);
     expect(missing.body.error).toMatch(/PRICE_RPC_URL is required on mainnet/);
-    for (const url of ["https://mainnet.helius-rpc.com/", "https://beta.helius-rpc.com/", "https://x.helius.xyz/", "http://prices.example/", "not a url"]) {
+    for (const url of ["https://mainnet.helius-rpc.com/", "https://beta.helius-rpc.com/", "https://x.helius.xyz/", "https://mainnet.helius-rpc.com./", "https://helius.dev../", "http://prices.example/", "not a url"]) {
       expect((await call(req("/api/prices"), main({ PRICE_RPC_URL: url }))).res.status, url).toBe(500);
     }
     mockFetch(rpcReply(account(), goodB()));
