@@ -44,8 +44,8 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | --- | --- | --- |
 | `HELIUS_API_KEY` | secret | Added as `api-key` to RPC, indexer and prover requests sent to the built-in Helius hosts only |
 | `DEALER_KEY` | secret | Sent to dealers as `x-keeler-key` |
-| `NETWORK` | var | `local`, `devnet` or `mainnet` |
-| `DEALERS` | var | JSON `[{"url","pubkey"}]` |
+| `NETWORK` | var | `local`, `devnet` or `mainnet`; any other value makes every `/api/` route a 500 |
+| `DEALERS` | var | JSON `[{"url","pubkey"}]`. Each `url` is `https://`; `http://` only on `local` (`DEALER_KEY` goes with every request) |
 | `UPSTREAM_RPC` | var | RPC URL. Default: `https://<network>.helius-rpc.com/`, or `http://127.0.0.1:8899` on `local` |
 | `UPSTREAM_SPR` | var | Base URL for both indexer and prover paths. Default: `https://<network>.helius-rpc.com/v1/spr` |
 | `UPSTREAM_INDEXER` | var | Overrides `UPSTREAM_SPR` for the indexer paths. Default on `local`: `http://127.0.0.1:8784` |
@@ -61,9 +61,9 @@ Cross-origin requests to `/api/*` and `/v1/*` are refused (403) and no CORS head
 | `LEND_PROGRAM_ID` | var | Lend program ID (base58) |
 | `LEND_POOLS` | var | JSON `[{"mint","curve":[{"utilisationBps","rateBps"}],"feeBps","maxUtilisationBps","minSupply"}]`. The curve has 2 to 8 points, utilisation strictly rising from 0 to 10000 |
 | `LEND_VAULTS` | var | JSON `[{"id","collateralMint","debtMint","cfBps","ltBps","lmlBps","penaltyBps","minCollateral","minDebt"}]`. `id` 0 to 65535 and unique, `debtMint` one of the pools, `cfBps <= ltBps <= lmlBps`. Every pool mint and collateral mint must also be in `ASSETS` (the page reads lend amounts with its decimals) |
-| `LEND_KEEPERS` | var | Optional JSON `[{"url","pubkey"}]`, 1 to 4 keepers in the order to ask them, no repeated `pubkey`. Unset: one keeper, at `LEND_KEEPER_URL` (or the first `DEALERS` entry's `url`) with the first `DEALERS` entry's `pubkey` |
-| `LEND_KEEPER_URL` | var | Optional `http(s)://` base URL of the lending keeper, used only without `LEND_KEEPERS`. Default: the first `DEALERS` entry's `url` |
-| `LEND_PAUSED` | var | `"1"` refuses every `build` and `supply` ticket with a 503, and sends the rest (`pools`, `account`, `repay` and `deposit` tickets) with `x-keeler-paused: 1`, so the keeper refuses a deposit that opens a position. Repayments and adding collateral keep working |
+| `LEND_KEEPERS` | var | Optional JSON `[{"url","pubkey"}]`, 1 to 4 keepers in the order to ask them, no repeated `pubkey`, each `url` `https://` (`http://` only on `local`). Unset: one keeper, at `LEND_KEEPER_URL` (or the first `DEALERS` entry's `url`) with the first `DEALERS` entry's `pubkey` |
+| `LEND_KEEPER_URL` | var | Optional `https://` (on `local` also `http://`) base URL of the lending keeper, used only without `LEND_KEEPERS`. Default: the first `DEALERS` entry's `url` |
+| `LEND_PAUSED` | var | `"1"` refuses `supply` tickets (new deposits into Earn) with a 503, and sends everything else (`pools`, `account`, `repay` and `deposit` tickets, every `build`) with `x-keeler-paused: 1`: the keeper then refuses a deposit that opens a position and any build that borrows. Repaying, topping up, withdrawing from Earn and withdrawing collateral keep working, and tickets issued before the switch still fill |
 
 ## Lending
 
@@ -75,8 +75,10 @@ keepers' public keys in order. The page shows lending only when `keepers` is the
 
 Each route goes to the first keeper with `x-keeler-key`. If it gives no reply, or a reply that is not
 the keeper's JSON (not JSON, an ok reply of the wrong shape or naming another keeper, an error without
-`{"error"}`), the Worker asks the next keeper once, with the same body. A keeper's own JSON reply
-stands, whatever its status. Limits are charged once per request, before the first keeper.
+`{"error"}`, such as a dealer whose keeper is still starting: 503 `{"starting"}`), the Worker asks the
+next keeper with the same body, and so on through the list (up to four). A keeper's own JSON reply
+stands, whatever its status. With none left the answer is the last failure: 503 "Lending is starting
+up" when the last keeper was starting, else 502. Limits are charged once per request, before the first keeper.
 Bodies and queries must have exactly the fields below (unknown fields are refused, 400);
 amounts and ids are decimal strings that fit a u64, `timestamp`, `expiry`, `now` and `at` are
 whole seconds, `vault` is 0 to 65535. The Worker forwards only the checked fields, and returns

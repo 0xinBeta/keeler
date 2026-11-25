@@ -26,17 +26,22 @@
 # read from chain. In order: build, checks, cost, deploy (typed
 # confirmation), the same marker checks on the deployed program data, hand
 # the upgrade authority to the vault (typed confirmation) and read it back,
-# then (lend) create the reserve with `keeler lend-init-reserve`. It creates
+# then (lend) create the reserve with `keeler deploy reserve create`, unless
+# it exists. A rerun after any failure redoes only what is missing (the
+# deploy and the hand-over are checked, not repeated). It creates
 # no token, runs no faucet and moves no inventory.
 #
 # Keychain items (Solana keypair JSON arrays), made by the owner before a real
 # run: keeler-mainnet-deploy (pays, the first upgrade authority, and the lend
 # admin: --admin and --payer are its address), keeler-mainnet-<program>-program
 # (its address is --program-id), keeler-mainnet-<program>-buffer; and the
-# Helius key in keeler-helius-api-key.
+# Helius key in keeler-helius-api-key. For lend, also the items the keeper
+# config names: its keeper key (`key` or `lend.key`), `lend.pool_key` and
+# `lend.admin_key` (keeler-mainnet-deploy); the reserve's creation signs with
+# the keeper key and the admin key, and the pool key gives the viewing key.
 #
-# Writes only target/mainnet-<program>/: plan.json, build.json (commit and
-# .so sha256), the .so, deployed.so, deployment.json, deploy.log, and the
+# Writes only target/mainnet-<program>/: plan.json, build.json (commit, tag
+# and .so sha256), reserve-scan.json (lend), the .so, deployed.so, deployment.json, deploy.log, and the
 # build directories.
 set -euo pipefail
 
@@ -173,6 +178,8 @@ dirty=$(git -C "$root" status --porcelain | grep -v '^?? \.tools$' || true)
 [[ -z $dirty ]] || die "the git tree is not clean:
 $dirty"
 commit=$(git -C "$root" rev-parse HEAD)
+# The operator checks this is the audited tag (docs/mainnet-runbook.md).
+tag=$(git -C "$root" describe --tags --exact-match HEAD 2>/dev/null || echo none)
 
 out=$root/target/mainnet-$program
 $estimate && out=$out/estimate
@@ -180,7 +187,7 @@ mkdir -p "$out"
 # Nothing here should print the Helius key; this catches it if a tool does.
 redact() { perl -pe 'BEGIN { $| = 1 } s/api-key=[^&"\s]+/api-key=REDACTED/g'; }
 exec > >(redact) 2> >(redact | tee -a "$out/deploy.log" >&2)
-echo "deploy-mainnet $program at $commit$($estimate && echo ' (estimate)')" >&2
+echo "deploy-mainnet $program at $commit (tag $tag)$($estimate && echo ' (estimate)')" >&2
 
 # The real build needs the ceremony's verifying keys committed: the test
 # ones refuse to compile without insecure-test-setup.
@@ -216,9 +223,30 @@ if ! $estimate && ! $build_only; then
 fi
 
 # The deploy tool: `keeler deploy` (cli/src/deploy.rs), in its own target.
-CARGO_TARGET_DIR=$root/target/mainnet-$program/cargo-tool cargo build --release --quiet \
-    --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
+# For lend it is built with the program's parameters, so its keeper checks
+# (the keeper set, the pool viewing key, the program ID) are the mainnet ones.
+lend_params() {
+    KEELER_LEND_PROGRAM_ID=${arg_program_id} KEELER_LEND_ADMIN=${arg_admin} \
+        KEELER_LEND_KEEPERS=${arg_keepers} KEELER_LEND_POOL_VIEWING=${arg_pool_viewing} \
+        KEELER_LEND_VAULT1_COLLATERAL_MINT=${arg_collateral_mint} \
+        KEELER_LEND_VAULT1_DEBT_MINT=${arg_debt_mint} \
+        KEELER_LEND_VAULT1_PRICE_ACCOUNT=${arg_price_account} \
+        KEELER_LEND_VAULT1_FEED_ID=${arg_feed_id} "$@"
+}
+unset KEELER_LEND_KEEPER
+tool=(env)
+[[ $program == lend ]] && tool=(lend_params)
+"${tool[@]}" env CARGO_TARGET_DIR="$root/target/mainnet-$program/cargo-tool" cargo build --release --quiet \
+    --locked --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
 keeler=$root/target/mainnet-$program/cargo-tool/release/keeler
+
+# Everything the reserve's creation checks (keys from the Keychain, keeper
+# in the set, pool viewing key, admin, network, the keeper's SOL), now:
+# after the hand-over a refusal there could only be fixed by a rerun.
+if [[ $program == lend ]] && ! $estimate && ! $build_only; then
+    KEELER_LEND_KEYS_DIR=${arg_keys_dir} "$keeler" deploy reserve check "${arg_keeper_config}" >&2 ||
+        die "the keeper config ${arg_keeper_config} cannot create the reserve; fix it before deploying"
+fi
 
 # The build. --estimate builds the same code with the committed test keys
 # (and without the mainnet feature, which refuses them): the size, and so
@@ -233,14 +261,7 @@ lend)
     rm -f "$so"
     (
         cd "$root/lend"
-        unset KEELER_LEND_KEEPER
-        KEELER_LEND_PROGRAM_ID=${arg_program_id} KEELER_LEND_ADMIN=${arg_admin} \
-            KEELER_LEND_KEEPERS=${arg_keepers} KEELER_LEND_POOL_VIEWING=${arg_pool_viewing} \
-            KEELER_LEND_VAULT1_COLLATERAL_MINT=${arg_collateral_mint} \
-            KEELER_LEND_VAULT1_DEBT_MINT=${arg_debt_mint} \
-            KEELER_LEND_VAULT1_PRICE_ACCOUNT=${arg_price_account} \
-            KEELER_LEND_VAULT1_FEED_ID=${arg_feed_id} \
-            CARGO_TARGET_DIR=$out/cargo cargo build-sbf --manifest-path program/Cargo.toml \
+        lend_params env CARGO_TARGET_DIR="$out/cargo" cargo build-sbf --manifest-path program/Cargo.toml \
             --tools-version v1.54 --sbf-out-dir "$out/deploy" -- --locked "${features[@]}"
     )
     ;;
@@ -268,8 +289,8 @@ swap)
 esac
 [[ -f $so ]] || die "the build left no $so"
 so_sha256=$(shasum -a 256 "$so" | awk '{print $1}')
-printf '{"program": "%s", "commit": "%s", "so_sha256": "%s", "estimate": %s}\n' \
-    "$program" "$commit" "$so_sha256" "$estimate" >"$out/build.json"
+printf '{"program": "%s", "commit": "%s", "tag": "%s", "so_sha256": "%s", "estimate": %s}\n' \
+    "$program" "$commit" "$tag" "$so_sha256" "$estimate" >"$out/build.json"
 echo "built $so: sha256 $so_sha256, commit $commit" >&2
 
 if $estimate; then
@@ -332,7 +353,9 @@ confirm "Hand the upgrade authority of ${arg_program_id} to vault $vault_index o
 cat "$out/authority.json" >&2
 
 if [[ $program == lend ]]; then
-    KEELER_LEND_KEYS_DIR=${arg_keys_dir} "$keeler" lend-init-reserve "${arg_keeper_config}" >&2
+    # "reserve exists" when an earlier run made it: a rerun finishes.
+    KEELER_LEND_KEYS_DIR=${arg_keys_dir} "$keeler" deploy reserve create "${arg_keeper_config}" \
+        "$out/reserve-scan.json" >&2
 fi
 
 python3 - "$out" "$commit" "$so_sha256" <<'EOF'

@@ -598,6 +598,21 @@ pub struct AuthorityPlan {
     pub deploy_key: KeySource,
 }
 
+impl AuthorityPlan {
+    /// The checked RPC and the deploy key; on mainnet only from the Keychain.
+    fn open(&self) -> Result<(SolanaRpc, Keypair)> {
+        ensure!(
+            self.genesis_hash != MAINNET_GENESIS
+                || matches!(self.deploy_key, KeySource::Keychain(_)),
+            "mainnet keys come from the Keychain, not a file; refusing"
+        );
+        Ok((
+            checked_rpc(&self.network, &self.genesis_hash)?,
+            self.deploy_key.keypair()?,
+        ))
+    }
+}
+
 impl MainnetPlan {
     fn program_plan(&self) -> ProgramPlan {
         ProgramPlan {
@@ -649,10 +664,73 @@ fn load<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     serde_json::from_str(&text).map_err(|e| anyhow!("plan {path}: {e}"))
 }
 
+/// `ExtendProgram` (loader v3 tag 6): grows `program`'s program data by
+/// `bytes`, rent paid by `payer`. Needs no upgrade authority's signature.
+fn extend_ix(program: &Address, payer: &Address, bytes: u32) -> Instruction {
+    loader_ix(
+        6,
+        &bytes.to_le_bytes(),
+        vec![
+            AccountMeta::new(program_data_address(program), false),
+            AccountMeta::new(*program, false),
+            AccountMeta::new_readonly(address(SYSTEM), false),
+            AccountMeta::new(*payer, true),
+        ],
+    )
+}
+
+/// SIMD-0431's least extension (`MINIMUM_EXTEND_PROGRAM_BYTES`).
+const MIN_EXTEND: u32 = 10_240;
+
+/// A keeper's SOL for the reserve's creation fee, checked before the deploy.
+const RESERVE_MIN_LAMPORTS: u64 = 50_000_000;
+
+/// The keeper config's admin and keeper connection, every check
+/// `keeler lend-init-reserve` makes before it sends, plus the mainnet ones:
+/// run before the deploy, so nothing fails after the hand-over that could
+/// have failed before it.
+fn reserve_parts(
+    path: &str,
+) -> Result<(crate::keeper::KeeperConfig, Keypair, crate::keeper::Parts)> {
+    let cfg = crate::keeper::KeeperConfig::load(path)?;
+    ensure!(
+        cfg.lend.network == "mainnet",
+        "lend.network is {:?}, not \"mainnet\"",
+        cfg.lend.network
+    );
+    let admin = cfg
+        .lend
+        .admin_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("lend.admin_key is not set (the deploy key's Keychain item)"))?
+        .keypair()?;
+    ensure!(
+        admin.pubkey() == keeler_lend::ADMIN,
+        "lend.admin_key is {}, not the program's ADMIN {}",
+        admin.pubkey(),
+        keeler_lend::ADMIN
+    );
+    let p = crate::keeper::connect(&cfg.lend, &cfg.network, &cfg.key)?;
+    let have = checked_rpc(&cfg.network, MAINNET_GENESIS)?
+        .get_balance(p.signer.pubkey())
+        .map_err(err)?;
+    ensure!(
+        have >= RESERVE_MIN_LAMPORTS,
+        "the keeper {} holds {}; fund it with at least {} for the reserve's creation",
+        p.signer.pubkey(),
+        sol(have),
+        sol(RESERVE_MIN_LAMPORTS)
+    );
+    Ok((cfg, admin, p))
+}
+
 pub const DEPLOY_USAGE: &str = "usage: keeler deploy viewing-key <keychain item>
        keeler deploy check <mainnet plan>
        keeler deploy program <mainnet plan> <write deployed bytes to>
-       keeler deploy hand-over <plan> <program> <squads multisig> <vault index>";
+       keeler deploy hand-over <plan> <program> <squads multisig> <vault index>
+       keeler deploy extend <plan> <program> <bytes>
+       keeler deploy reserve check <keeper config>
+       keeler deploy reserve create <keeper config> <scratch state file>";
 
 /// `keeler deploy ...`, for `scripts/deploy-mainnet.sh`,
 /// `scripts/deploy-lend-devnet.sh` and `scripts/set-upgrade-authority.sh`.
@@ -700,13 +778,11 @@ pub fn cli(args: &[String]) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         ["hand-over", path, program, multisig, index] => {
-            let plan: AuthorityPlan = load(path)?;
-            let rpc = checked_rpc(&plan.network, &plan.genesis_hash)?;
+            let (rpc, current) = load::<AuthorityPlan>(path)?.open()?;
             let (program, multisig) = (address_arg(program)?, address_arg(multisig)?);
             let index: u8 = index.parse().context("vault index")?;
             let vault = squads_vault(&multisig, index);
             let m = check_squads_vault(&rpc, &vault, &multisig, index)?;
-            let current = plan.deploy_key.keypair()?;
             match upgrade_authority(&rpc, &program)? {
                 Some(a) if a == vault => log!("{program}'s upgrade authority is already {vault}"),
                 Some(a) if a == current.pubkey() => hand_over(&rpc, &current, &program, &vault)?,
@@ -725,6 +801,55 @@ pub fn cli(args: &[String]) -> Result<()> {
                     "time_lock": m.time_lock,
                 })
             );
+        }
+        ["extend", path, program, bytes] => {
+            let (rpc, payer) = load::<AuthorityPlan>(path)?.open()?;
+            let program = address_arg(program)?;
+            let bytes: u32 = bytes.parse().context("bytes")?;
+            ensure!(
+                bytes >= MIN_EXTEND,
+                "extend by at least {MIN_EXTEND} bytes (SIMD-0431)"
+            );
+            upgrade_authority(&rpc, &program)?;
+            let before = deployed_bytes(&rpc, &program)?.len();
+            send(
+                &rpc,
+                &[extend_ix(&program, &payer.pubkey(), bytes)],
+                &payer,
+                &[&payer],
+            )
+            .context("extend the program data")?;
+            let after = deployed_bytes(&rpc, &program)?.len();
+            ensure!(
+                after == before + bytes as usize,
+                "program data reads back {after} bytes, not {}",
+                before + bytes as usize
+            );
+            println!(
+                "{}",
+                json!({"program_id": program.to_string(), "program_bytes": after})
+            );
+        }
+        ["reserve", "check", cfg] => {
+            let (_, admin, p) = reserve_parts(cfg)?;
+            println!(
+                "{}",
+                json!({"keeper": p.signer.pubkey().to_string(), "admin": admin.pubkey().to_string()})
+            );
+        }
+        ["reserve", "create", cfg, scan] => {
+            let (cfg, admin, p) = reserve_parts(cfg)?;
+            // The history of every keeper shows a reserve made by an earlier run.
+            let k = crate::keeper::Keeper::open(&cfg.lend, &p.chain, &p.signer, scan.into())?;
+            if k.snapshot()?.reserve.is_some() {
+                println!("reserve exists");
+            } else {
+                drop(k);
+                println!(
+                    "reserve created: {}",
+                    crate::lend_chain::init_reserve(&p.chain, &admin)?
+                );
+            }
         }
         _ => bail!("{DEPLOY_USAGE}"),
     }
@@ -1114,6 +1239,11 @@ mod tests {
         assert_eq!(&ix.data[12..20], &36u64.to_le_bytes());
         let w = loader_ix(1, &[9], vec![]);
         assert_eq!(w.data, vec![1, 0, 0, 0, 9]);
+        // ExtendProgram { additional_bytes: u32 } as bincode writes it.
+        let e = extend_ix(&a, &a, MIN_EXTEND);
+        assert_eq!(e.data, [6, 0, 0, 0, 0, 40, 0, 0]);
+        assert_eq!(e.accounts[0].pubkey, program_data_address(&a));
+        assert!(e.accounts[3].is_signer && e.accounts[3].is_writable);
         // An empty deployed tail must be zeros.
         let mut data = vec![0; PROGRAM_DATA_HEADER];
         data.extend([1, 2, 3, 0, 0]);

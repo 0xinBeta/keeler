@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Balance, Config, Keeler, LendAccount, Order } from "../keeler/index";
-import { Audience, ChainSees, Closing, Dealers, Facts, Faq, Features, LendFeatures, LendLiquidation, LendNumbers, LendPrivacy, Steps } from "./Landing";
+import { Audience, ChainSees, Closing, Dealers, Facts, Faq, Features, LendFeatures, LendLiquidation, LendNumbers, LendPrivacy, Steps, pairOf } from "./Landing";
 import { LendActivity } from "./Lend";
 import type { Market } from "./Lend";
 import { Orders } from "./Orders";
@@ -308,19 +308,19 @@ export function App({ keeler }: { keeler: Keeler }) {
             />
           )}
           <Features />
-          <ChainSees />
+          <ChainSees pair={pairOf(market)} />
           <Steps />
           {lend && (
             <>
-              <LendFeatures market={market} onOpen={openTab} />
-              <LendPrivacy />
-              <LendLiquidation />
+              <LendFeatures market={market} onOpen={openTab} pair={pairOf(market)} />
+              <LendPrivacy pair={pairOf(market)} />
+              <LendLiquidation pair={pairOf(market)} />
               <LendNumbers />
             </>
           )}
           <Audience />
           <Dealers />
-          <Faq lend={!!lend} />
+          <Faq lend={!!lend} pair={pairOf(market)} />
           <Closing onStart={startSwap} />
         </main>
       </div>

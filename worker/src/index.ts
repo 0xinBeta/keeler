@@ -99,6 +99,8 @@ const LOCAL = { rpc: "http://127.0.0.1:8899", indexer: "http://127.0.0.1:8784", 
 const CSP =
   "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'";
 
+const NETWORKS = ["local", "devnet", "mainnet"];
+
 class Fail extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
@@ -127,6 +129,7 @@ export default {
 
 async function api(request: Request, env: Env, url: URL, path: string): Promise<Response> {
     try {
+      if (!NETWORKS.includes(env.NETWORK)) throw new Fail(500, "The server setting NETWORK is not local, devnet or mainnet.");
       const origin = request.headers.get("origin");
       if (origin !== null && origin !== url.origin) throw new Fail(403, "Cross-origin requests are not allowed.");
       if (path === "/api/config") return only(request, "GET") ?? json(config(env));
@@ -213,9 +216,12 @@ function parsed(value: unknown, name: string): unknown {
   }
 }
 
+/** A dealer or keeper URL: https, or http too on a local network (DEALER_KEY goes with every request). */
+const upstreamUrl = (env: Env, v: unknown) => typeof v === "string" && (env.NETWORK === "local" ? /^https?:\/\/[^\s/]+/ : /^https:\/\/[^\s/]+/).test(v);
+
 function dealers(env: Env): { url: string; pubkey: string }[] {
   const list = parsed(env.DEALERS ?? [], "DEALERS");
-  if (!Array.isArray(list) || !list.every((d) => typeof d?.url === "string" && typeof d?.pubkey === "string")) {
+  if (!Array.isArray(list) || !list.every((d) => upstreamUrl(env, d?.url) && typeof d?.pubkey === "string")) {
     throw new Fail(500, "The server setting DEALERS is malformed.");
   }
   return list;
@@ -788,7 +794,7 @@ const LEND_ROUTES: Record<string, LendRoute> = {
  * entry's url) under the first DEALERS entry's key. Empty when none is configured.
  */
 function keepers(env: Env): { url: string; pubkey: string }[] {
-  const url = /^https?:\/\/[^\s/]+/;
+  const url = { test: (v: unknown) => upstreamUrl(env, v) };
   if (env.LEND_KEEPERS !== undefined) {
     const raw = parsed(env.LEND_KEEPERS, "LEND_KEEPERS");
     const ok = Array.isArray(raw) && raw.length > 0 && raw.length <= 4 &&
@@ -871,7 +877,8 @@ export async function signedByWallet(env: Env, method: string, keeperPath: strin
   return ed25519(f.sessionKey as string, f.signature as string, message);
 }
 
-const LEND_PAUSED_TEXT = "Lending is paused: no new deposits, loans or withdrawals for now. Repayments, deposits into an open position and refunds of unfilled requests still work.";
+const LEND_PAUSED_TEXT = "Lending is paused: no new deposits into Earn, new positions or borrowing for now. Repayments, top-ups and withdrawals still work.";
+const LEND_STARTING_TEXT = "Lending is starting up. Try again in a minute.";
 
 async function lend(request: Request, env: Env, url: URL, path: string): Promise<Response> {
   const route = Object.hasOwn(LEND_ROUTES, path) ? LEND_ROUTES[path]! : undefined;
@@ -890,10 +897,11 @@ async function lend(request: Request, env: Env, url: URL, path: string): Promise
     body = JSON.stringify(clean);
     fields = clean;
   } else if (url.search !== "") throw new Fail(400, `${route.keeper} takes no query.`);
-  // LEND_PAUSED, the Worker's lending switch for every keeper: reads, repayments and deposits into an open position
-  // pass. Only the keeper knows whether a deposit's position is open, so a deposit ticket goes on marked paused.
+  // LEND_PAUSED, the Worker's lending switch for every keeper: it refuses new Earn deposits itself and marks the rest
+  // `x-keeler-paused`, so the keeper refuses opening a position and any build that borrows; reads, repayments, top-ups
+  // and withdrawals pass (only the keeper knows whether a deposit's position is open or a build borrows).
   const paused = env.LEND_PAUSED === "1";
-  if (paused && (route.request === BUILD_REQUEST || (route.request === TICKET_REQUEST && fields.purpose === "supply"))) throw new Fail(503, LEND_PAUSED_TEXT);
+  if (paused && route.request === TICKET_REQUEST && fields.purpose === "supply") throw new Fail(503, LEND_PAUSED_TEXT);
   const key = dealerKey(env);
   const list = keepers(env);
   if (list.length === 0) throw new Fail(503, "No lending keeper is configured.");
@@ -909,11 +917,11 @@ async function lend(request: Request, env: Env, url: URL, path: string): Promise
   const global = route.limits[1];
   if (global !== null && !(path === "/api/lend/ticket" && fields.purpose === "repay")) await limit(env, global, request, 1, true);
 
-  // The first keeper, then the next once, only when there was no answer or the answer is not the keeper's JSON (a
-  // tunnel's error page, a malformed reply); a keeper's own refusal or 5xx is its answer. A retried ticket may leave
-  // an unused one on the first keeper; it expires.
+  // Each keeper in order, the next only when there was no answer or the answer is not the keeper's JSON (a tunnel's
+  // error page, a malformed reply, a keeper still starting inside its dealer: 503 {"starting"}); a keeper's own
+  // refusal or 5xx with an `error` is its answer. A retried ticket may leave an unused one on a keeper; it expires.
   let failure = new Fail(502, "The lending keeper did not answer.");
-  for (const k of list.slice(0, 2)) {
+  for (const k of list) {
     const response = await askDealer(k.url, route.keeper, key, body, route.timeoutMs, paused ? { "x-keeler-paused": "1" } : {});
     if (response === null) {
       failure = new Fail(502, "The lending keeper did not answer.");
@@ -933,7 +941,8 @@ async function lend(request: Request, env: Env, url: URL, path: string): Promise
     }
     const error = (reply as { error?: unknown } | null)?.error;
     if (typeof error !== "string") {
-      failure = new Fail(502, "The lending keeper could not do this right now.");
+      const starting = response.status === 503 && typeof (reply as { starting?: unknown } | null)?.starting === "string";
+      failure = starting ? new Fail(503, LEND_STARTING_TEXT) : new Fail(502, "The lending keeper could not do this right now.");
       continue;
     }
     if (response.status >= 400 && response.status < 500) return json({ error: error.slice(0, 200) }, response.status);

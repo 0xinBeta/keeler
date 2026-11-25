@@ -31,8 +31,20 @@ const worker = {
     proxy.on("proxyReq", (req) => req.removeHeader("origin")),
 };
 
+// index.html says "test tokens only"; a mainnet build (VITE_NETWORK=mainnet) drops that sentence.
+export const pageHtml = (html: string, network: string | undefined) =>
+  network === "mainnet" ? html.replace(" Test version, test tokens only, unaudited.", "") : html;
+const description = () => {
+  let network: string | undefined;
+  return {
+    name: "keeler-page-description",
+    configResolved: (c: { env: Record<string, string | undefined> }) => void (network = c.env.VITE_NETWORK),
+    transformIndexHtml: (html: string) => pageHtml(html, network),
+  };
+};
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), description()],
   define: { __KEELER_SWAP_ARTIFACTS__: JSON.stringify({ make: swapPins("make"), cancel: swapPins("cancel") }), __KEELER_LEND_PINS__: JSON.stringify(lendPins()) },
   server: { proxy: { "/api": worker, "/v1/spr": worker } },
   // The Worker's CSP allows fonts from 'self' only, so small font files must not be inlined as data: URIs.
