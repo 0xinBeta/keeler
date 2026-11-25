@@ -136,7 +136,22 @@ binary finds the proving keys (`SWAP_KEYS_DIR`).
     rewrites the Worker's `DEALERS` (backing off on failure) when the
     `*-*.trycloudflare.com` URL changes.
   - `set-upgrade-authority.sh` hands the authority to an existing
-    system-owned account after you type its address again.
+    system-owned account after you type its address again. With
+    `--squads <multisig> <vault-index> <program> [plan]` it hands it to that
+    Squads v4 vault instead, after checking the multisig (threshold 2 or more,
+    no config authority) and a typed confirmation.
+- `scripts/deploy-lend-devnet.sh [--estimate] [name]`: the lend program on
+  devnet, with the dealer (and an optional standby) as keepers and a pool key
+  of its own (`docs/lend-deploy.md`). `--estimate` sends nothing and creates
+  no Keychain items.
+- `scripts/deploy-mainnet.sh swap|lend [--estimate] ...`: the mainnet deploy
+  (`docs/mainnet-runbook.md`). Every parameter is given explicitly; it
+  refuses a dirty tree, a non-mainnet RPC, a test-price build, verifying keys
+  that are not the ceremony manifest's, and a Squads multisig that one key
+  controls. `--build-only` builds and checks for an upgrade through the
+  multisig; `--check-so` checks an existing `.so`. Until the key ceremony's
+  verifying keys are committed it stops with `no key ceremony yet`;
+  `--estimate` works before that.
 - Dealer HTTP (loopback only, every request carries `x-keeler-key`, 4 KiB
   body cap), amounts as decimal strings:
   `POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` ->
