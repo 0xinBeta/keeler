@@ -90,7 +90,7 @@ describe("a mainnet build", () => {
       "Try it with free test tokens.",
       "Illustrative borrow capacity",
       "Illustrative position of 4 tSOL against 420 tUSD debt.",
-      "Running the keeper in an attested enclave, so that Keeler's operators cannot read amounts, is planned.",
+      "Running the keeper in an attested enclave, so that anyone can check which code holds its keys, is planned.",
       "85% loan-to-value for tSOL → tUSD",
       "Not yet.",
     ])
