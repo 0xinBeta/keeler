@@ -9,17 +9,20 @@ use solana_address::Address;
 use solana_keypair::Keypair;
 use spr_client::Rpc;
 
-/// Where a secret comes from. `file` is for local test keys only.
+/// Where a secret comes from. `file` is for local test keys only; `env`
+/// names an environment variable, for a container that has no Keychain.
+/// Mainnet takes only `keychain`.
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeySource {
     File(PathBuf),
     Keychain(String),
+    Env(String),
 }
 
 impl KeySource {
-    pub fn is_file(&self) -> bool {
-        matches!(self, KeySource::File(_))
+    pub fn is_keychain(&self) -> bool {
+        matches!(self, KeySource::Keychain(_))
     }
 
     pub fn secret(&self) -> Result<String> {
@@ -29,6 +32,7 @@ impl KeySource {
                 .trim()
                 .to_owned(),
             KeySource::Keychain(name) => keychain_secret(name)?,
+            KeySource::Env(name) => env_secret(name)?,
         })
     }
 
@@ -46,9 +50,11 @@ impl KeySource {
 pub enum Prover {
     /// The local prover (`ZOLANA_PROVER_URL`), with proof data from our indexer.
     Local,
-    /// Helius's attested prover, which serves at the indexer URL. `keychain`
-    /// holds the API key, bare or as a Helius URL with an `api-key` parameter.
-    Helius { keychain: String },
+    /// Helius's attested prover, which serves at the indexer URL. The key
+    /// source holds the API key, bare or as a Helius URL with an `api-key`
+    /// parameter: `{"helius":{"keychain":"<item>"}}` or
+    /// `{"helius":{"env":"<variable>"}}`.
+    Helius(KeySource),
 }
 
 /// The highest priority fee a config may set, micro-lamports per compute
@@ -80,11 +86,11 @@ impl Network {
     pub fn urls(&self) -> Result<(String, String)> {
         match &self.prover {
             Prover::Local => Ok((self.rpc_url.clone(), self.indexer_url.clone())),
-            Prover::Helius { keychain } => {
+            Prover::Helius(source) => {
                 // The key only ever goes to Helius.
                 helius_host(&self.rpc_url)?;
                 helius_host(&self.indexer_url)?;
-                let key = helius_key(&keychain_secret(keychain)?)?;
+                let key = helius_key(&source.secret()?)?;
                 Ok((
                     with_api_key(&self.rpc_url, &key)?,
                     with_api_key(&self.indexer_url, &key)?,
@@ -93,16 +99,25 @@ impl Network {
         }
     }
 
+    /// Whether every secret this network reads comes from the Keychain, as
+    /// mainnet requires.
+    pub fn key_from_keychain(&self) -> bool {
+        match &self.prover {
+            Prover::Local => true,
+            Prover::Helius(source) => source.is_keychain(),
+        }
+    }
+
     pub fn check(&self) -> Result<()> {
         ensure!(
             self.priority_fee <= MAX_PRIORITY_FEE,
             "network.priority_fee must be at most {MAX_PRIORITY_FEE} micro-lamports per compute unit"
         );
-        if let Prover::Helius { .. } = self.prover {
+        if let Prover::Helius(_) = self.prover {
             for url in [&self.rpc_url, &self.indexer_url] {
                 ensure!(
                     !url.contains("api-key"),
-                    "put the Helius key in the Keychain, not the URL"
+                    "put the Helius key in its key source, not the URL"
                 );
                 helius_host(url)?;
             }
@@ -292,6 +307,22 @@ pub struct Http {
     pub listen: SocketAddr,
     /// The shared secret every request carries in `x-keeler-key`.
     pub key: KeySource,
+    /// Accept requests from any address, not only loopback; every route
+    /// still needs the key. For a host whose own gateway is the only way
+    /// in. Refused on mainnet.
+    #[serde(default)]
+    pub allow_remote: bool,
+}
+
+impl Http {
+    /// The listen address is loopback unless `allow_remote` is set.
+    pub fn check(&self) -> Result<()> {
+        ensure!(
+            self.allow_remote || self.listen.ip().is_loopback(),
+            "http.listen must be a loopback address unless http.allow_remote is set"
+        );
+        Ok(())
+    }
 }
 
 /// Test tokens and fee SOL for a wallet, paid by `key`, which is the mint
@@ -357,10 +388,7 @@ impl DealerConfig {
             "listen must be a loopback address"
         );
         if let Some(http) = &self.http {
-            ensure!(
-                http.listen.ip().is_loopback(),
-                "http.listen must be a loopback address"
-            );
+            http.check()?;
         }
         if let Some(f) = &self.faucet {
             for t in &f.tokens {
@@ -550,6 +578,16 @@ fn feed_id(id: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// The trimmed value of the environment variable `name`. An unset or empty
+/// variable is an error that names the variable, never a value.
+fn env_secret(name: &str) -> Result<String> {
+    let value =
+        std::env::var(name).map_err(|_| anyhow!("environment variable {name} is not set"))?;
+    let value = value.trim();
+    ensure!(!value.is_empty(), "environment variable {name} is empty");
+    Ok(value.to_owned())
+}
+
 /// Reads a secret from the macOS Keychain. The name is passed as an argument,
 /// never through a shell, and the secret is never logged.
 pub fn keychain_secret(name: &str) -> Result<String> {
@@ -606,6 +644,89 @@ mod tests {
     }
 
     #[test]
+    fn env_key_source_reads_one_trimmed_variable() {
+        let src: KeySource = serde_json::from_str(r#"{"env":"KEELER_TEST_ENV_KEY"}"#).unwrap();
+        assert!(!src.is_keychain());
+        let unset = format!("{:#}", src.secret().err().unwrap());
+        assert_eq!(unset, "environment variable KEELER_TEST_ENV_KEY is not set");
+        std::env::set_var("KEELER_TEST_ENV_KEY", "  \n");
+        let empty = format!("{:#}", src.secret().err().unwrap());
+        assert_eq!(empty, "environment variable KEELER_TEST_ENV_KEY is empty");
+        std::env::set_var("KEELER_TEST_ENV_KEY", " SECRET-value\n");
+        assert_eq!(src.secret().unwrap(), "SECRET-value");
+        std::env::set_var("KEELER_TEST_ENV_KEY", "SECRET-not-a-keypair");
+        let err = format!("{:#}", src.keypair().err().unwrap());
+        assert!(!err.contains("SECRET"), "{err}");
+        std::env::remove_var("KEELER_TEST_ENV_KEY");
+    }
+
+    #[test]
+    fn helius_key_source_takes_the_old_and_new_shapes() {
+        let prover = |p: &str| serde_json::from_str::<Prover>(p).unwrap();
+        assert!(matches!(
+            prover(r#"{"helius":{"keychain":"k"}}"#),
+            Prover::Helius(KeySource::Keychain(k)) if k == "k"
+        ));
+        assert!(matches!(
+            prover(r#"{"helius":{"env":"HELIUS"}}"#),
+            Prover::Helius(KeySource::Env(v)) if v == "HELIUS"
+        ));
+        assert!(matches!(prover(r#""local""#), Prover::Local));
+        let net = |p: &str| Network {
+            rpc_url: "https://devnet.helius-rpc.com".into(),
+            indexer_url: "https://devnet.helius-rpc.com/v1/spr".into(),
+            prover: prover(p),
+            priority_fee: 0,
+        };
+        assert!(net(r#"{"helius":{"keychain":"k"}}"#).key_from_keychain());
+        assert!(!net(r#"{"helius":{"env":"H"}}"#).key_from_keychain());
+        assert!(!net(r#"{"helius":{"file":"h"}}"#).key_from_keychain());
+        assert!(net(r#""local""#).key_from_keychain());
+        std::env::set_var(
+            "KEELER_TEST_HELIUS",
+            "https://devnet.helius-rpc.com/?api-key=ab-12",
+        );
+        let (rpc, indexer) = net(r#"{"helius":{"env":"KEELER_TEST_HELIUS"}}"#)
+            .urls()
+            .unwrap();
+        std::env::remove_var("KEELER_TEST_HELIUS");
+        assert_eq!(rpc, "https://devnet.helius-rpc.com/?api-key=ab-12");
+        assert_eq!(
+            indexer,
+            "https://devnet.helius-rpc.com/v1/spr?api-key=ab-12"
+        );
+    }
+
+    #[test]
+    fn allow_remote_opens_only_the_http_listener() {
+        let http = |listen: &str, allow: &str| {
+            dealer_json(&format!(
+                r#""quote_ttl_secs":30,"settle_margin_secs":5,
+                "http":{{"listen":"{listen}","key":{{"env":"K"}}{allow}}}"#
+            ))
+        };
+        let open = DealerConfig::from_json(&http("0.0.0.0:47500", r#","allow_remote":true"#));
+        assert!(open.unwrap().http.unwrap().allow_remote);
+        assert!(DealerConfig::from_json(&http("0.0.0.0:47500", "")).is_err());
+        assert!(
+            DealerConfig::from_json(&http("0.0.0.0:47500", r#","allow_remote":false"#)).is_err()
+        );
+        let local = DealerConfig::from_json(&http("127.0.0.1:47500", "")).unwrap();
+        assert!(!local.http.unwrap().allow_remote);
+        let tcp_open = http("0.0.0.0:47500", r#","allow_remote":true"#)
+            .replace("127.0.0.1:47001", "0.0.0.0:47001");
+        assert!(
+            DealerConfig::from_json(&tcp_open).is_err(),
+            "the quote protocol stays on loopback"
+        );
+        let no_key = dealer_json(
+            r#""quote_ttl_secs":30,"settle_margin_secs":5,
+            "http":{"listen":"0.0.0.0:47500","allow_remote":true}"#,
+        );
+        assert!(DealerConfig::from_json(&no_key).is_err());
+    }
+
+    #[test]
     fn band_must_be_below_10000() {
         assert!(TraderConfig::from_json(&trader_json(9_999, B)).is_ok());
         assert!(TraderConfig::from_json(&trader_json(10_000, B)).is_err());
@@ -657,9 +778,7 @@ mod tests {
         let net = |url: &str| Network {
             rpc_url: url.into(),
             indexer_url: "https://devnet.helius-rpc.com/v1/spr".into(),
-            prover: Prover::Helius {
-                keychain: "k".into(),
-            },
+            prover: Prover::Helius(KeySource::Keychain("k".into())),
             priority_fee: 0,
         };
         assert!(net("https://devnet.helius-rpc.com").check().is_ok());
@@ -722,9 +841,7 @@ mod tests {
         let net = Network {
             rpc_url: "https://mainnet.helius-rpc.com".into(),
             indexer_url: "https://mainnet.helius-rpc.com/v1/spr".into(),
-            prover: Prover::Helius {
-                keychain: "keeler-helius-api-key".into(),
-            },
+            prover: Prover::Helius(KeySource::Keychain("keeler-helius-api-key".into())),
             priority_fee: 0,
         };
         let (rpc_url, _) = net.urls().unwrap();

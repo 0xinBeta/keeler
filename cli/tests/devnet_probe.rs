@@ -2,7 +2,7 @@
 //! `cargo test -p keeler --test devnet_probe -- --ignored --nocapture`.
 //! Nothing here sends a transaction: simulation only, signatures unchecked.
 use keeler::{
-    config::{redact, Network, Prover},
+    config::{redact, KeySource, Network, Prover},
     deploy::{address, create_mint, MINT_LEN},
 };
 use solana_address::Address;
@@ -39,9 +39,7 @@ fn devnet_pool_interface_takes_any_authority() {
     let net = Network {
         rpc_url: "https://devnet.helius-rpc.com".into(),
         indexer_url: "https://devnet.helius-rpc.com/v1/spr".into(),
-        prover: Prover::Helius {
-            keychain: "keeler-helius-api-key".into(),
-        },
+        prover: Prover::Helius(KeySource::Keychain("keeler-helius-api-key".into())),
         priority_fee: 0,
     };
     let (url, _) = net.urls().unwrap();

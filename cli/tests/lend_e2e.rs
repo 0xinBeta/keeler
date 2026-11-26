@@ -560,6 +560,7 @@ fn session_as<T>(
                 &NoSwap,
                 Some(&k),
                 Duration::from_secs(3),
+                false,
             )
         });
         let out = f(&k);
