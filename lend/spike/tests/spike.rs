@@ -4,7 +4,7 @@
 //! `ZOLANA_PROVER_URL` (port 3001 + offset / 100), the tool paths from
 //! `.tools/env`, and the SBF build in `lend/target/deploy`:
 //! `cargo test --release -p lend-spike --features circuits --test spike -- --nocapture`.
-#[path = "wallet.rs"]
+#[path = "../../../.tools/privacy-ring-examples/test-utils/wallet.rs"]
 mod wallet;
 
 use std::{
