@@ -560,25 +560,26 @@ const ACTIONS: [Action, string][] = [
   ["withdraw", "Withdraw"],
 ];
 
-export function healthState(h: number, v: Vault): "healthy" | "close" | "liquidatable" {
-  return liquidatable(h, v) ? "liquidatable" : h > v.collateralFactorBps ? "close" : "healthy";
+type HealthState = "healthy" | "close" | "liquidatable";
+export function healthState(collateral: bigint, debt: bigint, v: Vault): HealthState {
+  return liquidatable(collateral, debt, v) ? "liquidatable" : healthBps(collateral, debt, v.price) > v.collateralFactorBps ? "close" : "healthy";
 }
 const STATE_LABEL = { healthy: "Healthy", close: "Close to liquidation", liquidatable: "Liquidatable" } as const;
 
-export function HealthBar({ health, vault, after }: { health: number; vault: Vault; after?: number }) {
+type Reading = { health: number; state: HealthState };
+export function HealthBar({ health, state: st, vault, after }: Reading & { vault: Vault; after?: Reading }) {
   const w = (h: number) => `${Math.min(Number.isFinite(h) ? h : 10_000, 10_000) / 100}%`;
-  const st = healthState(health, vault);
   return (
     <div className="health">
       <div className="health-head">
         <span className="instrument-label">Loan-to-value</span>
         <span className="num">
           {pct(health)}
-          {after !== undefined && after !== health && (
+          {after && after.health !== health && (
             <>
               <span className="muted" aria-hidden="true"> → </span>
               <span className="sr-only"> after: </span>
-              <span className={healthState(after, vault) === "healthy" ? "" : "bad"}>{pct(after)}</span>
+              <span className={after.state === "healthy" ? "" : "bad"}>{pct(after.health)}</span>
             </>
           )}
         </span>
@@ -593,7 +594,7 @@ export function HealthBar({ health, vault, after }: { health: number; vault: Vau
         aria-valuetext={`${pct(health)}, ${STATE_LABEL[st].toLowerCase()}`}
       >
         <span className="health-fill" style={{ width: w(health) }} />
-        {after !== undefined && after !== health && <span className="health-after" style={{ left: w(after) }} />}
+        {after && after.health !== health && <span className="health-after" style={{ left: w(after.health) }} />}
         <span className="health-mark" style={{ left: w(vault.collateralFactorBps) }} />
         <span className="health-mark health-mark-lt" style={{ left: w(vault.liquidationThresholdBps) }} />
       </div>
@@ -644,7 +645,7 @@ function borrowForm(p: LendProps, vault: Vault, pool: Pool, action: Action, text
   const d2 = act === "borrow" ? d + amt : act === "repay" ? (amt > d ? 0n : d - amt) : d;
   const h = healthBps(c, d, vault.price);
   const h2 = healthBps(c2, d2, vault.price);
-  return { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2 };
+  return { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2, st: healthState(c, d, vault), st2: healthState(c2, d2, vault) };
 }
 
 export function BorrowTab(p: DeskProps) {
@@ -680,10 +681,9 @@ export function BorrowTab(p: DeskProps) {
       </DeskLayout>
     );
 
-  const { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2 } = form;
-  const lp = liquidationPrice(c, d, vault.liquidationThresholdBps);
-  const lp2 = liquidationPrice(c2, d2, vault.liquidationThresholdBps);
-  const st = healthState(h, vault);
+  const { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2, st, st2 } = form;
+  const lp = liquidationPrice(c, d, vault);
+  const lp2 = liquidationPrice(c2, d2, vault);
   // Repaying "all": the debt plus two minutes of interest; anything above the debt comes back as change.
   // Interest keeps accruing until the keeper's transaction lands; the overpayment comes back as change.
   const repayAll = grow(d, pool.borrowAprBps, 120) + d / 100n + 1n;
@@ -771,7 +771,7 @@ export function BorrowTab(p: DeskProps) {
               </dd>
             </div>
           </dl>
-          <HealthBar health={h} vault={vault} after={shown || amt > 0n ? h2 : undefined} />
+          <HealthBar health={h} state={st} vault={vault} after={shown || amt > 0n ? { health: h2, state: st2 } : undefined} />
         </section>
       ) : (
         <section className="rail-panel mine" aria-label="Your position">
@@ -873,7 +873,7 @@ export function BorrowTab(p: DeskProps) {
               <dl className="form-summary kv-preview" aria-live="polite">
                 <div>
                   <dt>Loan-to-value after</dt>
-                  <dd className={`num${healthState(h2, vault) === "healthy" ? "" : " bad"}`}>{d2 === 0n ? "No debt" : pct(h2)}</dd>
+                  <dd className={`num${st2 === "healthy" ? "" : " bad"}`}>{d2 === 0n ? "No debt" : pct(h2)}</dd>
                 </div>
                 <div>
                   <dt>Liquidation price after</dt>

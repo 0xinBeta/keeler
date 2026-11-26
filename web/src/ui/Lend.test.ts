@@ -12,21 +12,26 @@ const vault: Vault = {
   minCollateral: 0n, minDebt: 0n, price: 142_370_000_000n, confidence: 0n, priceTime: 0,
 };
 
-test("health states follow the borrow limit and the threshold", () => {
-  expect(healthState(7000, vault)).toBe("healthy");
-  expect(healthState(8000, vault)).toBe("healthy");
-  expect(healthState(8200, vault)).toBe("close");
-  expect(healthState(8500, vault)).toBe("close");
-  expect(healthState(8501, vault)).toBe("liquidatable");
+test("health states follow the borrow limit and the keeper's liquidation test", () => {
+  const SOL = 1_000_000_000n;
+  expect(healthState(SOL, 99_000000n, vault)).toBe("healthy");
+  expect(healthState(SOL, 113_896000n, vault)).toBe("healthy");
+  expect(healthState(SOL, 117_000000n, vault)).toBe("close");
+  expect(healthState(SOL, 121_500000n, vault)).toBe("close");
+  expect(healthState(SOL, 124_000000n, vault)).toBe("liquidatable");
+  expect(healthState(0n, 1n, vault)).toBe("liquidatable");
 });
 
-test("the health bar is a labelled meter with its state and the preview", () => {
-  const html = renderToStaticMarkup(createElement(HealthBar, { health: 8700, vault, after: 7000 }));
+test("the health bar is a labelled meter that draws the state it is given", () => {
+  const html = renderToStaticMarkup(createElement(HealthBar, { health: 8700, state: "liquidatable", vault, after: { health: 7000, state: "healthy" } }));
   expect(html).toContain('role="meter"');
   expect(html).toContain('aria-valuetext="87.0%, liquidatable"');
   expect(html).toContain("health-liquidatable");
   expect(html).toContain("70.0%");
   expect(html).toContain("85% liquidation");
+  const band = renderToStaticMarkup(createElement(HealthBar, { health: 8534, state: "close", vault }));
+  expect(band).toContain('aria-valuetext="85.3%, close to liquidation"');
+  expect(band).toContain("health-close");
 });
 
 test("the liquidation note says what the liquidation left, not what a later repayment did", () => {
