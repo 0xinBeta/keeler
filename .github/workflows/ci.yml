@@ -1,7 +1,7 @@
 name: CI
 
 # Gates pull requests to main; also runs on every push, so a branch is checked before its pull request.
-# A branch's push run and its pull request run share one concurrency group: the later one cancels the earlier.
+# Runs are grouped by pull request number, else by ref: a later run in a group cancels the earlier one.
 # Only main saves the cargo cache.
 # The slow suites are in slow.yml and gate nothing.
 
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.head_ref || github.ref_name }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
