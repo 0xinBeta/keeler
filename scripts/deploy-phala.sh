@@ -6,12 +6,20 @@
 # container logs are not public.
 #
 #   scripts/deploy-phala.sh [--publish] [--registry-user <github user>]
+#                           [--instance-type <type>]
 #
 #   --publish        also write the Worker secrets DEALERS and LEND_KEEPERS
 #                    with the CVM's URLs (the cut-over; wrangler logged in).
 #   --registry-user  pull a private ghcr.io image as this GitHub user, with
 #                    the token in the Keychain item keeler-phala-ghcr-token
 #                    (read:packages).
+#   --instance-type  the CVM size, on create and on update (default tdx.medium).
+#
+# The cut-over, in order: pause the Worker, wait until the open tickets and
+# quotes have run out, stop the Mac's `keeler dealer` and `keeler keeper`
+# (the script refuses to run while either does), deploy, check, then publish
+# (--publish). The CVM starts from empty volumes: the Mac's tickets, builds
+# in flight and quote book do not carry over.
 #
 # Handed to the CVM, by Keychain item: the dealer key (also the primary
 # keeper's), the standby keeper key, the pool key, the HTTP key, the faucet
@@ -20,7 +28,7 @@
 # and buffer keys. Every secret is read from the Keychain here and reaches
 # the phala CLI through a pipe (-e /dev/fd/3): never an argument, never a
 # file. The Phala API key (Keychain item keeler-phala-api-key) goes into the
-# CLI's environment. No Terraform: its state would hold the secrets in
+# environment of each phala call only. No Terraform: its state would hold the secrets in
 # clear. Needs Node and `npm ci --ignore-scripts` in deploy/phala (the pinned CLI).
 set -euo pipefail
 
@@ -29,7 +37,7 @@ phala_dir=$root/deploy/phala
 compose=$phala_dir/docker-compose.yml
 phala=$phala_dir/node_modules/.bin/phala
 name=keeler-devnet
-instance_type=tdx.small
+instance_type=tdx.medium
 disk_size=20G
 os_image=dstack-0.6.6
 publish=false
@@ -38,10 +46,15 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --publish) publish=true; shift ;;
         --registry-user) registry_user=${2:?--registry-user needs a GitHub user}; shift 2 ;;
+        --instance-type) instance_type=${2:?--instance-type needs a type}; shift 2 ;;
         *) echo "unknown argument $1" >&2; exit 1 ;;
     esac
 done
 
+if pgrep -f '(^|/)keeler (dealer|keeper) ' >/dev/null; then
+    echo "a keeler dealer or keeper runs on this machine: stop it first (two keepers on one key race)" >&2
+    exit 1
+fi
 [[ -x $phala ]] || { echo "no $phala: run (cd deploy/phala && npm ci --ignore-scripts)" >&2; exit 1; }
 image_lines=$(grep -E '^[[:space:]]+image:' "$compose")
 if grep -vqE 'image: ghcr\.io/0xinbeta/keeler-keeper@sha256:[0-9a-f]{64}$' <<<"$image_lines" ||
@@ -86,12 +99,12 @@ if [[ -n $registry_user ]]; then
 fi
 env_file() { printf '%s' "$env_text"; }
 
-PHALA_CLOUD_API_KEY=$(keychain keeler-phala-api-key)
-export PHALA_CLOUD_API_KEY
+phala_api_key=$(keychain keeler-phala-api-key)
+run_phala() { (cd "$phala_dir" && PHALA_CLOUD_API_KEY=$phala_api_key "$phala" "$@"); }
 
 phala_json() {
     local out
-    out=$("$phala" "$@" --json) || { echo "phala $* failed: $out" >&2; return 1; }
+    out=$(run_phala "$@" --json) || { echo "phala $* failed: $out" >&2; return 1; }
     printf '%s' "$out"
 }
 json_field() { python3 -c 'import json, sys; d = json.load(sys.stdin); d = d.get("data", d) if isinstance(d, dict) else d; print(eval(sys.argv[1], {}, {"d": d}))' "$1"; }
@@ -100,14 +113,18 @@ images=$(phala_json os-images)
 grep -q "\"$os_image\"" <<<"$images" ||
     { echo "Phala Cloud does not list the OS image $os_image (phala os-images)" >&2; exit 1; }
 
-cvms=$(phala_json cvms list)
-existing=$(json_field '[c["name"] for c in (d if isinstance(d, list) else d.get("items", []))].count("'"$name"'")' <<<"$cvms")
+cvms=$(phala_json cvms list --page-size 100)
+existing=$(json_field '[c["cvmName"] for c in d["items"]].count("'"$name"'") if isinstance(d, dict) and isinstance(d.get("items"), list) and d.get("totalPages", 1) <= 1 and all(isinstance(c, dict) and isinstance(c.get("cvmName"), str) for c in d["items"]) else "unreadable"' <<<"$cvms")
 if [[ $existing == 0 ]]; then
-    "$phala" deploy -n "$name" -c "$compose" -t "$instance_type" --disk-size "$disk_size" \
-        --image "$os_image" --kms phala --no-public-logs --wait --json -e /dev/fd/3 3< <(env_file)
-elif [[ $existing == 1 ]]; then
-    "$phala" deploy --cvm-id "$name" -c "$compose" --no-public-logs --wait --json \
+    run_phala deploy -n "$name" -c "$compose" -t "$instance_type" --disk-size "$disk_size" \
+        --image "$os_image" --kms phala --no-public-logs --no-public-sysinfo --wait --json \
         -e /dev/fd/3 3< <(env_file)
+elif [[ $existing == 1 ]]; then
+    run_phala deploy --cvm-id "$name" -c "$compose" -t "$instance_type" \
+        --no-public-logs --no-public-sysinfo --wait --json -e /dev/fd/3 3< <(env_file)
+elif [[ $existing == unreadable ]]; then
+    echo "phala cvms list did not give one page of items, each with a cvmName" >&2
+    exit 1
 else
     echo "$existing CVMs are named $name; resolve that in the dashboard first" >&2
     exit 1
@@ -120,6 +137,8 @@ domain=$(json_field 'd["gateway"]["base_domain"]' <<<"$cvm")
     { echo "unexpected app id or gateway domain in phala cvms get" >&2; exit 1; }
 [[ $(json_field 'd.get("public_logs")' <<<"$cvm") == False ]] ||
     { echo "the CVM's public_logs is not off" >&2; exit 1; }
+[[ $(json_field 'd.get("public_sysinfo")' <<<"$cvm") == False ]] ||
+    { echo "the CVM's public_sysinfo is not off" >&2; exit 1; }
 dealer_url=https://$app_id-47500.$domain
 standby_url=https://$app_id-47501.$domain
 echo "app id: $app_id"

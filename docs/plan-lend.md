@@ -351,7 +351,7 @@ instruction, another payout).
 ## Wire interfaces
 
 The keeper's HTTP routes (`GET /lend/pools`, `POST /lend/ticket`, `POST /lend/build`,
-`POST /lend/account`; loopback only, `x-keeler-key`, 16 KiB bodies, 30 s deadline), the session
+`POST /lend/account`; loopback only unless `http.allow_remote`, `x-keeler-key`, 16 KiB bodies, 30 s deadline), the session
 authorisation and request signatures, ticket bytes, the Worker's `/api/lend/*` forwarding and the
 page's build settings (`VITE_LEND_PROGRAM_ID`, `VITE_LEND_KEEPERS`, `VITE_LEND_POOL_VIEWING`) are
 specified in `docs/lend-api.md`.

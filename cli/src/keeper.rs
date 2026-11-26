@@ -3146,7 +3146,10 @@ impl<L: Ledger> crate::dealer::Api for Health<'_, L> {
         Err((404, "the faucet is off".into()))
     }
     fn now(&self) -> Result<u64, String> {
-        self.0.now().map_err(|e| format!("{e:#}"))
+        self.0.now().map_err(|e| {
+            log!("keeper: chain time: {e:#}");
+            "no chain time".to_string()
+        })
     }
 }
 

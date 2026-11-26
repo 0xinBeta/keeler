@@ -2,8 +2,9 @@
 # compiled build parameters and every key file against its committed checksum,
 # starts the binary inside the image and makes one lend proof and one swap proof
 # there with only the image's keys, printing their peak memory.
-# Pull requests that touch the image build and prove it; a manual run also pushes
-# ghcr.io/0xinbeta/keeler-keeper tagged with the commit and prints its digest.
+# Pull requests that touch the image build and prove it; a manual run on main
+# also pushes ghcr.io/0xinbeta/keeler-keeper tagged with the commit, from a
+# separate job that alone may write packages, and prints its digest.
 
 name: Keeper image
 
@@ -39,7 +40,6 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -166,15 +166,40 @@ jobs:
         run: |
           prove() {
             docker run --rm --network none -v "$1:/proof/test:ro" --entrypoint /bin/sh keeler-keeper:ci \
-              -c '/proof/test --exact "$1" && echo "peak memory: $(($(cat /sys/fs/cgroup/memory.peak) / 1048576)) MiB"' sh "$2"
+              -c '/proof/test --exact "$1" | tee /tmp/proof.out
+                grep -q "^test result: ok\. 1 passed;" /tmp/proof.out || { echo "not exactly one test passed"; exit 1; }
+                echo "peak memory: $(($(cat /sys/fs/cgroup/memory.peak) / 1048576)) MiB"' sh "$2"
           }
           prove "$(cat /tmp/lend-test)" supply_proves_with_the_checked_keys
           prove "$(cat /tmp/swap-test)" take_circuit::designated_take_proves_and_binds_public_inputs
+      - name: Save the image
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        run: docker save keeler-keeper:ci | gzip >keeler-keeper.tar.gz
+      - name: Upload the image
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: keeler-keeper
+          path: keeler-keeper.tar.gz
+          retention-days: 1
+
+  push:
+    name: Push the keeper image
+    needs: image
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: keeler-keeper
       - name: Push the image
-        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          gunzip -c keeler-keeper.tar.gz | docker load
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker tag keeler-keeper:ci "$IMAGE:$GITHUB_SHA"
           docker push "$IMAGE:$GITHUB_SHA"

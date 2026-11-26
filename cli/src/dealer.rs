@@ -55,6 +55,8 @@ const MAX_LEND_THREADS: usize = 8;
 /// HTTP connections open at once, each on its own thread: room for every
 /// lend request and as many again waiting on their heads or the swap routes.
 const MAX_HTTP_THREADS: usize = 2 * MAX_LEND_THREADS;
+/// Time a peer gets to send its head when any peer may connect.
+const REMOTE_HEAD_DEADLINE: Duration = Duration::from_secs(1);
 const HOUR: u64 = 3_600;
 const DEFAULT_AUTO_PAUSE: u32 = 3;
 const DEFAULT_MIN_FEE: u64 = 10_000_000;
@@ -616,13 +618,14 @@ fn read_head(r: &mut impl BufRead) -> io::Result<Option<Head>> {
 }
 
 /// Serves the HTTP API until `stop` is set. Each connection gets a thread of
-/// its own, at most `MAX_HTTP_THREADS` at once, so a client that never sends
-/// its head holds up no other. Swap routes are answered one at a time,
-/// `/lend/*` (when `lend` is set) up to `MAX_LEND_THREADS` at once. Each
-/// connection gets `deadline` from accept to its head and swap reply (lend:
-/// `LEND_DEADLINE`), no body is read before the peer, the key and the
-/// declared length pass, and every reply closes. Only a loopback peer passes
-/// unless `allow_remote` is set.
+/// its own, at most `MAX_HTTP_THREADS` at once. Swap routes are answered one
+/// at a time, `/lend/*` (when `lend` is set) up to `MAX_LEND_THREADS` at
+/// once. Each connection gets `deadline` to send its head (at most
+/// `REMOTE_HEAD_DEADLINE` when `allow_remote` is set), then `deadline` again
+/// from the swap lock to its reply (lend: `LEND_DEADLINE` from the head). No
+/// body is read before the peer, the key and the declared length pass, and
+/// every reply closes. Only a loopback peer passes unless `allow_remote` is
+/// set. Returns an error once a swap request has panicked.
 pub fn serve_http(
     listener: TcpListener,
     key: &str,
@@ -645,7 +648,7 @@ pub fn serve_http(
     };
     let server = &server;
     thread::scope(|s| {
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) && !server.swap.is_poisoned() {
             match listener.accept() {
                 Ok((stream, remote)) => {
                     if stream.set_nonblocking(false).is_err()
@@ -653,14 +656,13 @@ pub fn serve_http(
                     {
                         continue;
                     }
-                    if server.connections.fetch_add(1, Ordering::SeqCst) >= MAX_HTTP_THREADS {
-                        server.connections.fetch_sub(1, Ordering::SeqCst);
+                    let Some(slot) = Slot::take(&server.connections, MAX_HTTP_THREADS) else {
                         reply(&stream, error(503, "busy; try again shortly"));
                         continue;
-                    }
+                    };
                     s.spawn(move || {
+                        let _slot = slot;
                         server.one_request(stream, remote);
-                        server.connections.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => sleep(HTTP_POLL),
@@ -668,8 +670,25 @@ pub fn serve_http(
                 Err(e) => return Err(e.into()),
             }
         }
+        ensure!(!server.swap.is_poisoned(), "a swap request panicked");
         Ok(())
     })
+}
+
+/// One place in a counter capped at a maximum, given back when dropped.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl<'a> Slot<'a> {
+    fn take(count: &'a AtomicUsize, max: usize) -> Option<Self> {
+        let slot = Slot(count);
+        (count.fetch_add(1, Ordering::SeqCst) < max).then_some(slot)
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct HttpServer<'a, A> {
@@ -689,23 +708,30 @@ fn peer_allowed(remote: SocketAddr, allow_remote: bool) -> bool {
 }
 
 impl<A: Api> HttpServer<'_, A> {
+    fn head_deadline(&self) -> Duration {
+        if self.allow_remote {
+            self.deadline.min(REMOTE_HEAD_DEADLINE)
+        } else {
+            self.deadline
+        }
+    }
+
     fn one_request(&self, stream: TcpStream, remote: SocketAddr) {
         let Ok(clone) = stream.try_clone() else {
             return;
         };
         let mut reader = BufReader::new(Deadline {
             stream: clone,
-            until: Instant::now() + self.deadline,
+            until: Instant::now() + self.head_deadline(),
         });
         let peer = peer_allowed(remote, self.allow_remote);
         let out = match read_head(&mut reader) {
             Ok(Some(h)) if h.chunked => error(400, "bad request"),
             Ok(Some(h)) if h.path.starts_with("/lend/") && self.lend.is_some() => {
                 let Some(lend) = self.lend else { return };
-                if self.lend_busy.fetch_add(1, Ordering::SeqCst) >= MAX_LEND_THREADS {
-                    self.lend_busy.fetch_sub(1, Ordering::SeqCst);
+                let Some(_lend_slot) = Slot::take(&self.lend_busy, MAX_LEND_THREADS) else {
                     return reply(&stream, error(503, "busy; try again shortly"));
-                }
+                };
                 reader.get_mut().until = Instant::now() + LEND_DEADLINE;
                 let _ = stream.set_write_timeout(Some(LEND_DEADLINE));
                 let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
@@ -720,14 +746,13 @@ impl<A: Api> HttpServer<'_, A> {
                     Ok(buf) => lend.lend(&h.method, &h.path, &buf, h.paused),
                     Err(e) => e,
                 };
-                reply(&stream, out);
-                self.lend_busy.fetch_sub(1, Ordering::SeqCst);
-                return;
+                return reply(&stream, out);
             }
             Ok(Some(h)) => {
                 let Ok(_one_at_a_time) = self.swap.lock() else {
                     return reply(&stream, error(503, "unavailable"));
                 };
+                reader.get_mut().until = Instant::now() + self.deadline;
                 let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
                 handle(
                     self.api,
@@ -1446,6 +1471,55 @@ mod tests {
             let held = health(at);
             assert!(held.starts_with("HTTP/1.1 503"), "{held}");
             drop((idle, turned_away));
+            stop.store(true, Ordering::Relaxed);
+            server.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_slot_is_given_back_when_its_holder_panics() {
+        let count = AtomicUsize::new(0);
+        let held = Slot::take(&count, 2).unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            let _slot = Slot::take(&count, 2).unwrap();
+            panic!("handler failed");
+        })
+        .is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let second = Slot::take(&count, 2).unwrap();
+        assert!(Slot::take(&count, 2).is_none());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        drop((held, second));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn allow_remote_on_a_socket_still_wants_the_key_and_a_head_within_a_second() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let stop = AtomicBool::new(false);
+        let api = fake();
+        thread::scope(|s| {
+            let server = s.spawn(|| {
+                serve_http(
+                    listener,
+                    KEY,
+                    &stop,
+                    &api,
+                    None,
+                    Duration::from_secs(3),
+                    true,
+                )
+            });
+            assert!(health(at).starts_with("HTTP/1.1 200"));
+            let (r, _) = exchange(at, b"GET /health HTTP/1.1\r\n\r\n", None);
+            assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+            let (r, took) = exchange(at, b"GET /health HTTP/1.1\r\n", None);
+            assert!(r.starts_with("HTTP/1.1 408"), "{r}");
+            assert!(
+                took >= Duration::from_millis(900) && took < Duration::from_secs(2),
+                "{took:?}"
+            );
             stop.store(true, Ordering::Relaxed);
             server.join().unwrap().unwrap();
         });

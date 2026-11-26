@@ -212,7 +212,9 @@ after it. References are at the end of the section.
 ### What exists today [exists]
 
 - The keeper is a `keeler keeper` process on an operator's host. Its keeper key, the pool key and
-  the HTTP key are read from the macOS Keychain (`keychain_secret` in `cli/src/config.rs`); the
+  the HTTP key are read from the macOS Keychain (`keychain_secret` in `cli/src/config.rs`) on
+  mainnet, which refuses any other source; elsewhere a config may read them from a file or the
+  environment instead (`KeySource` in `cli/src/config.rs`); the
   state file is JSON, mode 0600, on that host's disk, with a lock that stops two processes on one
   file (`docs/lend-keeper.md`, "The state file").
 - The pool key is made once, on the deploy machine, and copied to each keeper host
