@@ -110,33 +110,17 @@ EOF
     param() { python3 -c 'import json, sys; v = json.load(open(sys.argv[1]))[sys.argv[2]]; print(",".join(v) if isinstance(v, list) else v)' "$params" "$1"; }
     [[ $(param program_id) == "$lend_program" ]] || { echo "$params is for another program than $lend_program" >&2; exit 1; }
     keepers=$(param keepers) || { echo "$params has no keepers: rerun scripts/deploy-lend-devnet.sh --estimate" >&2; exit 1; }
-    pool_viewing=$(param pool_viewing) || { echo "$params has no pool_viewing" >&2; exit 1; }
     [[ ,$keepers, == *,"$keeper",* ]] || { echo "$params: the keeper $keeper is not one of the lend program's keepers ($keepers)" >&2; exit 1; }
     if $standby; then
         others=$(/usr/bin/tr ',' '\n' <<<"$keepers" | grep -vx "$keeper" || true)
         [[ -n $others && $others != *$'\n'* ]] || { echo "--standby needs exactly one keeper besides $keeper in $params ($keepers)" >&2; exit 1; }
         standby_key=$others
     fi
-    # Older records lack the oracle; the build default (Pyth's SOL/USD) then holds.
-    opt() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$params" "$1"; }
-    price_account=$(opt price_account)
-    feed_id=$(opt feed_id)
     [[ -d $deployment/keys ]] || { echo "no $deployment/keys: rerun scripts/deploy-lend-devnet.sh --estimate" >&2; exit 1; }
     # The keeper proves with the deployment's own copy of the keys, so a
     # rebuild of lend/target under a running keeper cannot change them.
     export KEELER_LEND_KEYS_DIR=$deployment/keys
-    (
-        export KEELER_LEND_PROGRAM_ID=$lend_program KEELER_LEND_ADMIN
-        export KEELER_LEND_KEEPERS=$keepers KEELER_LEND_POOL_VIEWING=$pool_viewing
-        export KEELER_LEND_VAULT1_COLLATERAL_MINT KEELER_LEND_VAULT1_DEBT_MINT
-        KEELER_LEND_ADMIN=$(param admin)
-        KEELER_LEND_VAULT1_COLLATERAL_MINT=$(param collateral_mint)
-        KEELER_LEND_VAULT1_DEBT_MINT=$(param debt_mint)
-        if [[ -n $price_account ]]; then export KEELER_LEND_VAULT1_PRICE_ACCOUNT=$price_account; fi
-        if [[ -n $feed_id ]]; then export KEELER_LEND_VAULT1_FEED_ID=$feed_id; fi
-        CARGO_TARGET_DIR=$deployment/dealer-cargo \
-            cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p keeler --bin keeler
-    )
+    "$root/scripts/build-keeper.sh" "$params" "$deployment/dealer-cargo"
     bin=$deployment/dealer-cargo/release/keeler
 else
     $standby && { echo "--standby needs a config with a lend section" >&2; exit 1; }

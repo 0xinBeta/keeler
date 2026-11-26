@@ -727,6 +727,23 @@ mod tests {
     }
 
     #[test]
+    fn deployed_devnet_configs_parse() {
+        let dealer: DealerConfig =
+            parse_json(include_str!("../../deploy/devnet/dealer.json")).unwrap();
+        let http = dealer.http.as_ref().unwrap();
+        assert!(http.allow_remote);
+        http.check().unwrap();
+        dealer.common.check().unwrap();
+        assert!(dealer.lend.unwrap().admin_key.is_none());
+        let standby: crate::keeper::KeeperConfig =
+            parse_json(include_str!("../../deploy/devnet/standby.json")).unwrap();
+        assert!(standby.http.allow_remote);
+        standby.http.check().unwrap();
+        standby.network.check().unwrap();
+        assert!(standby.lend.admin_key.is_none());
+    }
+
+    #[test]
     fn band_must_be_below_10000() {
         assert!(TraderConfig::from_json(&trader_json(9_999, B)).is_ok());
         assert!(TraderConfig::from_json(&trader_json(10_000, B)).is_err());

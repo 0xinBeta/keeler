@@ -1,0 +1,14 @@
+{
+  "program_id": "CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL",
+  "admin": "8o2VNvAjjFCwwmt2eP8nMSuxPgbRVUCQ6gUZKnPukx95",
+  "keepers": [
+    "J7zbxNyAvwmyd1nMVw4nFMD68RNkCq5wWy9Mr8Bpggi8",
+    "7mKoY1bj2ShL2UmQLy5BxoSAu9mWbPAEukBM911QNm8k"
+  ],
+  "pool_viewing": "04f585dfc14e370d640170a761016bfa5007aab8b011894200fcfb5712d58c5569",
+  "collateral_mint": "8Boq7Rh5pVfJPFUqheNxA5s33C7c6r3FDsY6QV1NJQTB",
+  "debt_mint": "27xQ4kCLnJsxyDXv652weyce8crgee9HXD56m57XwAEn",
+  "price_account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+  "feed_id": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+  "swap_program_id": "Gj6UdHTUxv6Z3tR1ZviM9WfZNqDq15x9AGFbpCSe4YzW"
+}

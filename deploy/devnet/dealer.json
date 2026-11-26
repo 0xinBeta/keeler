@@ -1,0 +1,108 @@
+{
+  "network": {
+    "rpc_url": "https://devnet.helius-rpc.com",
+    "indexer_url": "https://devnet.helius-rpc.com/v1/spr",
+    "prover": {
+      "helius": {
+        "env": "KEELER_HELIUS_KEY"
+      }
+    }
+  },
+  "key": {
+    "env": "KEELER_DEALER_KEY"
+  },
+  "program_id": "Gj6UdHTUxv6Z3tR1ZviM9WfZNqDq15x9AGFbpCSe4YzW",
+  "pubkey": "J7zbxNyAvwmyd1nMVw4nFMD68RNkCq5wWy9Mr8Bpggi8",
+  "assets": [
+    {
+      "mint": "27xQ4kCLnJsxyDXv652weyce8crgee9HXD56m57XwAEn",
+      "price": {
+        "price": 1,
+        "expo": 0
+      }
+    },
+    {
+      "mint": "8Boq7Rh5pVfJPFUqheNxA5s33C7c6r3FDsY6QV1NJQTB",
+      "price": {
+        "price": 150,
+        "expo": 0
+      }
+    }
+  ],
+  "listen": "127.0.0.1:47001",
+  "spread_bps": 10,
+  "quote_ttl_secs": 300,
+  "settle_margin_secs": 60,
+  "http": {
+    "listen": "0.0.0.0:47500",
+    "key": {
+      "env": "KEELER_HTTP_KEY"
+    },
+    "allow_remote": true
+  },
+  "faucet": {
+    "key": {
+      "env": "KEELER_FAUCET_KEY"
+    },
+    "tokens": [
+      {
+        "mint": "27xQ4kCLnJsxyDXv652weyce8crgee9HXD56m57XwAEn",
+        "amount": 1000000000
+      },
+      {
+        "mint": "8Boq7Rh5pVfJPFUqheNxA5s33C7c6r3FDsY6QV1NJQTB",
+        "amount": 10000000000
+      }
+    ],
+    "lamports": 10000000,
+    "per_wallet_daily": 1,
+    "daily_cap": 60
+  },
+  "state_file": "/data/dealer.json",
+  "settle_tolerance_bps": 0,
+  "limits": [
+    {
+      "mint": "27xQ4kCLnJsxyDXv652weyce8crgee9HXD56m57XwAEn",
+      "max_sell_amount": 10000000000,
+      "hourly_sell_cap": 100000000000
+    },
+    {
+      "mint": "8Boq7Rh5pVfJPFUqheNxA5s33C7c6r3FDsY6QV1NJQTB",
+      "max_sell_amount": 100000000000,
+      "hourly_sell_cap": 1000000000000
+    }
+  ],
+  "lend": {
+    "program_id": "CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL",
+    "network": "devnet",
+    "state_file": "/data/keeper-primary.json",
+    "price": "test",
+    "price_refresh_secs": 45,
+    "limits": {
+      "min_supply": 1000000,
+      "min_collateral": 10000000,
+      "min_deposit_add": 1,
+      "min_repay": 10000,
+      "min_redeem": 10000,
+      "min_borrow": 10000,
+      "min_withdraw": 10000000,
+      "tickets_per_wallet_hour": 30,
+      "open_per_wallet": 4,
+      "max_open_intents": 64,
+      "builds_per_wallet_hour": 60,
+      "reservation_secs": 20,
+      "ticket_secs": 600,
+      "bucket_secs": 600,
+      "bound_margin_bps": 50
+    },
+    "poll_secs": 2,
+    "pool_key": {
+      "env": "KEELER_POOL_KEY"
+    },
+    "origins": [
+      "https://keeler.xterminbeta.workers.dev",
+      "http://127.0.0.1:8788"
+    ],
+    "role": "primary"
+  }
+}

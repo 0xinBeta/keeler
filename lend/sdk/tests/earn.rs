@@ -1,4 +1,4 @@
-//! `supply` and `redeem`, natively (no network, no proofs): the circuit's
+//! `supply` and `redeem`, natively (no network; one proof): the circuit's
 //! refusals, the shared rounding vectors, who can read each output, and every
 //! output recomputed by its owner from the user note and the first nullifier.
 //! Pool-owned notes with chosen states are forged here: native execution does
@@ -238,6 +238,20 @@ fn owned(p: &Prepared) -> usize {
 
 fn viewing(out: &SppProofOutputUtxo) -> X25519Pubkey {
     out.owner_address.unwrap().viewing_pubkey
+}
+
+#[test]
+fn supply_proves_with_the_checked_keys() {
+    let user = keypair(7);
+    let (_, reserve) = fresh_reserve(MINT);
+    let p = supply(
+        &address(&user),
+        reserve,
+        supply_intent(&user, 2_500_000),
+        NOW + 30,
+    )
+    .unwrap();
+    keeler_lend_sdk::proof::prove(p.circuit(), &p.proof_inputs).unwrap();
 }
 
 #[test]
