@@ -1,12 +1,13 @@
 name: CI
 
-# Gates pull requests to main; also runs on every push, so a branch is checked before its pull request.
+# Gates pull requests to main and runs on every push to main; other branches run through their pull request.
 # Runs are grouped by pull request number, else by ref: a later run in a group cancels the earlier one.
 # Only main saves the cargo cache.
 # The slow suites are in slow.yml and gate nothing.
 
 on:
   push:
+    branches: [main]
   pull_request:
     branches: [main]
 

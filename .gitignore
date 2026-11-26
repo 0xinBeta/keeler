@@ -1,5 +1,5 @@
 target/
-.tools/
+.tools
 .worktrees/
 node_modules/
 web/dist/
