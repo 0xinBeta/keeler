@@ -153,7 +153,7 @@ test("borrow: open, borrow, repay, withdraw, liquidation, repay all and close", 
   expect((await note.boundingBox())!.y).toBeLessThan((await p.locator("#borrow-amt").boundingBox())!.y);
   await shot(page, info, "06-liquidatable");
   await expect(p.getByText(/^Liquidated /)).toBeVisible({ timeout: 15_000 });
-  await expect(p.getByText(/It brought the position back to 85% or less, and the rest stayed yours\./)).toBeVisible();
+  await expect(p.getByText(/It brought the position back to 85\.0% at that price, and the rest stayed yours\./)).toBeVisible();
   await expect(orbLink(p.locator(".liquidated"), "View liquidation on Orb")).toHaveAttribute("href", orb("Liquidate"));
   await expect(meter).toHaveAttribute("aria-valuetext", /^8[45]\.\d%/);
   const collateral = units(await p.locator(".position dd").first().innerText(), 9);

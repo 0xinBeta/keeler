@@ -790,8 +790,9 @@ export function BorrowTab(p: DeskProps) {
     <DeskLayout p={p} title={op.run ? kindLabel(op.run, vault.collateral) : "Manage position"} rail={rail} railLabel="Vault, position and balances">
       {position && st === "close" && !position.lastLiquidation && (
         <p className="note note-warn" role="status">
-          Above {pct(cf, 0)} you can't borrow more. Liquidation starts above {pct(vault.liquidationThresholdBps, 0)}, at a{" "}
-          {vault.collateral.symbol} price of {lp === null ? "" : priceText(lp, vault)}. Repaying or adding collateral moves you back.
+          Above {pct(cf, 0)} you can't borrow more. Liquidation starts past {pct(vault.liquidationThresholdBps, 0)} of collateral value at the
+          oracle price plus its confidence and a 0.5% margin: at a {vault.collateral.symbol} price of {lp === null ? "" : priceText(lp, vault)} or
+          less. Repaying or adding collateral moves you back.
         </p>
       )}
       {position && st === "liquidatable" && (
@@ -927,7 +928,7 @@ export function LiquidatedNote({ position, vault, now }: { position: Position; v
         ? "It repaid the whole loan; the rest of your collateral stayed yours."
         : l.collateralLeft === 0n
           ? "It left no collateral; the remaining debt stays on the position until you repay it."
-          : `It brought the position back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest stayed yours.`}
+          : `It brought the position back to ${pct(healthBps(l.collateralLeft, l.debtLeft, l.price))} at that price, and the rest stayed yours.`}
       <OrbLinks links={liquidationLinks(l.signature)} says={ON_CHAIN.liquidation} />
     </div>
   );

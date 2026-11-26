@@ -35,12 +35,13 @@ test("the health bar is a labelled meter that draws the state it is given", () =
 });
 
 test("the liquidation note says what the liquidation left, not what a later repayment did", () => {
-  const lastLiquidation = { at: 100, debtRepaid: 40_000000n, collateralSold: 1_000000000n, price: 120_000_000_000n, collateralLeft: 3_000000000n, debtLeft: 60_000000n };
-  // Repaid in full since: no debt now, but the liquidation did not repay the whole loan.
-  const later = renderToStaticMarkup(createElement(LiquidatedNote, { position: { vault: 1, id: "42", collateral: 3_000000000n, debt: 0n, lastLiquidation }, vault, now: 130 }));
+  const lastLiquidation = { at: 100, debtRepaid: 18_113930n, collateralSold: 137_771696n, price: 132_792_660_000n, collateralLeft: 362_228304n, debtLeft: 40_886072n };
+  const later = renderToStaticMarkup(createElement(LiquidatedNote, { position: { vault: 1, id: "42", collateral: 362_228304n, debt: 0n, lastLiquidation }, vault, now: 130 }));
   expect(later).toContain("30 s ago");
   expect(later).not.toContain("whole loan");
-  expect(later).toContain("back to 85% or less");
+  expect(later).toContain("at 132.79 tUSD. It brought the position back to 85.0% at that price, and the rest stayed yours.");
+  const partial = renderToStaticMarkup(createElement(LiquidatedNote, { position: { vault: 1, id: "42", collateral: 3_000000000n, debt: 0n, lastLiquidation: { ...lastLiquidation, price: 120_000_000_000n, collateralLeft: 3_000000000n, debtLeft: 324_720000n } }, vault, now: 130 }));
+  expect(partial).toContain("back to 90.2% at that price");
   const full = renderToStaticMarkup(createElement(LiquidatedNote, { position: { vault: 1, id: "42", collateral: 1n, debt: 0n, lastLiquidation: { ...lastLiquidation, debtLeft: 0n } }, vault, now: 130 }));
   expect(full).toContain("It repaid the whole loan");
 });

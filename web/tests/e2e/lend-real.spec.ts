@@ -179,10 +179,9 @@ test("borrow: open, borrow, add, repay part, repay all with change, withdraw, cl
   await expect(position(0)).toHaveText("1 SOL");
 
   await borrowAction("Borrow", "3", "Borrow", "Done. It's in your private balance.", "borrow: click to landed");
-  // 3 tUSD on 1 SOL at 10: 30%; liquidation at 3 / 0.85 = 3.53.
   await expect(position(1)).toHaveText(/^3(\.0+\d*)? tUSD$/, { timeout: 30_000 });
   await expect(p.getByRole("meter", { name: "Loan-to-value" })).toHaveAttribute("aria-valuetext", /^30\.\d%, healthy$/);
-  await expect(position(2)).toHaveText(/^3\.5\d* tUSD$/);
+  await expect(position(2)).toHaveText("3.5 tUSD");
 
   await borrowAction("Add", "0.2", "Add collateral", "Done. The collateral is in your position.", "add collateral: click to filled");
   await expect(position(0)).toHaveText("1.2 SOL", { timeout: 30_000 });
@@ -221,7 +220,7 @@ test("liquidation: borrow near the limit, the price drops, the keeper liquidates
   // position is past the 85% threshold and below the program's 90% max limit, so the liquidation is partial.
   setPrice(8.6);
   await timed("liquidation: price moved to the page showing it", () => expect(p.getByText(/^Liquidated /)).toBeVisible({ timeout: KEEPER }));
-  await expect(p.getByText(/It brought the position back to 85% or less, and the rest stayed yours\./)).toBeVisible();
+  await expect(p.getByText(/It brought the position back to 85\.\d% at that price, and the rest stayed yours\./)).toBeVisible();
   const collateral = units(await position(0).innerText(), 9);
   expect(collateral).toBeLessThan(1_000_000_000n);
   expect(collateral).toBeGreaterThan(500_000_000n);
