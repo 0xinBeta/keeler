@@ -1,15 +1,18 @@
 //! `supply` and `redeem`: the program's refusals that need no real proof, on
 //! the SBF build in `lend/target/deploy` (build it first, see
 //! `lend/AGENTS.md`). The circuit's refusals are in `sdk/tests/earn.rs`.
+#[path = "../../../.tools/privacy-ring-examples/test-utils/mollusk.rs"]
 mod mollusk;
+mod pool_viewing;
 
 use keeler_lend::{
     error::LendError,
     instructions::{redeem::RedeemArgs, supply::SupplyArgs},
     tag, KEEPERS, POOL_SEED, POOL_VIEWING, USER_SEED,
 };
-use mollusk::{expect_err_exact, mollusk_with_program, only_the_pool_viewing_key};
+use mollusk::{expect_err_exact, mollusk_with_program};
 use mollusk_svm::{result::ProgramResult, Mollusk};
+use pool_viewing::only_the_pool_viewing_key;
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_program_error::ProgramError;
