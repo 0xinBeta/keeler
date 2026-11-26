@@ -11,8 +11,8 @@ mechanism:
 - **page**: a check the web page makes before the wallet signs (`web/src/keeler/lend-check.ts`);
 - **trust**: nothing enforces it; the party is trusted.
 
-Every section describes what the code does today, except the Nitro Enclave section, which is a
-proposal and marks each of its parts **[exists]** or **[proposal]**.
+Every section describes what the code does today, except the enclave section, which is a proposal
+and marks each of its parts **[exists]** or **[proposal]**.
 
 ## Devnet today
 
@@ -200,11 +200,14 @@ The other findings were fixed or mitigated; the review document records each one
 Also not enforced by any circuit, and documented in `lend/AGENTS.md`: the unbounded intent expiry
 and the liquidator change blinding above.
 
-## Running the keeper in an AWS Nitro Enclave
+## Running the keeper in an enclave
 
 The aim: let a user check which code holds the keeper and pool keys, instead of trusting the
 operator's hosts with them. It narrows what the operator is trusted for; it does not remove the
-operator. References are at the end of the section.
+operator. The plan is Phala dstack, an Intel TDX confidential VM; the AWS Nitro Enclaves design is
+kept as the alternative. Helius' prover contract accepts the same two platforms, `dstack-tdx` and
+`aws-nitro`, behind one attestation route and one 64-byte binding, and the route below is shaped
+after it. References are at the end of the section.
 
 ### What exists today [exists]
 
@@ -215,9 +218,177 @@ operator. References are at the end of the section.
 - The pool key is made once, on the deploy machine, and copied to each keeper host
   (`docs/mainnet-runbook.md`, section 4). The operator holds every key in clear.
 - The only TEE in the system is Helius' prover for the shielded pool's proofs ("The prover"
-  above). Nothing in this repository runs in, or checks, a Nitro Enclave.
+  above). Nothing in this repository runs in, or checks, any enclave.
 
-### What is measured, and how the image is built [proposal]
+### Common to both platforms [proposal]
+
+- A keeper route, `/lend/attestation?nonce=<32 bytes hex>`, answers `platform` (`dstack-tdx` or
+  `aws-nitro`), `request_key`, `reply_key`, `evidence` and a keeper signature. The request key
+  (X25519; the page encrypts every keeper request to it) and the reply key (Ed25519; it signs
+  every keeper reply) are drawn at boot, held in memory only, never derived from a platform key
+  and never sealed. They are not pinned: the page attests again when a request fails to decrypt,
+  as Helius' clients do after `tee_decryption_failed`.
+- So a request can be read only by the instance whose evidence carried the request key. A key
+  derived from the dstack app key would be held by every compose approved under the app (Helius'
+  contract says so of its own derived key) and by whoever holds the KMS root.
+- One 64-byte binding, carried by both platforms:
+
+  ```
+  binding = SHA-512("keeler-keeper-attest-v1" ‖ nonce ‖ program id ‖ keeper address ‖
+                    pool viewing key ‖ request key ‖ reply key)
+  ```
+
+  The fields have fixed lengths: the 23-byte ASCII tag, then 32, 32, 32, 33 (the pool viewing key
+  as the program pins it), 32 and 32 bytes, 216 in all. On TDX the binding is the quote's
+  `report_data`. On Nitro it is `user_data`, with `nonce` set to the caller's nonce and
+  `public_key` to the request key. Caller-chosen bytes never go into either field.
+- The keeper key signs `"keeler-keeper-attest-sig-v1" ‖ binding`, domain-prefixed as tickets are
+  (`keeler-lend-ticket-v1`, `cli/src/lend_auth.rs`). It shows that the holder of a compiled keeper
+  key endorsed this evidence, not that the key exists only inside the enclave.
+- The check: the platform's evidence checks (below), the binding recomputed from the caller's
+  nonce and the compiled program id, `KEEPERS` and `POOL_VIEWING`, the keeper signature against
+  `KEEPERS`, and the measurements against values compiled into the site, as the keeper set and
+  pool key are today. Lending stays hidden when it fails, as it does today for an unknown keeper.
+- What the check binds: a request encrypted to the request key can be read only by the attested
+  instance, and a reply signed by the reply key came from it, so where TLS ends (the Cloudflare
+  Worker for the page, Phala's gateway on dstack) does not decide who reads a request. The Worker
+  and the gateway can delay, drop or replay requests (the keeper's nonce and session checks stand
+  against replay), but cannot read them or forge replies.
+- What it cannot bind: the page is served by the operator, and a different page could skip the
+  check ("The Worker operator" above). A standalone `keeler attest-check`, run by the user, makes
+  the same check without depending on the page.
+
+### Keys made inside the enclave [proposal]
+
+- The enclave generates the keeper key and the pool key itself and seals them under a platform
+  key: a key from dstack's `getKey`, or a KMS data key on Nitro. They are not derived directly
+  with `getKey`: the dstack SDK says derived keys are "not suitable for holding assets", and
+  suggests a random key sealed under the derived key instead.
+- The current pool key was made on the deploy machine, so this means a new deployment with new
+  compiled `KEEPERS` and `POOL_VIEWING`; it cannot be applied to the present keys.
+- Two keepers hold one pool key and two keeper keys. The sealed pool key passes between the
+  instances as ciphertext; each instance seals its own keeper key. On dstack this is not a trust
+  boundary: every instance and every approved compose under one app id derives the same sealing
+  keys.
+- The pool key cannot rotate (`docs/mainnet-runbook.md`, section 11). If the sealing key is lost,
+  or the platform root is rotated without a migration, the sealed pool key cannot be read and, as
+  with every pool-key holder gone, Earn deposits and indebted positions cannot move. A backup
+  outside the enclave puts the key back with an operator. Each platform's case is below.
+
+### Encrypted state outside the enclave [proposal]
+
+- The state file (openings, tickets, pending builds, scan marks) is sealed with an AEAD under the
+  platform key and stored by the host, which holds bytes it cannot read. On dstack the data disk
+  is LUKS2 `aes-xts-plain64` with no authentication tag; ZFS, the default, checksums every block,
+  ext4 does not. The AEAD is what detects a changed file on either platform.
+- The host can hand the enclave an older file (dstack's security model: the host can restore an
+  earlier valid disk image). The chain is the anchor against that: on load the enclave checks
+  each note it holds against its nullifier account and replays the history from its scan mark, as
+  the keeper does today (`docs/lend-keeper.md`, "Recovery"), so an old reserve opening is seen to
+  be spent and the current notes are read back from the chain. A rollback can still change the
+  record that is not on chain: tickets and pending builds. No version counter is proposed: kept in
+  a store the operator controls, it can be restored together with the file.
+
+### A single-writer lease [proposal]
+
+- Today the lock stops two processes on one file, not two machines with one key
+  (`docs/lend-keeper.md`, "Never"). Phala's replica guide advises against replicas for a workload
+  that assumes it is the only writer, and the dstack app policy counts no instances. The design
+  adds a lease per keeper key in a store with conditional writes (for example a DynamoDB item:
+  holder, expiry, a fencing token that only grows). The enclave sends nothing and writes no state
+  without an unexpired lease, and stops a margin before expiry when a renewal fails.
+- A fencing token protects only what checks it: the state store must refuse a write with an older
+  token. The chain checks no token.
+- The expiry needs a time source the operator cannot skew, and the operator owns the lease store,
+  can rewrite or delete the item, and carries the enclave's network traffic. So the lease guards
+  against faults (a host that stalls and comes back, a failover run twice), not the operator.
+- The backstop is the chain: two builds on one reserve cannot both land (the reserve's
+  nullifier), so two writers cost a fee. Deposits spend no reserve, so two writers can still pass
+  `max_total_collateral` together (review K-2).
+
+### Phala dstack: the plan [proposal]
+
+- The keeper runs as a container pinned by digest in a dstack CVM (dstack facts here are from
+  commit `63dde6a`). MRTD measures the virtual firmware; RTMR0 the virtual hardware (vCPUs,
+  memory, devices); RTMR1 the kernel; RTMR2 the kernel command line, with the root file system
+  hash, and the initrd; RTMR3 the runtime events, among them `app-id`, `compose-hash`,
+  `instance-id`, `os-image-hash` and `key-provider`. `dstack-mr measure` computes MRTD and RTMR0
+  to RTMR2 from the OS image for the chosen vCPUs and memory. The site pins those, the `app-id`,
+  `compose-hash` and `os-image-hash` events and the `key-provider` id. dstack's
+  `make os-repro-check` builds the OS twice and compares the archives, which is dstack's own check,
+  not an independent rebuild; the keeper image's reproducibility is ours to show, as on Nitro.
+- `compose-hash` is the hash of the `app-compose.json` file. The environment is not measured and
+  the host can replace it, so every setting the keeper relies on is in the compose.
+- RTMR3 replay, in the V1 digest format, the one Helius' verifier accepts:
+  `digest = SHA-384(le32(0x08000001) ‖ ":" ‖ name ‖ ":" ‖ payload)`, then
+  `rtmr3 = SHA-384(rtmr3 ‖ digest)` from 48 zero bytes. V2 hashes canonical JSON and is opt-in
+  (`event_log_version: 2`). For V2 the dstack text says privileged code in the CVM can append
+  measured events after boot, so a policy takes each trusted event from before `system-ready`
+  and refuses duplicate names. The verifier here applies that rule to V1 too.
+- Debug. Nothing is zeroed: the debug bit is in the TD attributes of the signed quote.
+  `dcap-qvl` 0.6.6, the version in `web/pnpm-lock.yaml` through the Rings SDK, refuses it unless
+  the caller sets `allowDebug`, as dstack's own quote check does; the page never sets it. A
+  development OS image (`"is_dev": true` in its metadata; Phala's November report says it includes
+  SSH) is never pinned. The compose sets `public_logs` to false: dstack documents container logs
+  as public by default.
+- Verification. `dcap-qvl` checks the quote against Intel's root CA with the collateral at the
+  page's clock. It refuses TCB info or a QE identity past its `nextUpdate` and a `Revoked` TCB,
+  and returns the other statuses (`OutOfDate` among them), so the site pins the statuses it
+  accepts. The keeper relays the Intel-signed collateral, as Helius' prover does; Helius' README
+  states the cost: a newly revoked TCB shows only after the prover refreshes its collateral. Here
+  the bound is the relayed collateral's `nextUpdate`. `dcap-qvl` fetches from Phala's PCCS by
+  default and also defines Intel's PCS, which the keeper uses.
+- Keys. Every app key derives from the KMS root, the app id and the app epoch; the disk key adds
+  the instance id. The compose hash and the OS image are checked before release but are not
+  inputs, so any compose approved under the app id receives the same keys. Only the on-chain KMS
+  is used: on Phala Cloud's own KMS, Phala's November report says, Phala sets the key-release
+  policy. The routes to the keys:
+  - the DstackApp owner: adding a compose hash or a device, `setAllowAnyDevice`,
+    `setRequireTcbUpToDate`, upgrading the app contract until `disableUpgrades()`, advancing the
+    app epoch; each a public transaction;
+  - the DstackKms owner: upgrading the KMS contract, adding OS images, KMS measurements, KMS
+    devices and root epochs. On Ethereum (`0xd343a3f5593b93D8056aB5D60c433622d7D65a80`) and Base
+    (`0x2f83172A49584C017F2B256F0FB2Dca14126Ba9C`) it is
+    `0x3926658a072f82baea5e5a15e1fed8a776f4a663`, which reports a threshold of 2
+    (`getThreshold()`) and three owners (`getOwners()`), read 2026-11-26 at Ethereum block
+    26498932 and Base block 62502083; its deployed bytecode was not compared with any source;
+  - the holder of the KMS root, who derives every app key directly.
+- The app policy pins no MRTD or RTMR: it checks the launch ticket, app epoch, TCB status, compose
+  hash, device and TEE variant; the KMS contract adds its OS image allowlist. A client attests
+  only the instance it reaches and never sees another one running another approved compose. So
+  the design requires `disableUpgrades()`, a device allowlist, `requireTcbUpToDate`, and a
+  DstackApp owner that is the operators' own multisig, a second governance surface beside the
+  Solana upgrade multisig. The claim is that operators cannot obtain the keys without a public
+  transaction, not that they cannot read amounts: account views cross the Worker in clear (W-3),
+  and the operator serves the page.
+- Key loss and root rotation. A new root or app epoch gives a new `getKey` key, so the sealed keys
+  are read under the old epoch (`getKey` takes epoch selectors) and sealed again. When Phala
+  replaced its legacy Cloud KMS root, its November report says, `getKey()` returned new keys, the
+  old root stayed reachable as epoch 0 on request, apps using `getKey()` had to move what the old
+  keys protected, and the migration did not revoke the attacker's copy. The pool key cannot move,
+  so whoever holds a leaked root and the sealed file can read it.
+- Trust base: Intel (the TDX module, the PCK chain and root CA, the PCS) and Phala (the KMS root
+  and its nodes, the DstackKms owner, OS releases, the hosts, the VMM, the gateway). Intel's TDX
+  overview: denial of service by the VMM is out of scope, replay of memory through physical
+  attacks is not defended against, and a hardware attacker can see memory ciphertext.
+- Phala's published incidents, as Phala's own posts state them:
+  - From 2026-05-31, patched 2026-06-01: an API flaw let an attacker change some CVMs and add a
+    pre-launch script that may have read decrypted environment variables; off-chain KMS CVMs only,
+    on-chain KMS CVMs outside the affected scope (notice of 2026-06-01).
+  - 2026-10-08 to 2026-10-12 (timeline from 2026-10-11): the guest agent's log endpoint returned
+    container configuration, environment variables included, for a small set of apps (OS images
+    0.3.1 to 0.6.0); TEE, sealing and KMS keys and on-chain KMS operations unaffected (post-mortem
+    of 2026-10-19).
+  - 2026-10-21 to 2026-11-01: through a monitoring CVM's default password, an attacker reached a
+    VMM that took any request from loopback; requests to an experimental DeepSeek CVM on the
+    development OS image are counted at risk (November report).
+  - 2026-11-05 to 2026-11-06: a KMS replica whose onboarding checked only that the OS image was
+    known handed the legacy root key to callers at the attacker's address; a new root went live
+    2026-11-06; on-chain KMS applications not affected (November report, final version of
+    2026-11-23, with a penetration test and remaining migrations still open).
+- No single-instance guarantee: replicas share the app id and compose hash, and so the app keys.
+
+### AWS Nitro Enclaves: the alternative [proposal]
 
 - The keeper runs from an enclave image file (EIF) made with `nitro-cli build-enclave` from a
   tagged commit: the `keeler keeper` binary built with the deploy's build parameters
@@ -226,108 +397,64 @@ operator. References are at the end of the section.
 - The PCRs, as AWS defines them: PCR0 measures the image file, PCR1 the kernel and boot ramfs,
   PCR2 the application, PCR8 the signing certificate (only for a signed image). PCR3 is a hash of
   the parent instance's IAM role ARN and PCR4 of the parent's instance id: they describe the host,
-  not the code. The release publishes PCR0, PCR1 and PCR2; the KMS policy below may also pin PCR3.
+  not the code. The release publishes PCR0, PCR1 and PCR2; the KMS policy may also pin PCR3.
 - Anyone can rebuild the tag and compare. That needs a pinned `nitro-cli` with the kernel and init
   blobs it ships (they set PCR1), a container image pinned by digest, `cargo build --locked` with
   fixed paths and timestamps, and a file system with fixed order, owners and times. AWS's pages
-  define the PCRs but say nothing about reproducible builds, so reproducibility has to be shown by
-  independent rebuilds that match, not assumed.
+  say nothing about reproducible builds, so reproducibility is shown by independent rebuilds that
+  match, not assumed.
 - Production mode only. AWS states that an enclave booted in debug mode, or with an attached
   console, produces attestation documents whose PCRs are all zeros and that cannot be used for
-  attestation. A KMS policy pinned to the published values refuses it, and so does every verifier
-  below.
-
-### Keys made inside the enclave and sealed to the measurement [proposal]
-
-- The enclave generates the keeper key and the pool key itself and never exports them. The
-  current pool key was made on the deploy machine, so this means a new deployment with new
-  compiled `KEEPERS` and `POOL_VIEWING`; it cannot be applied to the present keys.
-- To keep them across restarts, the enclave calls KMS `GenerateDataKey` with an attestation
-  document as the `Recipient`. KMS returns the data key encrypted to the document's public key
+  attestation. A KMS policy pinned to the published values refuses it, and so does the check.
+- Sealing: the enclave calls KMS `GenerateDataKey` with an attestation document as the
+  `Recipient`. KMS returns the data key encrypted to the document's public key
   (`CiphertextForRecipient`; the plaintext field is empty) and a copy encrypted under the KMS key.
   The enclave seals its keys and state with the data key (AES-256-GCM) and gives the parent only
-  ciphertext.
-- After a restart the enclave calls `Decrypt` on that copy with a fresh attestation document. The
-  key policy allows `Decrypt` and `GenerateDataKey` only when `kms:RecipientAttestation:ImageSha384`
-  and `kms:RecipientAttestation:PCR<n>` (PCR0 to PCR2, and PCR3 for the role) equal the published
-  values; a request without an attestation document cannot satisfy the condition.
+  ciphertext; after a restart it calls `Decrypt` on that copy with a fresh attestation document.
+- The key policy allows `Decrypt` and `GenerateDataKey` only when
+  `kms:RecipientAttestation:ImageSha384` and `kms:RecipientAttestation:PCR<n>` (PCR0 to PCR2, and
+  PCR3 for the role) equal the published values; a request without an attestation document cannot
+  satisfy the condition. A new release has a new PCR0, so the policy is changed to admit it and
+  the site is rebuilt with the new values.
 - The policy denies `Encrypt` and `ReEncrypt*` to everyone. Neither takes an attestation document
   (the operations that do are `Decrypt`, `DeriveSharedSecret`, `GenerateDataKey`,
   `GenerateDataKeyPair` and `GenerateRandom`). With `Encrypt`, the operator could seal a key it
   knows in a form the enclave accepts; with `ReEncrypt`, it could move the sealed data key under a
   KMS key it may decrypt without attestation.
-- A new release has a new PCR0, so the key policy is changed to admit it and the site is rebuilt
-  with the new values. Who may change the key policy is set inside the operator's AWS account; it
-  is not a public, on-chain change like a keeper-set upgrade through the multisig.
+- Key loss: it follows from the sealing that a deleted KMS key, or a policy that admits no running
+  image, leaves the sealed pool key unreadable.
+- The evidence is the attestation document: CBOR, COSE_Sign1 signed with ES384, carrying
+  `module_id`, `timestamp`, `digest`, `pcrs`, `certificate`, `cabundle` and the optional `nonce`,
+  `user_data` and `public_key` (each at most 1,024 bytes). The check: the chain from `cabundle` to
+  the AWS Nitro Enclaves root certificate (whose fingerprint AWS publishes), each certificate's
+  validity, the COSE signature, the nonce, the timestamp's age, PCR0 to PCR2 against the compiled
+  values, no all-zero PCR, and `user_data` and `public_key` against the binding and request key.
 
-### How the page or a checker verifies an attestation [proposal]
+### Side by side
 
-- A keeper route, `/lend/attestation?nonce=<32 hex>`, returns a fresh attestation document: CBOR,
-  COSE_Sign1 signed with ES384, carrying `module_id`, `timestamp`, `digest`, `pcrs`,
-  `certificate`, `cabundle` and the optional `nonce`, `user_data` and `public_key` (each at most
-  1,024 bytes). `nonce` is the caller's. `public_key` is an enclave-generated key the page
-  encrypts its requests to. `user_data` is `SHA-256("keeler-keeper-attest-v1" ‖ program id ‖
-  keeper address ‖ pool viewing key ‖ reply key)`, the reply key being a second enclave key that
-  signs every keeper reply. The route's reply also carries a signature by the keeper key over the
-  document, so the enclave shows it holds a compiled keeper key rather than only naming one.
-- The check: the certificate chain from `cabundle` to the AWS Nitro Enclaves root certificate
-  (whose fingerprint AWS publishes), each certificate's validity, the COSE signature, the nonce,
-  the timestamp's age, PCR0 to PCR2 against the values compiled into the site (as the keeper set
-  and pool key are today), no all-zero PCR, and the keeper signature against the compiled
-  `KEEPERS`. Lending stays hidden when it fails, as it does today for an unknown keeper.
-- What the page's check binds: a request encrypted to `public_key` can be read only by an enclave
-  running the published image, and a reply signed by the reply key came from it. Both still pass
-  through the Cloudflare Worker, where the page's TLS ends. The Worker cannot read those requests
-  or forge those replies, but can delay, drop or replay them (the keeper's nonce and session
-  checks stand against replay). Page JavaScript cannot see its TLS peer's key, so the page cannot
-  bind a TLS channel to the enclave.
-- What it cannot bind: the page is served by the operator, and a different page could skip the
-  check ("The Worker operator" above). A standalone `keeler attest-check`, run by the user, does
-  not depend on the page; when it connects to the enclave directly with a TLS key the enclave
-  names in `user_data`, it can also bind that TLS channel to the enclave.
+| | Phala dstack (Intel TDX) | AWS Nitro Enclaves |
+| --- | --- | --- |
+| What is measured | MRTD, RTMR0 to RTMR2 (firmware, virtual hardware, kernel, command line, initrd), RTMR3 events (`app-id`, `compose-hash`, `os-image-hash`, `key-provider`) | PCR0 to PCR2 (image, kernel and ramfs, application); PCR3 and PCR4 describe the host |
+| How debug shows | The TD debug attribute in the quote; the verifier must refuse it | PCRs all zeros |
+| Who can release the keys | The KMS, under the DstackApp and DstackKms policies; also anyone holding the KMS root | AWS KMS, under the key policy's attestation conditions |
+| Where the release policy lives | Ethereum or Base contracts; the DstackApp owner and the DstackKms owner change it in public transactions | The key policy in the operator's AWS account; changed by that account, not publicly |
+| What a rebuild needs | The dstack OS release and `dstack-mr` for the vCPUs and memory; the keeper container by digest; the compose file | A pinned `nitro-cli` with its kernel and init blobs; the keeper container by digest |
+| Root of trust | Intel's TDX module and root CA | The Nitro hypervisor and the AWS Nitro Enclaves root certificate |
+| Also trusted | Phala: KMS root, DstackKms owner, OS releases, hosts, VMM, gateway | AWS |
+| Single-writer support | The app policy counts no instances; replicas share keys; the lease above | The lease above; the design uses nothing from AWS for it |
 
-### Encrypted state outside the enclave [proposal]
+### What neither enclave fixes [proposal]
 
-- The state file (openings, tickets, pending builds, scan marks) is sealed under the data key and
-  stored by the parent, which holds bytes it cannot read.
-- The parent can hand the enclave an older blob. The chain is the anchor against that: on load
-  the enclave checks each note it holds against its nullifier account and replays the history
-  from its scan mark, as the keeper does today (`docs/lend-keeper.md`, "Recovery"), so an old
-  reserve opening is seen to be spent and the current notes are read back from the chain. What a
-  rollback can still change is the record that is not on chain: tickets and pending builds.
-- No version counter is proposed: kept in a store the operator controls (a DynamoDB item, a
-  file), it can be restored together with the blob.
-
-### A single-writer lease [proposal]
-
-- Today the lock stops two processes on one file, not two machines with one key
-  (`docs/lend-keeper.md`, "Never"). An enclave fleet adds a lease per keeper key in a store with
-  conditional writes (for example a DynamoDB item: holder, expiry, a fencing token that only
-  grows). The enclave sends nothing and writes no state without an unexpired lease, and stops a
-  margin before expiry when a renewal fails.
-- A fencing token protects only what checks it: the state store must refuse a write with an older
-  token. The chain checks no token.
-- The expiry needs a time source the operator cannot skew, and the operator owns the lease table,
-  can rewrite or delete the item, and carries the enclave's network traffic. So the lease guards
-  against faults (a host that stalls and comes back, a failover run twice), not against the
-  operator.
-- The backstop is the chain: two builds on one reserve cannot both land (the reserve's
-  nullifier), so two writers cost a fee. Deposits spend no reserve, so two writers can still pass
-  `max_total_collateral` together (review K-2).
-
-### What the enclave cannot fix [proposal]
-
-- **Liveness.** The operator can stop the instance, cut its network or withhold the vsock proxy.
-  The pool still halts; the trust statement stays.
-- **The operator chooses the image and the key policy.** Users compare the PCRs with values the
-  site compiles in, and the site is served by the same operator; independent parties who rebuild
-  the tag and publish the PCRs are the check on that. The KMS key policy and CloudTrail are inside
-  the operator's AWS account and not publicly readable, so "only the published image can decrypt
-  the keys" is the operator's statement, not something a user can verify.
-- **The hardware and cloud vendor.** AWS, the Nitro hypervisor and the Nitro root certificate
-  become part of the trusted base.
+- **Liveness.** The operator, or on dstack Phala's hosts, can stop the instance, cut its network
+  or, on Nitro, withhold the vsock proxy. The pool still halts; the trust statement stays.
+- **The operator chooses the image and the release policy.** Users compare measurements with
+  values the site compiles in, and the site is served by the same operator; independent parties
+  who rebuild the tag and publish the measurements are the check on that. On Nitro the key policy
+  and CloudTrail are inside the operator's AWS account and not publicly readable, so "only the
+  published image can decrypt the keys" is the operator's statement. On dstack the approvals are
+  public, but the operators' multisig makes them.
 - **Side channels.** The proposal claims no protection against timing or microarchitectural side
-  channels, nor against what the parent learns from the size and timing of the enclave's traffic.
+  channels, nor against what the host learns from the size and timing of the enclave's traffic.
 - **Corrupt ciphertext.** An enclave running honest code will not write an unreadable reserve, but
   nothing on chain proves it did not.
 - **Public wallets.** Wallets are public on every operation in the Default Ring; the enclave
@@ -345,19 +472,46 @@ writes checkable on chain.
 
 ### References
 
-AWS documentation read on 2026-11-25:
+All read on 2026-11-26. dstack files are under
+https://github.com/Dstack-TEE/dstack/blob/63dde6a76e5c59402ab7ae3c26519ed1d10cbeae/:
 
-- Nitro Enclaves, cryptographic attestation (the PCRs, debug mode):
-  https://docs.aws.amazon.com/enclaves/latest/user/set-up-attestation.html
-- Nitro Enclaves, the attestation document and its validation:
-  https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html
-- Nitro Enclaves, using AWS KMS: https://docs.aws.amazon.com/enclaves/latest/user/kms.html
-- `nitro-cli run-enclave` (debug mode):
-  https://docs.aws.amazon.com/enclaves/latest/user/cmd-nitro-run-enclave.html
-- AWS KMS, how Nitro Enclaves use KMS:
-  https://docs.aws.amazon.com/kms/latest/developerguide/services-nitro-enclaves.html
-- AWS KMS, attested calls (`Recipient`, `CiphertextForRecipient`):
-  https://docs.aws.amazon.com/kms/latest/developerguide/attested-calls.html
-- AWS KMS, attestation condition keys:
-  https://docs.aws.amazon.com/kms/latest/developerguide/conditions-attestation.html
-- AWS KMS API, `ReEncrypt`: https://docs.aws.amazon.com/kms/latest/APIReference/API_ReEncrypt.html
+- `docs/attestation-tdx.md` (MRTD, RTMRs, `dstack-mr`); `docs/building-guest-os.md` (development
+  image, `os-repro-check`); `docs/onchain-governance.md`, `docs/app-key-epochs.md` (app ids,
+  epochs).
+- `docs/security/security-model.md` (storage, rollback, TCB status);
+  `docs/security/security-best-practices.md` (digest pinning, public logs, event-log V2);
+  `docs/security/cvm-boundaries.md` (`app-compose.json`, `compose-hash`, `storage_fs`).
+- `sdk/js/README.md`, SDK 0.6.0 (`getKey`, holding assets); `dstack/kms/src/main_service.rs`
+  (`derive_app_keys`); `dstack/kms/auth-eth/contracts/DstackApp.sol` and `DstackKms.sol`.
+- `dstack/cc-eventlog/src/runtime_events.rs` (V1 and V2 digests);
+  `dstack/dstack-attest/src/attestation.rs` (debug check).
+
+Helius: `WIRE_CONTRACT.md` and `README.md` under
+https://github.com/helius-labs/privacy-rings/blob/5571dc0e1031bea5c77496584a6e1d970fbbd3fe/prover/tee/.
+`@phala/dcap-qvl` 0.6.6: `src/verify.js`, `src/tcb_info.js` and `src/collateral.js` under
+https://unpkg.com/@phala/dcap-qvl@0.6.6/.
+
+- Phala, Cloud KMS and on-chain KMS (contract addresses):
+  https://docs.phala.com/phala-cloud/key-management/cloud-vs-onchain-kms
+- Phala, multi-replica scaling: https://docs.phala.com/phala-cloud/cvm/multi-replica-scaling
+- Phala, network security (gateway TLS): https://docs.phala.com/phala-cloud/networking/security
+- Phala, June 2026 notice:
+  https://phala.com/posts/security-incident-notice-phala-cloud-api-vulnerability
+- Phala, October 2026 post-mortem:
+  https://phala.com/posts/2026-10-post-mortem-dstack-guest-agent-vulnerability
+- Phala, November report: https://phala.com/posts/phala-november-detailed-incident-report
+- Intel, Trust Domain Extensions overview (threat model):
+  https://cdrdv2-public.intel.com/856790/Intel%20Trust%20Domain%20Extensions%20Overview%20-%20June%202025.pdf
+- On-chain reads (`owner()`, `getThreshold()`, `getOwners()`): https://ethereum-rpc.publicnode.com
+  and https://mainnet.base.org.
+
+AWS pages, under https://docs.aws.amazon.com/:
+
+- Nitro Enclaves: `enclaves/latest/user/set-up-attestation.html` (PCRs, debug mode),
+  `enclaves/latest/user/verify-root.html` (the attestation document and its validation),
+  `enclaves/latest/user/kms.html` (using AWS KMS), `enclaves/latest/user/cmd-nitro-run-enclave.html`
+  (debug mode).
+- AWS KMS: `kms/latest/developerguide/cryptographic-attestation.html`,
+  `kms/latest/developerguide/attested-calls.html` (`Recipient`, `CiphertextForRecipient`),
+  `kms/latest/developerguide/conditions-nitro-enclave.html` (condition keys),
+  `kms/latest/APIReference/API_ReEncrypt.html`.

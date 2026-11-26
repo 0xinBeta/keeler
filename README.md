@@ -271,8 +271,8 @@ dirty tree and a single-key upgrade authority).
 
 ## Documents
 
-- `docs/threat-model.md`: who can do what, what enforces it, and a Nitro Enclave proposal for the
-  keeper.
+- `docs/threat-model.md`: who can do what, what enforces it, and a proposal for running the
+  keeper in an enclave (Phala dstack, with AWS Nitro Enclaves as the alternative).
 - `docs/design-decisions.md`: the reasons behind the reserve note, fixed outputs, the keeper
   signature, the price bound, keeper-built transactions and liquidation sizing.
 - `docs/notes-for-xark-builders.md`: Xark pitfalls hit here and the spike's measurements.
