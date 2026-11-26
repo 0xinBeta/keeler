@@ -167,7 +167,8 @@ h1 {
 .health-close .health-fill {
   background: linear-gradient(90deg, var(--gold), #ff9a5e);
 }
-.health-liquidatable .health-fill {
+.health-liquidatable .health-fill,
+.health-unsecured .health-fill {
   background: var(--ember);
   box-shadow: 0 0 14px rgb(255 106 61 / 0.6);
 }
@@ -1170,7 +1171,8 @@ h1 {
 .app .badge-close {
   color: #f3c57d;
 }
-.app .badge-liquidatable {
+.app .badge-liquidatable,
+.app .badge-unsecured {
   color: var(--error);
 }
 .app .position .health {

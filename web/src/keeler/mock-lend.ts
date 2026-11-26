@@ -5,7 +5,7 @@
 import { KeelerError } from "./index";
 import type { Asset, KeelerLend, LendAccount, LendKind, LendOperation, LendStep, Liquidation, Pool, Position, Vault } from "./index";
 import * as L from "./lend-math";
-import { keeperLiquidates, liquidationBound } from "../ui/lend-view";
+import { keeperLiquidates, liquidationBound } from "./lend-keeper";
 
 const PRICE_SCALE = L.PRICE_SCALE;
 
@@ -179,7 +179,6 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
     if (o.status === "pending" && o.step === "keeper" && o.expiry !== null && now() > o.expiry) o.status = "refundable";
   };
 
-  // The keeper's watcher: liquidates any position past the threshold, a few seconds after the price moves.
   const watch = () => {
     clearTimeout(watcher);
     watcher = window.setTimeout(() => {
@@ -191,7 +190,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
         try {
           l = L.liquidate(p.debtShares, r.borrowPrice, p.collateral, bound, cv);
         } catch {
-          continue; // not liquidatable, or nothing to take
+          continue;
         }
         r = { ...r, debtShares: r.debtShares - (p.debtShares - l.debtShares) };
         p.lastLiquidation = { at: now(), debtRepaid: l.repay, collateralSold: l.payout, price: bound, collateralLeft: l.collateral, debtLeft: L.debtOf(l.debtShares, r.borrowPrice), signature: mockSignature("Liquidate") };
