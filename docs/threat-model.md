@@ -218,7 +218,8 @@ after it. References are at the end of the section.
 - The pool key is made once, on the deploy machine, and copied to each keeper host
   (`docs/mainnet-runbook.md`, section 4). The operator holds every key in clear.
 - The only TEE in the system is Helius' prover for the shielded pool's proofs ("The prover"
-  above). Nothing in this repository runs in, or checks, any enclave.
+  above). Nothing in this repository runs in an enclave; the only attestation it checks is that
+  prover's, through the Rings SDK.
 
 ### Common to both platforms [proposal]
 
@@ -251,21 +252,28 @@ after it. References are at the end of the section.
   pool key are today. Lending stays hidden when it fails, as it does today for an unknown keeper.
 - What the check binds: a request encrypted to the request key can be read only by the attested
   instance, and a reply signed by the reply key came from it, so where TLS ends (the Cloudflare
-  Worker for the page, Phala's gateway on dstack) does not decide who reads a request. The Worker
-  and the gateway can delay, drop or replay requests (the keeper's nonce and session checks stand
-  against replay), but cannot read them or forge replies.
+  Worker for the page, Phala's gateway on dstack) does not decide who reads a request. Page
+  JavaScript cannot see its TLS peer's key, so the page binds no TLS channel and relies on these
+  two keys alone. The Worker and the gateway can delay, drop or replay requests (the keeper's
+  nonce and session checks stand against replay), but cannot read them or forge replies.
+- The page attests each keeper and encrypts to the one it addresses, so failover
+  (`docs/mainnet-runbook.md`, section 10) is a retry by the page, not a forward by the Worker.
 - What it cannot bind: the page is served by the operator, and a different page could skip the
   check ("The Worker operator" above). A standalone `keeler attest-check`, run by the user, makes
   the same check without depending on the page.
 
 ### Keys made inside the enclave [proposal]
 
-- The enclave generates the keeper key and the pool key itself and seals them under a platform
-  key: a key from dstack's `getKey`, or a KMS data key on Nitro. They are not derived directly
-  with `getKey`: the dstack SDK says derived keys are "not suitable for holding assets", and
-  suggests a random key sealed under the derived key instead.
+- The enclave generates the keeper key and the pool key itself, never exports them in clear, and
+  seals them under a platform key: a key from dstack's `getKey`, or a KMS data key on Nitro. They
+  are not derived directly with `getKey`: the dstack SDK says derived keys are "not suitable for
+  holding assets", and suggests a random key sealed under the derived key instead.
 - The current pool key was made on the deploy machine, so this means a new deployment with new
   compiled `KEEPERS` and `POOL_VIEWING`; it cannot be applied to the present keys.
+- The measured image cannot compile in `KEEPERS` or `POOL_VIEWING` as the keeper does today
+  (`docs/mainnet-runbook.md`, section 6; the binary refuses to run with other values), because it
+  has yet to generate them. It would read its public keys from the sealed state and report them
+  in the binding, and the program and the site would be built from an attested first boot.
 - Two keepers hold one pool key and two keeper keys. The sealed pool key passes between the
   instances as ciphertext; each instance seals its own keeper key. On dstack this is not a trust
   boundary: every instance and every approved compose under one app id derives the same sealing
@@ -324,7 +332,9 @@ after it. References are at the end of the section.
   `rtmr3 = SHA-384(rtmr3 ‖ digest)` from 48 zero bytes. V2 hashes canonical JSON and is opt-in
   (`event_log_version: 2`). For V2 the dstack text says privileged code in the CVM can append
   measured events after boot, so a policy takes each trusted event from before `system-ready`
-  and refuses duplicate names. The verifier here applies that rule to V1 too.
+  and refuses duplicate names. The check would apply that rule to V1 too, and refuse a V1 event
+  name that contains ":" and any event type other than 0x08000001, as dstack's own validation and
+  Helius' contract do.
 - Debug. Nothing is zeroed: the debug bit is in the TD attributes of the signed quote.
   `dcap-qvl` 0.6.6, the version in `web/pnpm-lock.yaml` through the Rings SDK, refuses it unless
   the caller sets `allowDebug`, as dstack's own quote check does; the page never sets it. A
@@ -337,17 +347,19 @@ after it. References are at the end of the section.
   accepts. The keeper relays the Intel-signed collateral, as Helius' prover does; Helius' README
   states the cost: a newly revoked TCB shows only after the prover refreshes its collateral. Here
   the bound is the relayed collateral's `nextUpdate`. `dcap-qvl` fetches from Phala's PCCS by
-  default and also defines Intel's PCS, which the keeper uses.
+  default and also defines Intel's PCS, which the keeper would use.
 - Keys. Every app key derives from the KMS root, the app id and the app epoch; the disk key adds
   the instance id. The compose hash and the OS image are checked before release but are not
   inputs, so any compose approved under the app id receives the same keys. Only the on-chain KMS
   is used: on Phala Cloud's own KMS, Phala's November report says, Phala sets the key-release
   policy. The routes to the keys:
-  - the DstackApp owner: adding a compose hash or a device, `setAllowAnyDevice`,
-    `setRequireTcbUpToDate`, upgrading the app contract until `disableUpgrades()`, advancing the
-    app epoch; each a public transaction;
+  - the DstackApp owner: adding a compose hash or a device to any epoch row, `setAllowAnyDevice`,
+    `setAllowAnyTeeVariant` or `setAllowedTeeVariants`, `setRequireTcbUpToDate`, the launch-ticket
+    setters, `transferOwnership`, upgrading the app contract until `disableUpgrades()`; each a
+    public transaction;
   - the DstackKms owner: upgrading the KMS contract, adding OS images, KMS measurements, KMS
-    devices and root epochs. On Ethereum (`0xd343a3f5593b93D8056aB5D60c433622d7D65a80`) and Base
+    devices and root epochs, and setting TEE variants, SEV-SNP TCB requirements, KMS launch
+    tickets and ownership. On Ethereum (`0xd343a3f5593b93D8056aB5D60c433622d7D65a80`) and Base
     (`0x2f83172A49584C017F2B256F0FB2Dca14126Ba9C`) it is
     `0x3926658a072f82baea5e5a15e1fed8a776f4a663`, which reports a threshold of 2
     (`getThreshold()`) and three owners (`getOwners()`), read 2026-11-26 at Ethereum block
@@ -356,19 +368,28 @@ after it. References are at the end of the section.
 - The app policy pins no MRTD or RTMR: it checks the launch ticket, app epoch, TCB status, compose
   hash, device and TEE variant; the KMS contract adds its OS image allowlist. A client attests
   only the instance it reaches and never sees another one running another approved compose. So
-  the design requires `disableUpgrades()`, a device allowlist, `requireTcbUpToDate`, and a
-  DstackApp owner that is the operators' own multisig, a second governance surface beside the
-  Solana upgrade multisig. The claim is that operators cannot obtain the keys without a public
-  transaction, not that they cannot read amounts: account views cross the Worker in clear (W-3),
-  and the operator serves the page.
+  the design requires `disableUpgrades()`, a device allowlist,
+  `setAllowedTeeVariants(["dstack-tdx"])` (the variant policy is unrestricted by default),
+  `requireTcbUpToDate` (which refuses key release after an Intel TCB recovery until the hosts are
+  patched, a liveness cost), and a DstackApp owner that is the operators' own multisig, a second
+  governance surface beside the Solana upgrade multisig. The claim is that operators cannot
+  obtain the keys without a public transaction, not that they cannot read amounts: account views
+  cross the Worker in clear (W-3), and the operator serves the page.
+- The check above reads no chain, so nothing in it sees those transactions. `keeler attest-check`
+  would also read the DstackApp at the pinned `app-id`: its owner, that upgrades are disabled,
+  the flags, and the whole event history of compose hashes and devices in every epoch row. A
+  hash that was added and later removed still received the keys.
 - Key loss and root rotation. A new root or app epoch gives a new `getKey` key, so the sealed keys
-  are read under the old epoch (`getKey` takes epoch selectors) and sealed again. When Phala
+  are read under the old epoch (`getKey` takes epoch selectors) and sealed again. That needs the
+  compose in the old app row and the OS image in the old root row, and the DstackKms owner
+  controls the second (`docs/app-key-epochs.md`). When Phala
   replaced its legacy Cloud KMS root, its November report says, `getKey()` returned new keys, the
   old root stayed reachable as epoch 0 on request, apps using `getKey()` had to move what the old
   keys protected, and the migration did not revoke the attacker's copy. The pool key cannot move,
   so whoever holds a leaked root and the sealed file can read it.
 - Trust base: Intel (the TDX module, the PCK chain and root CA, the PCS) and Phala (the KMS root
-  and its nodes, the DstackKms owner, OS releases, the hosts, the VMM, the gateway). Intel's TDX
+  and its nodes, the DstackKms owner, OS releases, the hosts, the VMM, the gateway), and Ethereum
+  or Base with the RPC endpoint the KMS reads the policy through (`ETH_RPC_URL`). Intel's TDX
   overview: denial of service by the VMM is out of scope, replay of memory through physical
   attacks is not defended against, and a hardware attacker can see memory ciphertext.
 - Phala's published incidents, as Phala's own posts state them:
@@ -379,21 +400,23 @@ after it. References are at the end of the section.
     container configuration, environment variables included, for a small set of apps (OS images
     0.3.1 to 0.6.0); TEE, sealing and KMS keys and on-chain KMS operations unaffected (post-mortem
     of 2026-10-19).
-  - 2026-10-21 to 2026-11-01: through a monitoring CVM's default password, an attacker reached a
+  - 2026-10-20 to 2026-11-01: through a monitoring CVM's default password, an attacker reached a
     VMM that took any request from loopback; requests to an experimental DeepSeek CVM on the
     development OS image are counted at risk (November report).
-  - 2026-11-05 to 2026-11-06: a KMS replica whose onboarding checked only that the OS image was
-    known handed the legacy root key to callers at the attacker's address; a new root went live
-    2026-11-06; on-chain KMS applications not affected (November report, final version of
-    2026-11-23, with a penetration test and remaining migrations still open).
+  - 2026-11-04 to 2026-11-06: an attacker reached the VMM on two Phala Cloud hosts, read the
+    Cloud gateway's secrets and obtained the legacy Cloud KMS root; a KMS replica whose onboarding
+    checked only that the OS image was known handed it over seven times on 2026-11-05, the first
+    to a caller at the attacker's address; every key under that root is treated as exposed; a new
+    root went live 2026-11-06; on-chain KMS applications not affected (November report, final
+    version of 2026-11-23, with a penetration test and remaining migrations still open).
 - No single-instance guarantee: replicas share the app id and compose hash, and so the app keys.
 
 ### AWS Nitro Enclaves: the alternative [proposal]
 
 - The keeper runs from an enclave image file (EIF) made with `nitro-cli build-enclave` from a
-  tagged commit: the `keeler keeper` binary built with the deploy's build parameters
-  (`docs/mainnet-runbook.md`, section 6), the ceremony's proving keys checked against the
-  manifest, a minimal init, no shell.
+  tagged commit: the `keeler keeper` binary built with the deploy's build parameters except the
+  keeper set and pool key (`docs/mainnet-runbook.md`, section 6), the ceremony's proving keys
+  checked against the manifest, a minimal init, no shell.
 - The PCRs, as AWS defines them: PCR0 measures the image file, PCR1 the kernel and boot ramfs,
   PCR2 the application, PCR8 the signing certificate (only for a signed image). PCR3 is a hash of
   the parent instance's IAM role ARN and PCR4 of the parent's instance id: they describe the host,
@@ -429,6 +452,7 @@ after it. References are at the end of the section.
   the AWS Nitro Enclaves root certificate (whose fingerprint AWS publishes), each certificate's
   validity, the COSE signature, the nonce, the timestamp's age, PCR0 to PCR2 against the compiled
   values, no all-zero PCR, and `user_data` and `public_key` against the binding and request key.
+- Trust base: AWS, the Nitro hypervisor and the AWS Nitro Enclaves root certificate.
 
 ### Side by side
 
@@ -441,18 +465,19 @@ after it. References are at the end of the section.
 | What a rebuild needs | The dstack OS release and `dstack-mr` for the vCPUs and memory; the keeper container by digest; the compose file | A pinned `nitro-cli` with its kernel and init blobs; the keeper container by digest |
 | Root of trust | Intel's TDX module and root CA | The Nitro hypervisor and the AWS Nitro Enclaves root certificate |
 | Also trusted | Phala: KMS root, DstackKms owner, OS releases, hosts, VMM, gateway | AWS |
-| Single-writer support | The app policy counts no instances; replicas share keys; the lease above | The lease above; the design uses nothing from AWS for it |
+| Single-writer support | The app policy counts no instances; replicas share keys; the lease above | Nitro Enclaves count no instances either; the lease above |
 
 ### What neither enclave fixes [proposal]
 
 - **Liveness.** The operator, or on dstack Phala's hosts, can stop the instance, cut its network
-  or, on Nitro, withhold the vsock proxy. The pool still halts; the trust statement stays.
+  or, on Nitro, withhold the vsock proxy. On dstack the DstackKms owner can also stop key release
+  at the next boot by removing the OS image. The pool still halts; the trust statement stays.
 - **The operator chooses the image and the release policy.** Users compare measurements with
   values the site compiles in, and the site is served by the same operator; independent parties
   who rebuild the tag and publish the measurements are the check on that. On Nitro the key policy
   and CloudTrail are inside the operator's AWS account and not publicly readable, so "only the
-  published image can decrypt the keys" is the operator's statement. On dstack the approvals are
-  public, but the operators' multisig makes them.
+  published image can decrypt the keys" is the operator's statement, not something a user can
+  verify. On dstack the approvals are public, but the operators' multisig makes them.
 - **Side channels.** The proposal claims no protection against timing or microarchitectural side
   channels, nor against what the host learns from the size and timing of the enclave's traffic.
 - **Corrupt ciphertext.** An enclave running honest code will not write an unreadable reserve, but
@@ -482,9 +507,11 @@ https://github.com/Dstack-TEE/dstack/blob/63dde6a76e5c59402ab7ae3c26519ed1d10cbe
   `docs/security/security-best-practices.md` (digest pinning, public logs, event-log V2);
   `docs/security/cvm-boundaries.md` (`app-compose.json`, `compose-hash`, `storage_fs`).
 - `sdk/js/README.md`, SDK 0.6.0 (`getKey`, holding assets); `dstack/kms/src/main_service.rs`
-  (`derive_app_keys`); `dstack/kms/auth-eth/contracts/DstackApp.sol` and `DstackKms.sol`.
+  (`derive_app_keys`); `dstack/kms/auth-eth/contracts/DstackApp.sol` and `DstackKms.sol`;
+  `dstack/kms/auth-eth/README.md` (`ETH_RPC_URL`).
 - `dstack/cc-eventlog/src/runtime_events.rs` (V1 and V2 digests);
-  `dstack/dstack-attest/src/attestation.rs` (debug check).
+  `dstack/dstack-attest/src/attestation.rs` (debug check);
+  `dstack/dstack-util/src/system_setup.rs` (the RTMR3 events, `aes-xts-plain64`).
 
 Helius: `WIRE_CONTRACT.md` and `README.md` under
 https://github.com/helius-labs/privacy-rings/blob/5571dc0e1031bea5c77496584a6e1d970fbbd3fe/prover/tee/.
