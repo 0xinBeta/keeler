@@ -2700,7 +2700,44 @@ fn a_mainnet_keeper_takes_its_http_key_from_the_keychain_and_bounds_its_fee() {
     let keychain = json!({"keychain": "http"});
     assert!(cfg(keychain.clone(), 0).check().is_ok());
     assert!(cfg(json!({"file": "/tmp/key"}), 0).check().is_err());
+    assert!(cfg(json!({"env": "HTTP_KEY"}), 0).check().is_err());
     let max = crate::config::MAX_PRIORITY_FEE;
     assert!(cfg(keychain.clone(), max).check().is_ok());
     assert!(cfg(keychain, max + 1).check().is_err());
+}
+
+#[test]
+fn allow_remote_and_env_keys_are_for_devnet_only() {
+    let cfg = |network: &str, helius: Value, http: Value| -> KeeperConfig {
+        let mut lend = mainnet_lend(r#"["https://keeler.example"]"#, 1);
+        lend["network"] = json!(network);
+        let cluster = if network == "mainnet" {
+            "mainnet"
+        } else {
+            "devnet"
+        };
+        serde_json::from_value(json!({
+            "network": {"rpc_url": format!("https://{cluster}.helius-rpc.com"),
+                "indexer_url": format!("https://{cluster}.helius-rpc.com/v1/spr"),
+                "prover": {"helius": helius}},
+            "key": {"env": "KEEPER_KEY"},
+            "http": http,
+            "lend": lend,
+        }))
+        .unwrap()
+    };
+    let env = json!({"env": "HELIUS"});
+    let keychain = json!({"keychain": "helius"});
+    let open = json!({"listen": "0.0.0.0:47501", "key": {"env": "HTTP"}, "allow_remote": true});
+    let closed = json!({"listen": "0.0.0.0:47501", "key": {"env": "HTTP"}});
+    let local = json!({"listen": "127.0.0.1:47501", "key": {"keychain": "http"}});
+    assert!(cfg("devnet", env.clone(), open.clone()).check().is_ok());
+    assert!(cfg("devnet", env.clone(), closed).check().is_err());
+    assert!(cfg("mainnet", keychain.clone(), local.clone())
+        .check()
+        .is_ok());
+    assert!(cfg("mainnet", env, local).check().is_err());
+    let mut remote = open;
+    remote["key"] = json!({"keychain": "http"});
+    assert!(cfg("mainnet", keychain, remote).check().is_err());
 }

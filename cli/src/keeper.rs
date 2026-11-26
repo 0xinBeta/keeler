@@ -2998,21 +2998,24 @@ impl KeeperConfig {
                 e.column()
             )
         })?;
-        ensure!(
-            cfg.http.listen.ip().is_loopback(),
-            "http.listen must be a loopback address"
-        );
         cfg.check()?;
         Ok(cfg)
     }
 
     pub fn check(&self) -> Result<()> {
+        self.http.check()?;
         self.network.check()?;
         self.lend.check()?;
-        ensure!(
-            !self.lend.mainnet() || !self.http.key.is_file(),
-            "on mainnet the HTTP key comes from the Keychain, not a file"
-        );
+        if self.lend.mainnet() {
+            ensure!(
+                self.http.key.is_keychain() && self.network.key_from_keychain(),
+                "on mainnet the HTTP and Helius keys come from the Keychain, not a file or the environment"
+            );
+            ensure!(
+                !self.http.allow_remote,
+                "http.allow_remote is refused on mainnet"
+            );
+        }
         Ok(())
     }
 }
@@ -3038,8 +3041,8 @@ pub fn connect(
     if lend.mainnet() {
         let files = [Some(key_source), Some(pool_source), lend.admin_key.as_ref()];
         ensure!(
-            !files.iter().flatten().any(|k| k.is_file()),
-            "on mainnet the keeper, pool and admin keys come from the Keychain, not a file"
+            files.iter().flatten().all(|k| k.is_keychain()),
+            "on mainnet the keeper, pool and admin keys come from the Keychain, not a file or the environment"
         );
     }
     let signer = key_source.keypair()?;
@@ -3124,6 +3127,7 @@ pub fn run_standalone(cfg: &KeeperConfig, stop: &AtomicBool) -> Result<()> {
             &health,
             Some(&keeper),
             Duration::from_secs(3),
+            cfg.http.allow_remote,
         );
         stop.store(true, Ordering::Relaxed);
         let _ = worker.join();
@@ -3142,7 +3146,10 @@ impl<L: Ledger> crate::dealer::Api for Health<'_, L> {
         Err((404, "the faucet is off".into()))
     }
     fn now(&self) -> Result<u64, String> {
-        self.0.now().map_err(|e| format!("{e:#}"))
+        self.0.now().map_err(|e| {
+            log!("keeper: chain time: {e:#}");
+            "no chain time".to_string()
+        })
     }
 }
 

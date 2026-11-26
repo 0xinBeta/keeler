@@ -1,0 +1,7 @@
+{
+  "name": "keeler-phala-deploy",
+  "private": true,
+  "dependencies": {
+    "phala": "1.2.8"
+  }
+}

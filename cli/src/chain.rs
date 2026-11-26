@@ -224,7 +224,7 @@ impl Chain {
             .with_proof_data_source(ProofDataSource::Client),
             // Helius serves the prover at the indexer URL, attested under the
             // network's signed TEE policy, and fetches proof data itself.
-            Prover::Helius { .. } => {
+            Prover::Helius(_) => {
                 let tee = match reqwest::Url::parse(&network.rpc_url)?.host_str() {
                     Some("devnet.helius-rpc.com") => TeeNetwork::Devnet,
                     Some("mainnet.helius-rpc.com") => TeeNetwork::Mainnet,

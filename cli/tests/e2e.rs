@@ -527,6 +527,7 @@ fn http_quote_settles() {
         Some(Http {
             listen: http,
             key: KeySource::File(key_file),
+            allow_remote: false,
         }),
     );
     let kp = shielded(&fixture::actor(0)).unwrap();
@@ -597,6 +598,7 @@ fn http_quote_settles() {
         Some(Http {
             listen: http,
             key: KeySource::File(net.keys.join("http-key")),
+            allow_remote: false,
         }),
     );
 

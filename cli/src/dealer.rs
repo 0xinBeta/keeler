@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Mutex, OnceLock,
     },
-    thread::{self, sleep, Scope},
+    thread::{self, sleep},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -50,8 +50,13 @@ const HTTP_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_LEND_BODY: usize = 16_384;
 /// A `/lend/build` proves a transaction; the Worker waits 30 s.
 const LEND_DEADLINE: Duration = Duration::from_secs(30);
-/// `/lend/*` requests served at once, each on its own thread.
+/// `/lend/*` requests served at once.
 const MAX_LEND_THREADS: usize = 8;
+/// HTTP connections open at once, each on its own thread: room for every
+/// lend request and as many again waiting on their heads or the swap routes.
+const MAX_HTTP_THREADS: usize = 2 * MAX_LEND_THREADS;
+/// Time a peer gets to send its head when any peer may connect.
+const REMOTE_HEAD_DEADLINE: Duration = Duration::from_secs(1);
 const HOUR: u64 = 3_600;
 const DEFAULT_AUTO_PAUSE: u32 = 3;
 const DEFAULT_MIN_FEE: u64 = 10_000_000;
@@ -267,15 +272,25 @@ fn fresh_last_look(
 }
 
 /// What a dealer on `cluster` refuses to start with: a lend section for
-/// another network, and on mainnet a faucet or a key read from a file.
+/// another network, and on mainnet a faucet, a key that is not in the
+/// Keychain, or an HTTP server open beyond loopback.
 fn start_checks(cfg: &DealerConfig, cluster: Cluster) -> Result<()> {
     if let Some(l) = &cfg.lend {
         crate::keeper::check_cluster(l, cluster)?;
     }
     if cluster == Cluster::Mainnet {
         ensure!(cfg.faucet.is_none(), "no faucet on mainnet");
-        let files = cfg.common.key.is_file() || cfg.http.as_ref().is_some_and(|h| h.key.is_file());
-        ensure!(!files, "on mainnet keys come from the Keychain, not a file");
+        let keychain = cfg.common.key.is_keychain()
+            && cfg.common.network.key_from_keychain()
+            && cfg.http.as_ref().is_none_or(|h| h.key.is_keychain());
+        ensure!(
+            keychain,
+            "on mainnet keys come from the Keychain, not a file or the environment"
+        );
+        ensure!(
+            !cfg.http.as_ref().is_some_and(|h| h.allow_remote),
+            "http.allow_remote is refused on mainnet"
+        );
     }
     Ok(())
 }
@@ -333,7 +348,7 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
     };
     let poll_every = Duration::from_secs(cfg.poll_secs.unwrap_or(match c.network.prover {
         Prover::Local => 1,
-        Prover::Helius { .. } => 5,
+        Prover::Helius(_) => 5,
     }));
     let listener = TcpListener::bind(cfg.listen)?;
     let http = match &cfg.http {
@@ -343,7 +358,7 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
                 key.len() >= 16,
                 "the HTTP key must be at least 16 characters"
             );
-            Some((TcpListener::bind(h.listen)?, key))
+            Some((TcpListener::bind(h.listen)?, key, h.allow_remote))
         }
         None => None,
     };
@@ -363,8 +378,9 @@ pub fn run(cfg: &DealerConfig, stop: &AtomicBool) -> Result<()> {
                 crate::keeper::run_in_dealer(l, &c.network, &c.key, parts, keeper, stop)
             });
         }
-        let web = http
-            .map(|(l, key)| s.spawn(move || serve_http(l, &key, stop, api, lend, HTTP_DEADLINE)));
+        let web = http.map(|(l, key, allow_remote)| {
+            s.spawn(move || serve_http(l, &key, stop, api, lend, HTTP_DEADLINE, allow_remote))
+        });
         let mut seen = HashSet::new();
         let mut bound = HashMap::new();
         while !stop.load(Ordering::Relaxed)
@@ -601,72 +617,127 @@ fn read_head(r: &mut impl BufRead) -> io::Result<Option<Head>> {
     }
 }
 
-/// Serves the HTTP API until `stop` is set: swap routes one connection at a
-/// time, `/lend/*` (when `lend` is set) on threads of their own. Each
-/// connection gets `deadline` from accept to its head and swap reply (lend:
-/// `LEND_DEADLINE`), no body is read before the key and the declared length
-/// pass, and every reply closes.
+/// Serves the HTTP API until `stop` is set. Each connection gets a thread of
+/// its own, at most `MAX_HTTP_THREADS` at once. Swap routes are answered one
+/// at a time, `/lend/*` (when `lend` is set) up to `MAX_LEND_THREADS` at
+/// once. Each connection gets `deadline` to send its head (at most
+/// `REMOTE_HEAD_DEADLINE` when `allow_remote` is set), then `deadline` again
+/// from the swap lock to its reply (lend: `LEND_DEADLINE` from the head). No
+/// body is read before the peer, the key and the declared length pass, and
+/// every reply closes. Only a loopback peer passes unless `allow_remote` is
+/// set. Returns an error once a swap request has panicked.
 pub fn serve_http(
     listener: TcpListener,
     key: &str,
     stop: &AtomicBool,
-    api: &impl Api,
+    api: &(impl Api + Sync),
     lend: Option<&dyn LendRoutes>,
     deadline: Duration,
+    allow_remote: bool,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
-    let busy = AtomicUsize::new(0);
+    let server = HttpServer {
+        key,
+        api,
+        lend,
+        deadline,
+        allow_remote,
+        connections: AtomicUsize::new(0),
+        lend_busy: AtomicUsize::new(0),
+        swap: Mutex::new(()),
+    };
+    let server = &server;
     thread::scope(|s| {
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) && !server.swap.is_poisoned() {
             match listener.accept() {
                 Ok((stream, remote)) => {
-                    one_request(s, stream, remote, key, api, lend, &busy, deadline)
+                    if stream.set_nonblocking(false).is_err()
+                        || stream.set_write_timeout(Some(deadline)).is_err()
+                    {
+                        continue;
+                    }
+                    let Some(slot) = Slot::take(&server.connections, MAX_HTTP_THREADS) else {
+                        reply(&stream, error(503, "busy; try again shortly"));
+                        continue;
+                    };
+                    s.spawn(move || {
+                        let _slot = slot;
+                        server.one_request(stream, remote);
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => sleep(HTTP_POLL),
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
                 Err(e) => return Err(e.into()),
             }
         }
+        ensure!(!server.swap.is_poisoned(), "a swap request panicked");
         Ok(())
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn one_request<'s>(
-    scope: &'s Scope<'s, '_>,
-    stream: TcpStream,
-    remote: SocketAddr,
-    key: &'s str,
-    api: &impl Api,
-    lend: Option<&'s dyn LendRoutes>,
-    busy: &'s AtomicUsize,
-    deadline: Duration,
-) {
-    if stream.set_nonblocking(false).is_err() || stream.set_write_timeout(Some(deadline)).is_err() {
-        return;
+/// One place in a counter capped at a maximum, given back when dropped.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl<'a> Slot<'a> {
+    fn take(count: &'a AtomicUsize, max: usize) -> Option<Self> {
+        let slot = Slot(count);
+        (count.fetch_add(1, Ordering::SeqCst) < max).then_some(slot)
     }
-    let Ok(clone) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(Deadline {
-        stream: clone,
-        until: Instant::now() + deadline,
-    });
-    let (status, body) = match read_head(&mut reader) {
-        Ok(Some(h)) if h.chunked => error(400, "bad request"),
-        Ok(Some(h)) if h.path.starts_with("/lend/") && lend.is_some() => {
-            let Some(lend) = lend else { return };
-            if busy.fetch_add(1, Ordering::SeqCst) >= MAX_LEND_THREADS {
-                busy.fetch_sub(1, Ordering::SeqCst);
-                return reply(&stream, error(503, "busy; try again shortly"));
-            }
-            reader.get_mut().until = Instant::now() + LEND_DEADLINE;
-            let _ = stream.set_write_timeout(Some(LEND_DEADLINE));
-            scope.spawn(move || {
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct HttpServer<'a, A> {
+    key: &'a str,
+    api: &'a A,
+    lend: Option<&'a dyn LendRoutes>,
+    deadline: Duration,
+    allow_remote: bool,
+    connections: AtomicUsize,
+    lend_busy: AtomicUsize,
+    swap: Mutex<()>,
+}
+
+/// Whether a request from `remote` may go on to the key check.
+fn peer_allowed(remote: SocketAddr, allow_remote: bool) -> bool {
+    allow_remote || remote.ip().is_loopback()
+}
+
+impl<A: Api> HttpServer<'_, A> {
+    fn head_deadline(&self) -> Duration {
+        if self.allow_remote {
+            self.deadline.min(REMOTE_HEAD_DEADLINE)
+        } else {
+            self.deadline
+        }
+    }
+
+    fn one_request(&self, stream: TcpStream, remote: SocketAddr) {
+        let Ok(clone) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(Deadline {
+            stream: clone,
+            until: Instant::now() + self.head_deadline(),
+        });
+        let peer = peer_allowed(remote, self.allow_remote);
+        let out = match read_head(&mut reader) {
+            Ok(Some(h)) if h.chunked => error(400, "bad request"),
+            Ok(Some(h)) if h.path.starts_with("/lend/") && self.lend.is_some() => {
+                let Some(lend) = self.lend else { return };
+                let Some(_lend_slot) = Slot::take(&self.lend_busy, MAX_LEND_THREADS) else {
+                    return reply(&stream, error(503, "busy; try again shortly"));
+                };
+                reader.get_mut().until = Instant::now() + LEND_DEADLINE;
+                let _ = stream.set_write_timeout(Some(LEND_DEADLINE));
                 let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
                 let out = match read_body(
-                    key,
-                    Some(remote),
+                    self.key,
+                    peer,
                     h.key.as_deref(),
                     h.length,
                     &mut body,
@@ -675,28 +746,30 @@ fn one_request<'s>(
                     Ok(buf) => lend.lend(&h.method, &h.path, &buf, h.paused),
                     Err(e) => e,
                 };
-                reply(&stream, out);
-                busy.fetch_sub(1, Ordering::SeqCst);
-            });
-            return;
-        }
-        Ok(Some(h)) => {
-            let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
-            handle(
-                api,
-                key,
-                Some(remote),
-                &h.method,
-                &h.path,
-                h.key.as_deref(),
-                h.length,
-                &mut body,
-            )
-        }
-        Ok(None) => error(400, "bad request"),
-        Err(_) => error(408, "request timeout"),
-    };
-    reply(&stream, (status, body));
+                return reply(&stream, out);
+            }
+            Ok(Some(h)) => {
+                let Ok(_one_at_a_time) = self.swap.lock() else {
+                    return reply(&stream, error(503, "unavailable"));
+                };
+                reader.get_mut().until = Instant::now() + self.deadline;
+                let mut body = (&mut reader).take(h.length.unwrap_or(0) as u64);
+                handle(
+                    self.api,
+                    self.key,
+                    peer,
+                    &h.method,
+                    &h.path,
+                    h.key.as_deref(),
+                    h.length,
+                    &mut body,
+                )
+            }
+            Ok(None) => error(400, "bad request"),
+            Err(_) => error(408, "request timeout"),
+        };
+        reply(&stream, out);
+    }
 }
 
 fn reply(stream: &TcpStream, (status, body): (u16, Value)) {
@@ -759,17 +832,17 @@ fn error(status: u16, msg: &str) -> (u16, Value) {
     (status, json!({ "error": msg }))
 }
 
-/// The body, once the remote is loopback, the key matches and the declared
+/// The body, once the peer is allowed, the key matches and the declared
 /// length is at most `max`.
 fn read_body(
     key: &str,
-    remote: Option<SocketAddr>,
+    peer_allowed: bool,
     given_key: Option<&str>,
     length: Option<usize>,
     body: &mut dyn Read,
     max: usize,
 ) -> Result<Vec<u8>, (u16, Value)> {
-    if !remote.is_some_and(|r| r.ip().is_loopback()) {
+    if !peer_allowed {
         return Err(error(403, "loopback only"));
     }
     if !given_key.is_some_and(|g| same_key(g.as_bytes(), key.as_bytes())) {
@@ -794,14 +867,14 @@ fn read_body(
 fn handle(
     api: &impl Api,
     key: &str,
-    remote: Option<SocketAddr>,
+    peer_allowed: bool,
     method: &str,
     url: &str,
     given_key: Option<&str>,
     length: Option<usize>,
     body: &mut dyn Read,
 ) -> (u16, Value) {
-    let buf = match read_body(key, remote, given_key, length, body, MAX_BODY) {
+    let buf = match read_body(key, peer_allowed, given_key, length, body, MAX_BODY) {
         Ok(b) => b,
         Err(e) => return e,
     };
@@ -1257,12 +1330,12 @@ mod tests {
         key: Option<&str>,
         body: &str,
     ) -> (u16, String) {
-        call_on(&fake(), remote, method, path, key, body)
+        call_on(&fake(), (remote, false), method, path, key, body)
     }
 
     fn call_on(
         api: &Fake,
-        remote: &str,
+        (remote, allow_remote): (&str, bool),
         method: &str,
         path: &str,
         key: Option<&str>,
@@ -1271,7 +1344,7 @@ mod tests {
         let (status, v) = handle(
             api,
             KEY,
-            Some(remote.parse().unwrap()),
+            peer_allowed(remote.parse().unwrap(), allow_remote),
             method,
             path,
             key,
@@ -1347,11 +1420,142 @@ mod tests {
     }
 
     #[test]
+    fn allow_remote_lets_any_peer_reach_the_key_check_only() {
+        let api = fake();
+        let remote = |allow, path: &str, key| {
+            let body = if path == "/quote" {
+                rfq_json(r#""100""#)
+            } else {
+                String::new()
+            };
+            let method = if path == "/quote" { "POST" } else { "GET" };
+            call_on(&api, ("10.0.0.1:5000", allow), method, path, key, &body).0
+        };
+        for path in ["/quote", "/health", "/faucet", "/nowhere"] {
+            assert_eq!(remote(false, path, Some(KEY)), 403, "{path}");
+            assert_eq!(remote(true, path, None), 401, "{path}");
+            assert_eq!(remote(true, path, Some("0123456789abcdeX")), 401, "{path}");
+        }
+        assert_eq!(remote(true, "/quote", Some(KEY)), 200);
+        assert_eq!(remote(true, "/health", Some(KEY)), 200);
+        assert!(!peer_allowed("[2001:db8::1]:1".parse().unwrap(), false));
+        assert!(peer_allowed("[::1]:1".parse().unwrap(), false));
+    }
+
+    #[test]
+    fn an_idle_connection_does_not_delay_the_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let stop = AtomicBool::new(false);
+        let api = fake();
+        thread::scope(|s| {
+            let server = s.spawn(|| {
+                serve_http(
+                    listener,
+                    KEY,
+                    &stop,
+                    &api,
+                    None,
+                    Duration::from_secs(3),
+                    false,
+                )
+            });
+            let idle: Vec<_> = (0..MAX_HTTP_THREADS - 1)
+                .map(|_| TcpStream::connect(at).unwrap())
+                .collect();
+            sleep(Duration::from_millis(200));
+            let started = Instant::now();
+            assert!(health(at).starts_with("HTTP/1.1 200"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let turned_away = TcpStream::connect(at).unwrap();
+            let held = health(at);
+            assert!(held.starts_with("HTTP/1.1 503"), "{held}");
+            drop((idle, turned_away));
+            stop.store(true, Ordering::Relaxed);
+            server.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_slot_is_given_back_when_its_holder_panics() {
+        let count = AtomicUsize::new(0);
+        let held = Slot::take(&count, 2).unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            let _slot = Slot::take(&count, 2).unwrap();
+            panic!("handler failed");
+        })
+        .is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let second = Slot::take(&count, 2).unwrap();
+        assert!(Slot::take(&count, 2).is_none());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        drop((held, second));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn allow_remote_on_a_socket_still_wants_the_key_and_a_head_within_a_second() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listener.local_addr().unwrap();
+        let stop = AtomicBool::new(false);
+        let api = fake();
+        thread::scope(|s| {
+            let server = s.spawn(|| {
+                serve_http(
+                    listener,
+                    KEY,
+                    &stop,
+                    &api,
+                    None,
+                    Duration::from_secs(3),
+                    true,
+                )
+            });
+            assert!(health(at).starts_with("HTTP/1.1 200"));
+            let (r, _) = exchange(at, b"GET /health HTTP/1.1\r\n\r\n", None);
+            assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+            let (r, took) = exchange(at, b"GET /health HTTP/1.1\r\n", None);
+            assert!(r.starts_with("HTTP/1.1 408"), "{r}");
+            assert!(
+                took >= Duration::from_millis(900) && took < Duration::from_secs(2),
+                "{took:?}"
+            );
+            stop.store(true, Ordering::Relaxed);
+            server.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn mainnet_refuses_env_keys_and_allow_remote() {
+        let cfg = |net: &str, key: &str, helius: &str, allow: bool| {
+            DealerConfig::from_json(&format!(
+                r#"{{"network":{{"rpc_url":"https://{net}.helius-rpc.com","indexer_url":"https://{net}.helius-rpc.com/v1/spr",
+                "prover":{{"helius":{helius}}}}},"key":{key},
+                "assets":[{{"mint":"11111111111111111111111111111111","price":{{"price":1,"expo":0}}}}],
+                "listen":"127.0.0.1:47001","spread_bps":10,"quote_ttl_secs":30,"settle_margin_secs":5,
+                "program_id":"{id}","http":{{"listen":"{host}:47500","key":{key},"allow_remote":{allow}}}}}"#,
+                id = swap_program::ID,
+                host = if allow { "0.0.0.0" } else { "127.0.0.1" }
+            ))
+            .unwrap()
+        };
+        let (env, keychain) = (r#"{"env":"K"}"#, r#"{"keychain":"k"}"#);
+        assert!(start_checks(&cfg("devnet", env, env, true), Cluster::Devnet).is_ok());
+        let main = |key, helius, allow| {
+            start_checks(&cfg("mainnet", key, helius, allow), Cluster::Mainnet)
+        };
+        assert!(main(keychain, keychain, false).is_ok());
+        assert!(main(env, keychain, false).is_err());
+        assert!(main(keychain, env, false).is_err());
+        assert!(main(keychain, keychain, true).is_err());
+    }
+
+    #[test]
     fn http_faucet_caps() {
         let api = fake();
         let ask = |w: u8| {
             let body = format!(r#"{{"wallet":"{}"}}"#, addr(w));
-            call_on(&api, LOCAL, "POST", "/faucet", Some(KEY), &body)
+            call_on(&api, (LOCAL, false), "POST", "/faucet", Some(KEY), &body)
         };
         assert_eq!(ask(1), (200, r#"{"ok":true}"#.into()));
         assert_eq!(ask(1).0, 429);
@@ -1360,7 +1564,7 @@ mod tests {
         assert_eq!(
             call_on(
                 &api,
-                LOCAL,
+                (LOCAL, false),
                 "POST",
                 "/faucet",
                 Some(KEY),
@@ -1378,8 +1582,17 @@ mod tests {
         let stop = AtomicBool::new(false);
         let api = fake();
         thread::scope(|s| {
-            let server = s
-                .spawn(|| serve_http(listener, KEY, &stop, &api, None, Duration::from_millis(400)));
+            let server = s.spawn(|| {
+                serve_http(
+                    listener,
+                    KEY,
+                    &stop,
+                    &api,
+                    None,
+                    Duration::from_millis(400),
+                    false,
+                )
+            });
             test(at);
             stop.store(true, Ordering::Relaxed);
             server.join().unwrap().unwrap();
@@ -1438,6 +1651,7 @@ mod tests {
                     &api,
                     Some(&Echo),
                     Duration::from_millis(400),
+                    false,
                 )
             });
             let (r, _) = exchange(at, post("/lend/ticket", KEY, 16_384).as_bytes(), None);

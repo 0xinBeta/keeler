@@ -196,8 +196,8 @@ sends v1 transactions.
 
 ## Build and run
 
-Needs macOS on Apple silicon (every secret beyond a local network is read from the macOS Keychain
-with `security`), git, curl, Python 3.11 or newer, rustup, the Solana/Agave CLI (`cargo build-sbf`),
+Needs macOS on Apple silicon (every mainnet secret is read from the macOS Keychain with
+`security`; a devnet config may read its secrets from the environment instead), git, curl, Python 3.11 or newer, rustup, the Solana/Agave CLI (`cargo build-sbf`),
 `wasm-pack` (the circuit compiler builds the browser packages with it), Node and pnpm. The setup
 scripts and the gating tests also run on Linux x86-64 (CI); the local-network and end-to-end tests
 have been run on macOS only.
@@ -333,8 +333,9 @@ Amounts are base units; mints are base58; SOL is `111111111111111111111111111111
 `source .tools/env` so the binary finds the proving keys (`SWAP_KEYS_DIR`).
 
 `network.prover` is `"local"` or `{"helius": {"keychain": "<name>"}}` (Helius' attested prover,
-the API key read from that Keychain item). `key` is `{"file": "<keypair.json>"}` for local test
-keys or `{"keychain": "<name>"}`. A price is fixed (`{"price": 15, "expo": -2}` is 0.15 USD) or
+the API key read from that Keychain item, or `{"env": "<NAME>"}`). `key` is
+`{"file": "<keypair.json>"}` for local test keys, `{"keychain": "<name>"}`, or `{"env": "<NAME>"}`
+(the environment variable holds what the Keychain item would; refused on mainnet). A price is fixed (`{"price": 15, "expo": -2}` is 0.15 USD) or
 `{"pyth": {"account", "feed_id"}}` with a `pyth` section (`max_age_secs`, `max_conf_bps`), read on
 chain and checked for owner (`rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`), full verification,
 feed id, age, sign and confidence.
@@ -374,11 +375,12 @@ Dealer:
 }
 ```
 
-Optional dealer fields: `http` (`listen`, `key`) for the HTTP API; `poll_secs`; `faucet`;
+Optional dealer fields: `http` (`listen`, `key`, `allow_remote`) for the HTTP API; `poll_secs`; `faucet`;
 `state_file` (mode 0600); `pause_file`; `settle_tolerance_bps`; `limits` per mint
 (`max_sell_amount`, `hourly_sell_cap`); `pubkey`; `auto_pause_after`; `min_fee_lamports`.
 
-Dealer HTTP (loopback only, `x-keeler-key` on every request, 4 KiB body cap):
+Dealer HTTP (loopback only unless `http.allow_remote`, refused on mainnet; `x-keeler-key` on every
+request, 4 KiB body cap):
 `POST /quote` `{"sell_mint","buy_mint","sell_amount","trader"}` -> `{"quote":{"buy_amount","expiry","signature"}}`;
 `POST /faucet` `{"wallet"}`; `GET /health`. Quote signatures are Ed25519 by the dealer's key over
 `"keeler-quote-v2"`, a network byte, then program, mints, trader, amounts and expiry

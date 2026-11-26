@@ -1,0 +1,32 @@
+services:
+  dealer:
+    image: ghcr.io/0xinbeta/keeler-keeper@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    command: ["dealer", "/config/dealer.json"]
+    restart: unless-stopped
+    ports:
+      - "47500:47500"
+    volumes:
+      - dealer-data:/data
+    environment:
+      - KEELER_DEALER_KEY=${KEELER_DEALER_KEY}
+      - KEELER_POOL_KEY=${KEELER_POOL_KEY}
+      - KEELER_HTTP_KEY=${KEELER_HTTP_KEY}
+      - KEELER_FAUCET_KEY=${KEELER_FAUCET_KEY}
+      - KEELER_HELIUS_KEY=${KEELER_HELIUS_KEY}
+  standby:
+    image: ghcr.io/0xinbeta/keeler-keeper@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    command: ["keeper", "/config/standby.json"]
+    restart: unless-stopped
+    ports:
+      - "47501:47501"
+    volumes:
+      - standby-data:/data
+    environment:
+      - KEELER_STANDBY_KEY=${KEELER_STANDBY_KEY}
+      - KEELER_POOL_KEY=${KEELER_POOL_KEY}
+      - KEELER_HTTP_KEY=${KEELER_HTTP_KEY}
+      - KEELER_HELIUS_KEY=${KEELER_HELIUS_KEY}
+
+volumes:
+  dealer-data:
+  standby-data:

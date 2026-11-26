@@ -1,0 +1,54 @@
+{
+  "network": {
+    "rpc_url": "https://devnet.helius-rpc.com",
+    "indexer_url": "https://devnet.helius-rpc.com/v1/spr",
+    "prover": {
+      "helius": {
+        "env": "KEELER_HELIUS_KEY"
+      }
+    }
+  },
+  "key": {
+    "env": "KEELER_STANDBY_KEY"
+  },
+  "http": {
+    "listen": "0.0.0.0:47501",
+    "key": {
+      "env": "KEELER_HTTP_KEY"
+    },
+    "allow_remote": true
+  },
+  "lend": {
+    "program_id": "CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL",
+    "network": "devnet",
+    "price": "test",
+    "price_refresh_secs": 45,
+    "limits": {
+      "min_supply": 1000000,
+      "min_collateral": 10000000,
+      "min_deposit_add": 1,
+      "min_repay": 10000,
+      "min_redeem": 10000,
+      "min_borrow": 10000,
+      "min_withdraw": 10000000,
+      "tickets_per_wallet_hour": 30,
+      "open_per_wallet": 4,
+      "max_open_intents": 64,
+      "builds_per_wallet_hour": 60,
+      "reservation_secs": 20,
+      "ticket_secs": 600,
+      "bucket_secs": 600,
+      "bound_margin_bps": 50
+    },
+    "poll_secs": 2,
+    "pool_key": {
+      "env": "KEELER_POOL_KEY"
+    },
+    "origins": [
+      "https://keeler.xterminbeta.workers.dev",
+      "http://127.0.0.1:8788"
+    ],
+    "role": "standby",
+    "state_file": "/data/keeper-standby.json"
+  }
+}
