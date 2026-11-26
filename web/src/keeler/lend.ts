@@ -138,7 +138,10 @@ type KeeperAccount = {
 type WireBuild = { transaction: string; outputs: string[]; now: number; bound?: string; index?: string; keeper?: unknown };
 type WireTicket = { id?: unknown; expiry?: unknown; signature?: unknown; keeper?: unknown };
 
-const NEVER_SENT = "This request was never sent (the wallet did not sign it); nothing moved.";
+type Quoted = { price: bigint; confidence: bigint; priceTime: number };
+const UNREAD: Quoted = { price: 0n, confidence: 0n, priceTime: 0 };
+
+const NEVER_SENT ="This request was never sent (the wallet did not sign it); nothing moved.";
 const NEVER_LANDED = "The transaction expired before it reached the chain; nothing moved.";
 const FAILED = "The transaction failed on chain; nothing moved.";
 
@@ -243,15 +246,26 @@ export function createLend(d: LendDeps): KeelerLend {
 
   /**
    * The vault's price as the program reads it: the test price account where there is one (test networks), else the
-   * reference price (`/api/prices`, the Pyth feed the program's account carries). Price 0 when neither answers.
+   * reference price (`/api/prices`, the Pyth feed the program's account carries). Price 0 when neither answers. A
+   * failed read of the test price account gives the last one read in this session, or price 0: never the reference.
    */
-  const vaultQuote = async (v: LendServerConfig["vaults"][number]): Promise<{ price: bigint; confidence: bigint; priceTime: number }> => {
-    const onChain = await d.chain.testPrice(v.id).catch(() => null);
-    if (onChain) return { price: onChain.price, confidence: onChain.confidence, priceTime: onChain.publishTime };
+  const lastTestPrice = new Map<number, Quoted>();
+  const vaultQuote = async (v: LendServerConfig["vaults"][number]): Promise<Quoted> => {
+    let onChain;
+    try {
+      onChain = await d.chain.testPrice(v.id);
+    } catch {
+      return lastTestPrice.get(v.id) ?? UNREAD;
+    }
+    if (onChain) {
+      const q = { price: onChain.price, confidence: onChain.confidence, priceTime: onChain.publishTime };
+      lastTestPrice.set(v.id, q);
+      return q;
+    }
     try {
       return { ...vaultPrice(await prices(), asset(v.collateralMint), asset(v.debtMint)), confidence: 0n };
     } catch {
-      return { price: 0n, confidence: 0n, priceTime: 0 };
+      return UNREAD;
     }
   };
 

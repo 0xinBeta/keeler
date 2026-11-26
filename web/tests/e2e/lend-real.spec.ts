@@ -219,6 +219,7 @@ test("liquidation: borrow near the limit, the price drops, the keeper liquidates
   // 7.5 / 0.85 = 8.82 and 7.5 / 0.90 = 8.33: at 8.6 (the keeper checks 8.65, price + confidence + its margin) the
   // position is past the 85% threshold and below the program's 90% max limit, so the liquidation is partial.
   setPrice(8.6);
+  await expect(p.locator(".vault .rail-tag")).toHaveText("1 SOL = 8.6 tUSD", { timeout: 25_000 });
   await timed("liquidation: price moved to the page showing it", () => expect(p.getByText(/^Liquidated /)).toBeVisible({ timeout: KEEPER }));
   await expect(p.getByText(/It brought the position back to 85\.\d% at that price, and the rest stayed yours\./)).toBeVisible();
   const collateral = units(await position(0).innerText(), 9);
