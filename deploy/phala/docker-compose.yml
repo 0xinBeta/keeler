@@ -1,6 +1,6 @@
 services:
   dealer:
-    image: ghcr.io/0xinbeta/keeler-keeper@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    image: ghcr.io/0xinbeta/keeler-keeper@sha256:c6024394deddceffa1854b3acad7adf6fa56a94007fdab7c8b7f79d1dd6c0c7c
     command: ["dealer", "/config/dealer.json"]
     restart: unless-stopped
     ports:
@@ -14,7 +14,7 @@ services:
       - KEELER_FAUCET_KEY=${KEELER_FAUCET_KEY}
       - KEELER_HELIUS_KEY=${KEELER_HELIUS_KEY}
   standby:
-    image: ghcr.io/0xinbeta/keeler-keeper@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    image: ghcr.io/0xinbeta/keeler-keeper@sha256:c6024394deddceffa1854b3acad7adf6fa56a94007fdab7c8b7f79d1dd6c0c7c
     command: ["keeper", "/config/standby.json"]
     restart: unless-stopped
     ports:

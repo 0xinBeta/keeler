@@ -18,7 +18,7 @@
 //!
 //! Every key is a fixture test key, and the browser wallet's seed is fixed:
 //! local network only.
-#[path = "../tests/wallet.rs"]
+#[path = "../../../.tools/privacy-ring-examples/test-utils/wallet.rs"]
 mod wallet;
 
 use std::{

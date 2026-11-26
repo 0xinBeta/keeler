@@ -16,9 +16,9 @@
 #   --instance-type  the CVM size, on create and on update (default tdx.medium).
 #
 # The cut-over, in order: pause the Worker, wait until the open tickets and
-# quotes have run out, stop the Mac's `keeler dealer` and `keeler keeper`
+# quotes have run out, stop the local `keeler dealer` and `keeler keeper`
 # (the script refuses to run while either does), deploy, check, then publish
-# (--publish). The CVM starts from empty volumes: the Mac's tickets, builds
+# (--publish). The CVM starts from empty volumes: the local tickets, builds
 # in flight and quote book do not carry over.
 #
 # Handed to the CVM, by Keychain item: the dealer key (also the primary
@@ -39,7 +39,7 @@ phala=$phala_dir/node_modules/.bin/phala
 name=keeler-devnet
 instance_type=tdx.medium
 disk_size=20G
-os_image=dstack-0.6.6
+os_image=dstack-0.6.5
 publish=false
 registry_user=""
 while [[ $# -gt 0 ]]; do

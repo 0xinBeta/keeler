@@ -1,7 +1,9 @@
 //! The Vault instructions' refusals that need no real proof, and the price
 //! check, on the SBF build in `lend/target/deploy` (a `test-price` build:
 //! `scripts/setup-lend.sh` passes the feature).
+#[path = "../../../.tools/privacy-ring-examples/test-utils/mollusk.rs"]
 mod mollusk;
+mod pool_viewing;
 
 use keeler_lend::{
     error::LendError,
@@ -17,8 +19,9 @@ use keeler_lend::{
     vaults::{VaultError, PYTH_RECEIVER, TSOL_TUSD},
     KEEPERS, POOL_SEED, POOL_VIEWING, USER_SEED,
 };
-use mollusk::{expect_err_exact, mollusk_with_program, only_the_pool_viewing_key};
+use mollusk::{expect_err_exact, mollusk_with_program};
 use mollusk_svm::{program::keyed_account_for_system_program, result::ProgramResult, Mollusk};
+use pool_viewing::only_the_pool_viewing_key;
 use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_program_error::ProgramError;

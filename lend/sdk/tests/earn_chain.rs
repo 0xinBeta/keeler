@@ -12,7 +12,7 @@
 mod measure;
 #[path = "tamper.rs"]
 mod tamper;
-#[path = "wallet.rs"]
+#[path = "../../../.tools/privacy-ring-examples/test-utils/wallet.rs"]
 mod wallet;
 
 use std::{

@@ -2,6 +2,7 @@
 //! circuits enforce, the outputs' owners and keys, and the keeper reading
 //! every output with its transaction viewing key.
 mod refusal;
+#[path = "../../../.tools/privacy-ring-examples/test-utils/utxo.rs"]
 mod utxo;
 
 use keeler_lend::circuits::{Close, DepositAdd, DepositOpen, Draw, Liquidate, Repay};

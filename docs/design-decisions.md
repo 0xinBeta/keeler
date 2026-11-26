@@ -113,7 +113,8 @@ leaves the position still liquidatable and costs the keeper, never the owner.
 
 From the Privacy Rings documentation (`docs/plan-lend.md`, "Background: Privacy Rings"): in the
 Default Ring owners are public signers, output owner tags and counts are public, and ciphertexts
-are unchecked; custom rings are in audit until December 2026. With a custom ring:
+are unchecked. Custom rings are in audit; Helius expects the audits to conclude in December 2026
+(https://www.helius.dev/docs/privacy/security, read 2026-11-26). With a custom ring:
 
 - **Hidden owners.** Wallets would stop being public on every operation, which today shows who
   supplies, borrows and is liquidated.

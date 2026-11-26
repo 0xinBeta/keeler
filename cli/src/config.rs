@@ -588,7 +588,7 @@ fn env_secret(name: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-/// Reads a secret from the macOS Keychain. The name is passed as an argument,
+/// Reads a secret from a macOS Keychain item. The name is passed as an argument,
 /// never through a shell, and the secret is never logged.
 pub fn keychain_secret(name: &str) -> Result<String> {
     let out = Command::new("security")

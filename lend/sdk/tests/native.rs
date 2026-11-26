@@ -2,6 +2,7 @@
 //! make, and every output's blinding and hash recomputed from its contents
 //! and the first nullifier.
 mod refusal;
+#[path = "../../../.tools/privacy-ring-examples/test-utils/utxo.rs"]
 mod utxo;
 
 use keeler_lend::circuits::{CancelIntent, InitReserve, Intent};

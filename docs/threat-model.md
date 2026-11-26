@@ -186,6 +186,14 @@ used, and the page checks it only grows within the curve's top rate). Over time 
 utilisation and notice very large operations. `/lend/pools` publishes size, utilisation and rates
 rounded to two significant figures, at most once per `bucket_secs`.
 
+### The explorer
+
+On devnet the page links the transactions it reports to their pages on Orb, Helius' explorer
+(`orbTx` in `web/src/keeler/network.ts`). A visitor who opens one tells Orb which transaction they
+are looking at, from their own network address. Orb's page for a devnet lend transaction of this
+program, opened on 2026-11-26, is titled "Private transfer via Helius Privacy" and shows "Amount:
+Confidential", the two signer wallets, the program and the fee, and no amount.
+
 ## Accepted findings from the internal security review
 
 From `docs/audit-2026-11-25.md` (internal, not an external audit; the compiled constraints and the
@@ -212,16 +220,38 @@ after it. References are at the end of the section.
 ### What exists today [exists]
 
 - The keeper is a `keeler keeper` process on an operator's host. Its keeper key, the pool key and
-  the HTTP key are read from the macOS Keychain (`keychain_secret` in `cli/src/config.rs`) on
+  the HTTP key are read from a macOS Keychain item (`keychain_secret` in `cli/src/config.rs`) on
   mainnet, which refuses any other source; elsewhere a config may read them from a file or the
   environment instead (`KeySource` in `cli/src/config.rs`); the
   state file is JSON, mode 0600, on that host's disk, with a lock that stops two processes on one
   file (`docs/lend-keeper.md`, "The state file").
 - The pool key is made once, on the deploy machine, and copied to each keeper host
   (`docs/mainnet-runbook.md`, section 4). The operator holds every key in clear.
-- The only TEE in the system is Helius' prover for the shielded pool's proofs ("The prover"
-  above). Nothing in this repository runs in an enclave; the only attestation it checks is that
-  prover's, through the Rings SDK.
+- On devnet that host is a Phala Cloud CVM (Intel TDX) since 2026-11-26: the dealer, which hosts the
+  primary keeper, and the standby keeper run as two containers in it, from
+  `deploy/phala/docker-compose.yml` and an image pinned by digest (`README.md`, "Where it runs";
+  `docs/lend-deploy.md`, "On Phala Cloud"). Their keys are the existing devnet keys, made on the
+  operator's machine, read from its Keychain by `scripts/deploy-phala.sh` and passed in as encrypted
+  environment values; the Helius API key passed in is `keeler-helius-api-key`, the item
+  `docs/mainnet-runbook.md` also names. The key manager is Phala's (`--kms phala`). Nothing checks
+  an attestation of this CVM: not the page, not the Worker, not a command in this repository. The
+  operator still knows every key, and none of the properties below hold for it. Phala can stop the
+  CVM, and with it both devnet keepers; its gateway ends TLS, so it sees the shared HTTP key and
+  every request and reply in clear, account views included; and its key manager decides who receives
+  the keys that open the encrypted environment values.
+- Phala's documentation describes a public Trust Center report for every app
+  (`https://trust.phala.com/app/<app id>`). This CVM's report, opened on 2026-11-26, answered HTTP
+  503 with "Phala Trust Center is temporarily unavailable for maintenance." The documentation also
+  describes an app attestation route that answers only for CVMs that opted into what it calls public
+  TCB info. This CVM was deployed with `--no-public-sysinfo`; whether that flag is the same setting
+  is not established. Whether a third party can fetch its quote or measurements without the
+  operator's Phala API key has not been established. What a third party can check today: the compose
+  file in this repository, the image by its digest (a public package), and the log of the workflow
+  run that built and pushed it, which prints that digest. The compose hash cannot be recomputed from
+  this repository: Phala hashes its own `app-compose.json`, which wraps the compose file and is not
+  committed here.
+- The only attestation this repository checks is Helius' prover's, through the Rings SDK ("The
+  prover" above).
 
 ### Common to both platforms [proposal]
 

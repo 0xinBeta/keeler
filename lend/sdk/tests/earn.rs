@@ -4,6 +4,7 @@
 //! Pool-owned notes with chosen states are forged here: native execution does
 //! not check the tree, only the note's contents.
 mod refusal;
+#[path = "../../../.tools/privacy-ring-examples/test-utils/utxo.rs"]
 mod utxo;
 
 use keeler_lend::circuits::{Redeem, Supply};

@@ -10,16 +10,22 @@ helius-labs/privacy-ring-examples (Helius Labs)
   https://github.com/helius-labs/privacy-ring-examples
   Pinned commit 9e5d69ade7e0c107a2929306d3b758a8969e1089.
   scripts/setup.sh clones it into .tools/ (not part of this repository) and
-  builds its swap program, which the swap side of Keeler runs. These files in
-  this repository derive from it:
-    patches/swap.patch            a patch to swap/xark (program features, lock)
-    lend/sdk/tests/utxo.rs        from test-utils/utxo.rs
-    lend/sdk/tests/wallet.rs      from test-utils/wallet.rs
-    lend/spike/tests/wallet.rs    from test-utils/wallet.rs
-    lend/program/tests/mollusk.rs from test-utils/mollusk.rs
-    lend/sdk/src/proof.rs         in part, from swap/xark/sdk/src/proof.rs
-  It builds on the Privacy Rings crates (spr-*, below), which are published
-  under Apache-2.0.
+  builds its swap program, which the swap side of Keeler runs. The lend tests
+  include its test-utils/mollusk.rs, test-utils/utxo.rs and
+  test-utils/wallet.rs from that checkout with #[path]; they are not copied
+  here. These files in this repository contain code from it:
+    lend/sdk/src/proof.rs      in part, from swap/xark/sdk/src/proof.rs
+    lend/sdk/src/lib.rs        Authority::complete_inputs, from
+                               swap/xark/sdk/src/shared.rs; prove_transact_with
+                               follows prove_transact there
+    lend/spike/tests/spike.rs  the same function
+    cli/src/chain.rs           prove_spp, from prove_transact in
+                               swap/xark/sdk/src/shared.rs
+    patches/swap.patch         a patch to swap/xark (program features, lock),
+                               with lines of that repository as context
+  That repository carries no licence at the pinned commit. Those files, as
+  far as they come from it, remain Helius Labs' and are not covered by this
+  repository's Apache-2.0 licence.
 
 Privacy Rings crates (spr-account-checks, spr-client, spr-interface,
 spr-keypair, spr-program, spr-program-test, spr-transaction,
@@ -59,4 +65,10 @@ Mollusk (mollusk-svm), Pinocchio
 
 Archivo and Unbounded fonts (@fontsource-variable/archivo, @fontsource-variable/unbounded)
   SIL Open Font License 1.1. Bundled into the built web page, not this
+  repository.
+
+Images
+  The images under web/src/ui/orbit/media/ were generated with an AI image
+  model for this project and are not derived from photographs.
+  docs/demo.gif is a screen recording of this project's page made for this
   repository.
