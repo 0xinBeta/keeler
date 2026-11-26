@@ -203,7 +203,7 @@ test("landing: the FAQ keeps its anchors and its answers", async ({ page }) => {
     await page.locator("#faq summary", { hasText: q }).click();
   }
   await expect(page.getByText(/By design it cannot take your principal/)).toBeVisible();
-  await expect(page.getByText("Running the keeper in an attested enclave, so that anyone can check which code holds its keys, is planned.")).toBeVisible();
+  await expect(page.getByText("What is planned is running it in an attested enclave, so that anyone can check which code holds its keys.")).toBeVisible();
   await expect(page.locator("footer.kl-foot")).toBeVisible();
   await expect(page.locator("footer.kl-foot")).toContainText("Devnet beta");
 
