@@ -122,3 +122,49 @@ others see or use. Nothing here is done by the deploy script.
    deploy. The page reads the pools and vaults from `/api/config`.
 9. **Check**: open the Earn tab (the pool shows its figures and the price), make a small deposit,
    borrow, repay all and close from a second wallet.
+
+## On Phala Cloud
+
+Since 2026-11-26 the devnet dealer (with the primary keeper) and the standby keeper run as two
+containers in one Phala Cloud CVM, `keeler-devnet`: `tdx.medium` (4 GB), OS image `dstack-0.6.5`, a
+20 GB disk, Phala's key manager (`--kms phala`), container logs and system information not public.
+The files:
+
+- `Dockerfile` and `.github/workflows/image.yml`: the keeper image. The workflow builds the binary
+  with `scripts/build-keeper.sh deploy/devnet/build-params.json`, stages the proving keys checked
+  against their checksums and the configs in `deploy/devnet/` (`dealer.json`, `standby.json`), and
+  makes one lend proof and one swap proof inside the image with only its keys. A run started by hand
+  on `main` pushes the image and prints its digest. Run 45853108001 measured a lend supply proof at
+  4.4 s with 1,048 MiB peak memory and a swap take proof at 4.4 s with 1,153 MiB, which is why the
+  machine has 4 GB.
+- `deploy/phala/docker-compose.yml`: the two services, the image pinned by digest, a volume each for
+  `/data`, and the secrets as environment values.
+- `scripts/deploy-phala.sh`: creates or updates the CVM, passes the secrets from the Keychain as
+  encrypted environment values, checks that both `/health` routes answer and that the logs are not
+  public, and with `--publish` points the Worker at the CVM. Its opening block lists what it hands
+  over and what it never does.
+
+The cut-over of 2026-11-26 went in the order the script's opening block gives: the Worker's `PAUSED`
+and `LEND_PAUSED` set at 17:10 UTC; the open tickets and quotes left to expire; the dealer and
+keepers on the operator's machine stopped; the CVM deployed (17:21 UTC); the Worker secrets
+`DEALERS` and `LEND_KEEPERS` set to the CVM's two gateway URLs,
+`https://<app id>-47500.<gateway domain>` and `-47501`; the pause lifted at 17:27 UTC. Both keepers
+then served `/lend/pools` with the pool rebuilt from the chain (180 tUSD, 26% utilisation, as before
+the move), and `/api/lend/pools` answered the same figures from outside. A request without the
+shared key gets 401.
+
+The state files live in the volumes (`/data`). A new CVM, or a lost volume, starts empty: the
+tickets, builds in flight and the dealer's quote book are gone, and each keeper rebuilds its book
+from the chain on start (`docs/lend-keeper.md`, "Recovery"). A read-only dry run of that replay
+(`strict_history`) took 462 s on the operator's machine on 2026-11-26.
+
+With the keepers remote:
+
+- The kill switches are the Worker's `PAUSED` and `LEND_PAUSED` (`worker/README.md`) and stopping
+  the CVM, which halts the pool. The configs in the image set no `pause_file`, and nothing outside
+  the CVM writes its volumes.
+- `keeler lend-set-price`, `lend-fund`, `lend-balance` and `lend-sweep` run on another machine with
+  a keeper config that names the same key and pool; they act on chain. `lend-balance` reads the
+  largest position's debt from that machine's state file, not the CVM's.
+- A test price set from another machine stays: the CVM keepers have no control file and keep
+  re-posting the price on chain until it is set back (`docs/lend-keeper.md`, "The test price").

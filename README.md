@@ -44,6 +44,24 @@ lend circuits; the upgrade authority handed to a Squads multisig; and two always
 
 Built with Claude Code.
 
+## Where it runs
+
+On devnet the dealer, which hosts the primary keeper, and the standby keeper run as two containers
+in one Phala Cloud CVM (Intel TDX), deployed on 2026-11-26 by `scripts/deploy-phala.sh` from
+`deploy/phala/docker-compose.yml` (`docs/lend-deploy.md`, "On Phala Cloud").
+
+- App id: `e9682954e48a61d39c561952f52116c4bd6270c0`
+- Image: `ghcr.io/0xinbeta/keeler-keeper@sha256:c6024394deddceffa1854b3acad7adf6fa56a94007fdab7c8b7f79d1dd6c0c7c`,
+  built from commit `25ba878` by run 45856775945 of the "Keeper image" workflow
+- Compose hash, as the Phala API reports it:
+  `7d6b96eaab71b28fc54b14f0b378abaaa5d31031a6d5aa282cd699c26687a45f`
+
+This shows only that the keepers run in a TDX CVM from a published compose file and image. The
+keys in it are the existing devnet keys, made outside it and known to the operator; the key
+manager is Phala's; nothing checks an attestation of the CVM: not the page, not the Worker, not a
+command in this repository. None of the properties of the enclave proposal in
+`docs/threat-model.md` hold for it.
+
 ## Architecture
 
 ```mermaid
@@ -150,9 +168,10 @@ shapes: `docs/design-decisions.md`.
 
 ## Measured
 
-Every figure below comes from a command in [`lend/MEASUREMENTS.md`](lend/MEASUREMENTS.md), run once
-on an Apple M4 (10 cores, 16 GB) on 2026-11-25 while the local validator, indexer and prover of the
-same test were running. Transaction size is the v1 wire size against the 4,096-byte v1 limit
+Every figure in the first table comes from a command in
+[`lend/MEASUREMENTS.md`](lend/MEASUREMENTS.md), run once on an Apple M4 (10 cores, 16 GB) on
+2026-11-25 while the local validator, indexer and prover of the same test were running. Transaction
+size is the v1 wire size against the 4,096-byte v1 limit
 (`solana_message::v1::MAX_TRANSACTION_SIZE`). Every lend proof is 128 bytes as sent.
 
 | Instruction | Constraints | Native proving | Compute units | v1 tx bytes (of 4,096) | Ix data bytes | Accounts (ix / tx) |
@@ -169,11 +188,13 @@ same test were running. Transaction size is the v1 wire size against the 4,096-b
 | `liquidate` | 48,878 | 2.56 to 3.35 s | 277,177 to 278,637 | 1,889 | 1,406 | 13 / 11 |
 | `close` | 13,510 | 0.84 to 1.06 s | 246,335 to 246,339 | 977 | 627 | 8 / 7 |
 
-Not measured: proving time in the browser (`intent`, `cancel_intent` and `close` are the three the
-page proves), a `draw` that only withdraws collateral, and the shielded pool's own proof on its own.
+Not measured for the shipped circuits: proving time in the browser (`intent`, `cancel_intent` and
+`close` are the three the page proves), a `draw` that only withdraws collateral, and the shielded
+pool's own proof on its own.
 
 The toolkit spike, on prototype circuits that are not the shipped ones (source:
-`docs/notes-for-xark-builders.md`, from `lend/scripts/run-spike.sh`):
+`docs/notes-for-xark-builders.md`, from `lend/scripts/run-spike.sh`). Its figures were committed on
+2026-11-24 (commit `3121a32`); the record says only Apple M-series:
 
 | Spike instruction | CU | v1 tx bytes (of 4,096) | ix data bytes | Accounts |
 | --- | --- | --- | --- | --- |
@@ -196,7 +217,7 @@ sends v1 transactions.
 
 ## Build and run
 
-Needs macOS on Apple silicon (every mainnet secret is read from the macOS Keychain with
+Needs macOS on Apple silicon (every mainnet secret is read from a macOS Keychain item with
 `security`; a devnet config may read its secrets from the environment instead), git, curl, Python 3.11 or newer, rustup, the Solana/Agave CLI (`cargo build-sbf`),
 `wasm-pack` (the circuit compiler builds the browser packages with it), Node and pnpm. The setup
 scripts and the gating tests also run on Linux x86-64 (CI); the local-network and end-to-end tests
@@ -236,6 +257,9 @@ scripts/run-lend-e2e.sh                                               # the keep
 scripts/run-swap-e2e.sh                                               # swaps end to end, port offset 2600
 ```
 
+The lend SDK's tests and example and the spike's test include `utxo.rs` or `wallet.rs` from
+`.tools/privacy-ring-examples/test-utils/`, so they build only after `scripts/setup.sh`.
+
 The page against a real local keeper: `scripts/lend-web-stack.sh start` (local network, keeper,
 Worker), then `cd web && pnpm exec playwright install chromium && pnpm e2e:lend`; the same page against
 its mock client, with no network: `pnpm e2e:mock`. Local networks use a port offset and stop what they start.
@@ -247,8 +271,16 @@ Continuous integration (`.github/workflows/ci.yml`, on every push and on pull re
 (so the lend keys checksum is checked), the `keeler-core`, `keeler` (lib, fixtures, deploy refusals),
 circuit and lend SDK native tests, and the web and Worker type checks and unit tests. It does not
 run the Mollusk tests, the local-network tests, the two end-to-end tests or the mock browser suite:
-those are `.github/workflows/slow.yml`, run by hand, which gates nothing and has to be dispatched once after it reaches `main`. Nothing in CI runs the page
-against a real local keeper, reaches devnet or mainnet, or uses a secret.
+those are `.github/workflows/slow.yml`, run by hand, which gates nothing. Nothing in CI runs the
+page against a real local keeper or reaches devnet or mainnet.
+
+The keeper image workflow (`.github/workflows/image.yml`) runs on pull requests that touch
+`Dockerfile`, `deploy/` or the workflow, and by hand. It builds the keeper with
+`deploy/devnet/build-params.json` (`scripts/build-keeper.sh`), checks the compiled build parameters
+and every key file against its checksum, builds the image and makes one lend proof and one swap
+proof inside it with only its keys. A run started by hand on `main` also pushes the image to
+`ghcr.io/0xinbeta/keeler-keeper`, from a separate job that logs in with the workflow's
+`GITHUB_TOKEN` and alone may write packages. No workflow uses any other secret.
 
 Devnet and mainnet deploys: `docs/lend-deploy.md` (`scripts/deploy-lend-devnet.sh`) and
 `docs/mainnet-runbook.md` (`scripts/deploy-mainnet.sh`, which refuses test keys, the test price, a
@@ -266,6 +298,10 @@ dirty tree and a single-key upgrade authority).
 | `web/` | The page: wallet, lend and swap clients, the signing check, tests |
 | `worker/` | The Cloudflare Worker |
 | `scripts/` | Setup, local stacks, deploys, end-to-end runners |
+| `scripts/build-keeper.sh` | Builds the keeper binary with a deployment's build parameters |
+| `Dockerfile` | The keeper image: the binary, the checked proving keys, the devnet configs |
+| `deploy/devnet/` | The devnet deployment's build parameters and the image's keeper configs |
+| `deploy/phala/` | The Phala Cloud compose file and the pinned `phala` CLI |
 | `patches/swap.patch` | The `wasm` feature added to the swap example |
 | `docs/` | Design, threat model, audit, runbooks, API |
 
@@ -395,7 +431,11 @@ rescans the order history on every poll.
 
 ## Licence and credits
 
-Apache-2.0 (`LICENSE`). The swap side runs Helius' `privacy-ring-examples` swap program, fetched
-at a pinned commit and patched (`patches/swap.patch`), not copied; five test and SDK helper files
-derive from that repository (`NOTICE`). Built on Helius Privacy Rings (`spr-*`,
+Apache-2.0 (`LICENSE`), except as below. The swap side runs Helius'
+`helius-labs/privacy-ring-examples` swap program, fetched at a pinned commit and patched
+(`patches/swap.patch`), not copied. The lend tests include two of its test helpers from that
+checkout. Two files here are adapted from it: `lend/program/tests/mollusk.rs` and, in part,
+`lend/sdk/src/proof.rs`. That repository carries no licence at the pinned commit. Those two files,
+as far as they come from it, and the patch's context remain Helius Labs' and are not covered by
+this repository's Apache-2.0 licence (`NOTICE`). Built on Helius Privacy Rings (`spr-*`,
 `@heliuslabs/spr`), Blueshift's Xark, and Pinocchio.

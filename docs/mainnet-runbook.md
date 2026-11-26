@@ -242,7 +242,7 @@ CARGO_TARGET_DIR=target/mainnet-keeper \
     account to its lend address; `keeler lend-balance keeper-<n>.json` shows what it holds.
   - Collateral that liquidations paid builds up at each keeper's lend address:
     `keeler lend-sweep keeper-<n>.json` unshields it to the keeper's own account, to sell or keep.
-- [ ] Run it under a supervisor that restarts it (launchd or systemd), with the proving keys:
+- [ ] Run it under a supervisor that restarts it (launchd), with the proving keys:
 
 ```sh
 KEELER_LEND_KEYS_DIR=<ceremony proving keys> target/mainnet-keeper/release/keeler keeper keeper-<n>.json

@@ -28,9 +28,10 @@ The second half of this file is the toolkit spike these notes came from, with it
   `mul(a, b)` (the same hint with `d = 1`, pinned by `q == a * b` and `r == 0`).
   `lend/program/src/circuits/math.rs` (`quotient`, `mul`, `div_rem`) and
   `lend/program/src/circuits/vault.rs` (`div_floor`).
-- **Classification.** Looks like a toolchain bug. `hint_div_rem`'s doc comment (xark 0.3.1,
-  `src/lang.rs`) says it returns `[q, r]` with `a = b*q + r` and names no restriction on its
-  inputs, and the native and compiled forms disagree.
+- **Classification.** Unconfirmed. It may be a toolchain bug: `hint_div_rem`'s doc comment (xark
+  0.3.1, `src/lang.rs`) says it returns `[q, r]` with `a = b*q + r` and names no restriction on
+  its inputs, and the native and compiled forms disagreed. The reduced reproduction below has not
+  been run, so it is not shown that the failure needs only this shape.
 - **Coverage here.** The workaround is exercised by every circuit that divides (accrual, shares,
   health, liquidation payout): the SDK's compiled-circuit tests (`lend/sdk/tests/refusal.rs`,
   `compiled_refuses`) run the built circuits, and the local-network tests prove them. The failing

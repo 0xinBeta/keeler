@@ -146,9 +146,9 @@ port is public: anyone can open connections, and only the key turns them away. T
 TLS, so it sees the key in clear.
 
 On the CVM (`scripts/deploy-phala.sh`), the cut-over goes in this order: pause the Worker, wait
-until the open tickets and quotes have run out, stop the Mac's `keeler dealer` and `keeler keeper`
-(the script refuses to run while either runs on the machine it runs on), deploy, check, publish
-(`--publish`). The CVM starts from empty volumes: the Mac's tickets, builds in flight and quote
+until the open tickets and quotes have run out, stop the local `keeler dealer` and `keeler keeper`
+(the script refuses to run while either runs on the host it runs on), deploy, check, publish
+(`--publish`). The CVM starts from empty volumes: the local tickets, builds in flight and quote
 book do not carry over. Wallets must be in
 the user registry: an unregistered wallet gets a 400 saying so.
 

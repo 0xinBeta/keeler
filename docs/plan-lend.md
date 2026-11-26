@@ -26,7 +26,8 @@ toolkit spike (`docs/notes-for-xark-builders.md`):
 - In the Default Ring, the only live ring, owners are public signers on every spend, and output
   owner tags and counts are public. Amounts and assets of shielded transfers are hidden; a move
   into or out of the pool through the interface shows its amount. Hidden-sender modes
-  are switched off on mainnet; custom rings are in audit until December 2026.
+  are switched off on mainnet. Custom rings are in audit; Helius expects the audits to conclude in
+  December 2026 (https://www.helius.dev/docs/privacy/security, read 2026-11-26).
 - A program holds funds as notes owned by its PDA; whoever builds a spend needs the note's opening.
   No key reads every note in the Default Ring.
 - A note can carry a balance and private state and be spent and re-created (`DataUtxo::new_mut`);
