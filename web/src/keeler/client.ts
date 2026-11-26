@@ -41,7 +41,7 @@ import {
 import { BUILD_NETWORK, testWalletAllowed, walletChain } from "./network";
 import { fairBuyAmount, ttlOk, vsFairBps, withinBand, type Price } from "./price";
 import { verifyQuote } from "./quote-sig";
-import { nextRecord, refreshAll, refundRefusal, rose, type ChainReads } from "./status";
+import { nextRecord, refreshAll, refundRefusal, rose, toOrder, type ChainReads } from "./status";
 import { orderStore, type OrderRecord } from "./storage";
 import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
 import { createLend, type LendServerConfig } from "./lend";
@@ -311,7 +311,10 @@ export function createKeeler(): Keeler {
     });
   };
 
-  const signAndSend = async (tx: Transaction) => send(await signTx(tx));
+  const signAndSend = async (tx: Transaction) => {
+    const signed = await signTx(tx);
+    return { slot: await send(signed), signature: getSignatureFromTransaction(signed) };
+  };
 
   const ctx = async (): Promise<SwapContext> => {
     const k = keys();
@@ -428,17 +431,6 @@ export function createKeeler(): Keeler {
       },
     };
   };
-
-  const toOrder = (r: OrderRecord): Order => ({
-    id: r.id,
-    sell: r.sell,
-    buy: r.buy,
-    sellAmount: r.sellAmount,
-    buyAmount: r.buyAmount,
-    expiry: r.expiry,
-    status: r.status,
-    ...(r.error ? { error: r.error } : {}),
-  });
 
   /** The make this page is signing or sending right now: its record is not refreshed meanwhile. */
   let inFlight: string | undefined;
@@ -642,7 +634,7 @@ export function createKeeler(): Keeler {
       const tx = await as("network", "Building the registration", () =>
         buildRegistrationTransaction({ client: c, owner: owner(), address: keys().keys.address() }),
       );
-      if (tx) await signAndSend(tx);
+      return tx ? (await signAndSend(tx)).signature : undefined;
     },
 
     async balances(): Promise<Balance[]> {
@@ -684,7 +676,9 @@ export function createKeeler(): Keeler {
           ...(mint === SOL_MINT ? {} : { asset: mint, splTokenAccount: await getAssociatedTokenAddress(me, mint) }),
         }),
       );
-      await sync(await signAndSend(tx));
+      const sent = await signAndSend(tx);
+      await sync(sent.slot);
+      return sent.signature;
     },
 
     async withdraw(asset, amount) {
@@ -703,7 +697,9 @@ export function createKeeler(): Keeler {
           ...(mint === SOL_MINT ? {} : { asset: mint }),
         }),
       );
-      await sync(await signAndSend(tx));
+      const sent = await signAndSend(tx);
+      await sync(sent.slot);
+      return sent.signature;
     },
 
     async quotes(sell, buy, sellAmount) {

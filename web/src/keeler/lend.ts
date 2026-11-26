@@ -256,8 +256,8 @@ export function createLend(d: LendDeps): KeelerLend {
   };
 
   const toOp = (r: OpRecord): LendOperation => {
-    const { tx: _t, onChain: _o, intent: _i, spends: _s, creates: _c, ...op } = r;
-    return { ...op, amounts: op.amounts.map((a) => ({ ...a })) };
+    const { tx, onChain, intent: _i, spends: _s, creates: _c, ...op } = r;
+    return { ...op, amounts: op.amounts.map((a) => ({ ...a })), ...(tx && onChain ? { signature: tx.signature } : {}) };
   };
   const save = (r: OpRecord) => {
     try {
@@ -301,7 +301,7 @@ export function createLend(d: LendDeps): KeelerLend {
       const wire = await d.chain.transaction(note.spentBy);
       if (!wire) return next;
       const mine = lendInstructions(wire, d.programId).some((ix) => ix.tag === TAG.cancelIntent && ix.signers.includes(d.wallet()));
-      return mine ? { ...next, status: "refunded" } : { ...next, status: "landed", step: "landed" };
+      return mine ? { ...next, status: "refunded", spentBy: note.spentBy } : { ...next, status: "landed", step: "landed", spentBy: note.spentBy };
     }
     return { ...next, status: next.expiry !== null && now > next.expiry ? "refundable" : "pending", step: "keeper" };
   };
@@ -417,7 +417,7 @@ export function createLend(d: LendDeps): KeelerLend {
         const old = before?.r as PositionRecord | undefined;
         const liquidated = old !== undefined && ix?.tag === TAG.liquidate;
         const leftByIt = liquidated && liquidationOutputs(ix.data).includes(hex(got.note.hash)) ? { collateral: got.note.amount, debtShares: got.decoded.shares } : undefined;
-        const lastLiquidation = liquidated ? liquidation(old, ix.data, leftByIt) : (old?.lastLiquidation ?? null);
+        const lastLiquidation = liquidated && before ? liquidation(old, ix.data, before.by, leftByIt) : (old?.lastLiquidation ?? null);
         const record: PositionRecord = { vault: v.id, id: p.position, collateral: got.note.amount, debtShares: got.decoded.shares, note: got.note, lastLiquidation };
         // A full liquidation that left nothing: the position is gone, and the page says what took it.
         if (empty(record)) {
@@ -443,7 +443,7 @@ export function createLend(d: LendDeps): KeelerLend {
       // A liquidation whose successor the keeper does not list (it never lists an empty position): emptied, if the
       // liquidation itself left nothing.
       if (ix?.tag === TAG.liquidate && view && !view.positions.some((p) => p.position === old.id)) {
-        const l = liquidation(old, ix.data);
+        const l = liquidation(old, ix.data, by);
         if (l.collateralLeft === 0n && l.debtLeft === 0n) s.put("emptied", old.id, { ...old, collateral: 0n, debtShares: 0n, lastLiquidation: l });
       }
       // Closed: nothing follows it. A keeper fill with no word from the keeper: derive the successor where it is
@@ -471,7 +471,7 @@ export function createLend(d: LendDeps): KeelerLend {
    * liquidation, from `old`, the instruction's `bound` and `now`, and the borrow index at `now`; without a fit (an index
    * far off), as a sale of everything.
    */
-  const liquidation = (old: PositionRecord, data: Uint8Array, left?: { collateral: bigint; debtShares: bigint }): NonNullable<PositionRecord["lastLiquidation"]> => {
+  const liquidation = (old: PositionRecord, data: Uint8Array, signature: string, left?: { collateral: bigint; debtShares: bigint }): NonNullable<PositionRecord["lastLiquidation"]> => {
     const v = vaultOf(old.vault);
     const args = data.subarray(1);
     const price = u64At(args, ARGS.liquidate.bound);
@@ -479,12 +479,12 @@ export function createLend(d: LendDeps): KeelerLend {
     const borrow = index(v.debtMint, "borrow", at);
     const actual = (after: { collateral: bigint; debtShares: bigint }) => {
       const debtLeft = debtOf(after.debtShares, borrow);
-      return { at, price, collateralSold: old.collateral - after.collateral, debtRepaid: debtOf(old.debtShares, borrow) - debtLeft, collateralLeft: after.collateral, debtLeft };
+      return { at, price, collateralSold: old.collateral - after.collateral, debtRepaid: debtOf(old.debtShares, borrow) - debtLeft, collateralLeft: after.collateral, debtLeft, signature };
     };
     if (left) return actual(left);
     try {
       const l = liquidate(old.debtShares, borrow, old.collateral, price, { cfBps: BigInt(v.cfBps), ltBps: BigInt(v.ltBps), lmlBps: BigInt(v.lmlBps), penaltyBps: BigInt(v.penaltyBps) });
-      return { at, price, collateralSold: l.payout, debtRepaid: l.repay, collateralLeft: l.collateral, debtLeft: debtOf(l.debtShares, borrow) };
+      return { at, price, collateralSold: l.payout, debtRepaid: l.repay, collateralLeft: l.collateral, debtLeft: debtOf(l.debtShares, borrow), signature };
     } catch {
       return actual({ collateral: 0n, debtShares: 0n });
     }
