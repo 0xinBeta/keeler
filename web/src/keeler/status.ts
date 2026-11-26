@@ -1,6 +1,7 @@
 // An order record's next status, from chain evidence only. A read that fails throws, so a
 // failed RPC or indexer call never turns an order terminal; the record stays as it was.
-import type { ChainStatus } from "./swap";
+import type { Order } from "./index";
+import type { Spend } from "./swap";
 import type { OrderRecord } from "./storage";
 
 export type SignatureState = { err: unknown; confirmationStatus?: string | null } | null;
@@ -10,7 +11,7 @@ export type ChainReads = {
   signatureStatus(signature: string): Promise<SignatureState>;
   blockHeight(): Promise<bigint>;
   /** What spent the order's nullifier, if anything. */
-  spend(r: OrderRecord): Promise<ChainStatus>;
+  spend(r: OrderRecord): Promise<Spend>;
 };
 
 export const NEVER_SENT = "This order was never sent (the wallet did not sign it); nothing is locked.";
@@ -35,13 +36,27 @@ export async function nextRecord(r: OrderRecord, now: number, chain: ChainReads)
     if (s.confirmationStatus !== "confirmed" && s.confirmationStatus !== "finalized") return r;
     if (s.err !== null && s.err !== undefined) return { ...r, status: "failed", error: FAILED_ON_CHAIN };
   }
-  const spend = await chain.spend(r);
+  const { status: spend, spentBy } = await chain.spend(r);
   const status = spend === "settled" || spend === "taken-unmatched" ? "settled" : spend === "cancelled" ? "refunded" : now > r.expiry ? "refundable" : "locked";
   const error = spend === "taken-unmatched" ? TAKEN_UNMATCHED : undefined;
-  if (status === r.status && error === r.error) return r;
-  const { error: _old, ...rest } = r;
-  return { ...rest, status, ...(error ? { error } : {}) };
+  if (status === r.status && error === r.error && spentBy === r.spentBy) return r;
+  const { error: _old, spentBy: _was, ...rest } = r;
+  return { ...rest, status, ...(error ? { error } : {}), ...(spentBy ? { spentBy } : {}) };
 }
+
+/** The order as the page shows it; the make's signature only once the make has landed. */
+export const toOrder = (r: OrderRecord): Order => ({
+  id: r.id,
+  sell: r.sell,
+  buy: r.buy,
+  sellAmount: r.sellAmount,
+  buyAmount: r.buyAmount,
+  expiry: r.expiry,
+  status: r.status,
+  ...(r.error ? { error: r.error } : {}),
+  ...(r.tx && r.status !== "pending" && r.status !== "failed" ? { makeSignature: r.tx.signature } : {}),
+  ...(r.spentBy ? { spentBy: r.spentBy } : {}),
+});
 
 /**
  * Every record refreshed at chain time; never rejects. If chain time cannot be read the stored

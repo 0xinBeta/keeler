@@ -1,7 +1,8 @@
 import { useState } from "react";
 import type { Keeler, Order } from "../keeler/index";
 import { countdown } from "./format";
-import { Amount, ErrorNote, errorText, useChainNow } from "./shared";
+import { Amount, ErrorNote, errorText, OnChainNotes, ON_CHAIN, OrbLinks, useChainNow } from "./shared";
+import type { OrbLink } from "./shared";
 
 const LABEL: Record<Order["status"], string> = {
   pending: "Sending",
@@ -11,6 +12,15 @@ const LABEL: Record<Order["status"], string> = {
   refunded: "Funds taken back",
   failed: "Failed",
 };
+
+/** The order's make and, once spent, what spent it: the settle, the refund, or a take whose payment did not match. */
+export function orderLinks(order: Order): OrbLink[] {
+  const spent = order.status === "refunded" ? "View refund on Orb" : order.error ? "View the transaction that took it on Orb" : "View settlement on Orb";
+  return [
+    { signature: order.makeSignature, label: "View order on Orb" },
+    { signature: order.spentBy, label: spent },
+  ];
+}
 
 type Props = {
   keeler: Keeler;
@@ -96,6 +106,7 @@ export function Orders({ keeler, orders, chainOffset, refresh, refreshBalances, 
                     expires.
                   </span>
                 )}
+                <OrbLinks links={orderLinks(o)} />
                 {o.status === "refundable" && (
                   <button className="button button-primary button-small" onClick={() => refund(o.id)} disabled={!!busy} aria-busy={busy === o.id}>
                     {busy === o.id ? "Taking funds back…" : "Take funds back"}
@@ -106,6 +117,7 @@ export function Orders({ keeler, orders, chainOffset, refresh, refreshBalances, 
           })}
         </ul>
       )}
+      <OnChainNotes rows={orders.map((o) => ({ links: orderLinks(o), says: ON_CHAIN.swap }))} />
       <ErrorNote text={error} />
     </section>
   );

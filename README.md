@@ -14,7 +14,7 @@ price is set to 132 and the keeper repays 11.046788 tUSD of the debt with 0.0840
 132.79. The keeper posts the test price of 150 again a few seconds later, which is why the vault
 header still reads 150.
 
-- Devnet lend program: [`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`](https://explorer.solana.com/address/CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL?cluster=devnet)
+- Devnet lend program: [`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`](https://orbmarkets.io/address/CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL/history?cluster=devnet)
 - Live page (devnet): https://keeler.xterminbeta.workers.dev
 
 | | Public chain | Keeper | Other pool users | A liquidated owner |
@@ -300,10 +300,10 @@ dirty tree and a single-key upgrade authority).
 The second part: a private quote router. A trader asks several dealers for a quote, drops quotes
 far from a reference price, and settles the best one through the Helius Privacy Rings swap example
 program (`helius-labs/privacy-ring-examples`, `swap/xark`), built from `.tools/` by
-`scripts/setup.sh` with its own test keys. Amounts and the price stay inside shielded notes and
-order terms encrypted to the trader and the chosen dealer; both wallets, both asset ids, and that
-a swap was made and later taken or cancelled are public; every dealer asked learns the pair, the
-size and the trader's public key.
+`scripts/setup.sh` with its own test keys. Amounts, the price and the two asset ids stay inside
+shielded notes and order terms encrypted to the trader and the chosen dealer; both wallets, and that
+a swap was made and later taken or cancelled, are public; every dealer asked still learns the pair,
+the size and the trader's public key.
 
 <details>
 <summary>Swap commands and configuration</summary>

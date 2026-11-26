@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { KeelerError } from "../keeler/index";
 import type { Asset, Balance, Config } from "../keeler/index";
+import { orbTx } from "../keeler/network";
 import { formatUnits } from "./format";
 
 const PILL = { local: "Local", devnet: "Devnet beta", mainnet: "Mainnet" } as const;
@@ -103,6 +104,60 @@ export function Funds({ balances }: { balances: Balance[] | null }) {
       </table>
     </section>
   );
+}
+
+/**
+ * What is public on chain for each kind of operation: lending and moves from the README's public and hidden table, an
+ * unfilled or refunded request from the `intent` and `cancel_intent` instructions, swaps from the README's Swaps
+ * section (the swap circuits' public inputs), registration from the user registry record (the nullifier and viewing public keys).
+ */
+export const ON_CHAIN = {
+  swap: "Public on chain: who traded, and that the order was made and then settled or refunded. The tokens, the amounts and the price are not.",
+  lend: "Public on chain: the wallets, the instruction and which pool or vault. The amounts are not.",
+  request: "Public on chain: your wallet, the token and, on a refund, the request's expiry. The amount is not, and neither is what the request is for until a keeper fills it.",
+  liquidation: "Public on chain: the wallets, that the position was liquidated, the vault and the price bound. The amounts are not.",
+  move: "Public on chain: your wallet and the amount moved.",
+  register: "Public on chain: your wallet and the public keys of your private balance.",
+} as const;
+
+export type OrbLink = { signature?: string; label: string };
+
+const hrefs = (links: OrbLink[]) =>
+  links.flatMap((l) => {
+    const href = l.signature ? orbTx(l.signature) : undefined;
+    return href ? [{ href, label: l.label }] : [];
+  });
+
+/** Each landed transaction's page on Orb and, when given, what of it is public; nothing when no link can be built. */
+export function OrbLinks({ links, says }: { links: OrbLink[]; says?: string }) {
+  const shown = hrefs(links);
+  if (shown.length === 0) return null;
+  return (
+    <>
+      <p className="order-note">
+        {shown.map((l, i) => (
+          <Fragment key={l.href}>
+            {i > 0 && <span aria-hidden="true"> · </span>}
+            <a href={l.href} target="_blank" rel="noopener noreferrer">
+              {l.label}
+              <span className="sr-only"> (opens in a new tab)</span>
+            </a>
+          </Fragment>
+        ))}
+      </p>
+      {says && <p className="order-note">{says}</p>}
+    </>
+  );
+}
+
+/** Below a list whose rows show their links alone: each distinct sentence of the rows that show a link, once. */
+export function OnChainNotes({ rows }: { rows: { links: OrbLink[]; says: string }[] }) {
+  const says = [...new Set(rows.filter((r) => hrefs(r.links).length > 0).map((r) => r.says))];
+  return says.map((s) => (
+    <p key={s} className="order-note">
+      {s}
+    </p>
+  ));
 }
 
 export function ErrorNote({ text }: { text: string | null }) {

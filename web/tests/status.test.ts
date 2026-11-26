@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refreshAll, refundRefusal, rose, type ChainReads, type SignatureState } from "../src/keeler/status";
+import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refreshAll, refundRefusal, rose, toOrder, type ChainReads, type SignatureState } from "../src/keeler/status";
 import type { OrderRecord } from "../src/keeler/storage";
 import type { ChainStatus } from "../src/keeler/swap";
 
@@ -21,13 +21,13 @@ const record = (over: Partial<OrderRecord> = {}): OrderRecord => ({
 });
 
 /** A chain that answers from these values; a thrown value models an RPC or indexer failure. */
-function chain(o: { sig?: SignatureState | Error; height?: bigint | Error; spend?: ChainStatus | Error }): ChainReads {
+function chain(o: { sig?: SignatureState | Error; height?: bigint | Error; spend?: ChainStatus | Error; spentBy?: string }): ChainReads {
   const answer = <T>(v: T | Error | undefined, name: string): Promise<T> =>
     v instanceof Error ? Promise.reject(v) : v === undefined ? Promise.reject(new Error(`unexpected ${name} read`)) : Promise.resolve(v);
   return {
     signatureStatus: () => answer(o.sig, "signature"),
     blockHeight: () => answer(o.height, "height"),
-    spend: () => answer(o.spend, "spend"),
+    spend: () => answer(o.spend, "spend").then((status) => ({ status, ...(o.spentBy ? { spentBy: o.spentBy } : {}) })),
   };
 }
 
@@ -100,6 +100,12 @@ describe("a locked order", () => {
   it("spent by something other than its maker's cancel, with no matching payout, is settled with a plain warning, never refunded", async () => {
     expect(await nextRecord(record({ status: "locked" }), EXPIRY + 1, chain({ spend: "taken-unmatched" }))).toMatchObject({ status: "settled", error: TAKEN_UNMATCHED });
   });
+  it("keeps the transaction that spent it: the dealer's settle or the maker's cancel", async () => {
+    const locked = record({ status: "locked" });
+    expect(await nextRecord(locked, 10, chain({ spend: "settled", spentBy: "settle" }))).toMatchObject({ status: "settled", spentBy: "settle" });
+    expect(await nextRecord(locked, EXPIRY + 1, chain({ spend: "cancelled", spentBy: "cancel" }))).toMatchObject({ status: "refunded", spentBy: "cancel" });
+    expect((await nextRecord(locked, 10, chain({ spend: "open" }))).spentBy).toBeUndefined();
+  });
   it("returns the same record when nothing changed", async () => {
     const locked = record({ status: "locked" });
     expect(await nextRecord(locked, 10, chain({ spend: "open" }))).toBe(locked);
@@ -152,5 +158,19 @@ describe("rose", () => {
     let n = 0;
     expect(await rose(async () => (n++, 5n), 5n, 3, 0)).toBe(false);
     expect(n).toBe(3);
+  });
+});
+
+describe("the order the page shows", () => {
+  it("names its make transaction only once the make has landed", () => {
+    expect(toOrder(record({ status: "pending" })).makeSignature).toBeUndefined();
+    expect(toOrder(record({ status: "failed", error: NEVER_LANDED })).makeSignature).toBeUndefined();
+    expect(toOrder(record({ status: "locked" })).makeSignature).toBe("sig");
+    expect(toOrder(record({ status: "locked", tx: undefined })).makeSignature).toBeUndefined();
+  });
+  it("names what spent it, and never the dealer's quote signature", () => {
+    const shown = toOrder(record({ status: "settled", signature: "ab".repeat(64), spentBy: "settle" }));
+    expect(shown).toMatchObject({ makeSignature: "sig", spentBy: "settle" });
+    expect(Object.values(shown)).not.toContain("ab".repeat(64));
   });
 });

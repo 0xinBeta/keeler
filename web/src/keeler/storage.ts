@@ -19,6 +19,8 @@ export type OrderRecord = {
   error?: string;
   /** The signed make, saved before it is sent: its signature and the last block height it can land at. */
   tx?: { signature: string; lastValidBlockHeight: bigint };
+  /** The transaction that spent the order once it is settled or refunded: the dealer's settle, or the maker's cancel. */
+  spentBy?: string;
   createdAt: number;
   opening: OrderOpening;
 };

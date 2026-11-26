@@ -9,7 +9,8 @@ import { countdown, formatUnits, parseUnits } from "./format";
 import { borrowLimits, drawPrice, earnLimits, grow, healthBps, liquidatable, liquidationPrice, maxBorrow, pct, priceText } from "./lend-view";
 import { borrowModel, earnModel } from "./orbit/model";
 import type { DeskModel } from "./orbit/model";
-import { Amount, amountText, ErrorNote, errorText, Funds, RefundNotice, useChainNow } from "./shared";
+import { Amount, amountText, ErrorNote, errorText, Funds, OnChainNotes, ON_CHAIN, OrbLinks, RefundNotice, useChainNow } from "./shared";
+import type { OrbLink } from "./shared";
 
 export type Market = { pools: Pool[]; vaults: Vault[] };
 
@@ -24,7 +25,7 @@ export type LendProps = {
   refreshBalances: () => Promise<unknown>;
 };
 
-type DeskProps = LendProps & { lend: KeelerLend; refundable: number; report: Report };
+type DeskProps = LendProps & { lend: KeelerLend; refundable: number; report: Report; toBalances: () => void };
 
 const FLOW: Record<LendKind, LendStep[]> = {
   supply: ["proving", "signing", "keeper", "landed"],
@@ -49,6 +50,34 @@ const LANDED: Record<LendKind, string> = {
   close: "Done. The position is closed and the collateral is in your private balance.",
 };
 const STEP_SHORT: Record<LendStep, string> = { proving: "Proving", signing: "Signing", keeper: "Keeper", landed: "Landed" };
+
+const isIntent = (op: LendOperation) => op.kind === "supply" || op.kind === "deposit" || op.kind === "repay";
+
+/** The transaction this page sent and, for an intent, the keeper's fill or the owner's refund. */
+export function opLinks(op: LendOperation): OrbLink[] {
+  return [
+    { signature: op.signature, label: isIntent(op) ? "View request on Orb" : "View transaction on Orb" },
+    { signature: op.spentBy, label: op.status === "refunded" ? "View refund on Orb" : "View keeper's fill on Orb" },
+  ];
+}
+
+/** What is public for the links `opLinks` shows: a request alone or with its refund names no pool or vault. */
+export const opSays = (op: LendOperation) => (isIntent(op) && (!op.spentBy || op.status === "refunded") ? ON_CHAIN.request : ON_CHAIN.lend);
+
+const liquidationLinks = (signature?: string): OrbLink[] => [{ signature, label: "View liquidation on Orb" }];
+
+function NoPrivate({ asset, then, toBalances }: { asset: Asset; then: string; toBalances: () => void }) {
+  return (
+    <div className="empty">
+      <p>
+        Your wallet's private balance has no {asset.symbol}. Move some in from your public balance, then {then}.
+      </p>
+      <button type="button" className="button button-primary main-action" onClick={toBalances}>
+        Go to balances
+      </button>
+    </div>
+  );
+}
 
 export function kindLabel(o: Pick<LendOperation, "kind" | "amounts">, collateral?: Asset): string {
   switch (o.kind) {
@@ -180,6 +209,7 @@ function Progress({ p, op, onDone }: { p: LendProps; op: ReturnType<typeof useOp
       <p className={`status${run.failed || status === "failed" ? " bad" : ""}`} aria-live="polite">
         {line}
       </p>
+      {live && <OrbLinks links={opLinks(live)} says={opSays(live)} />}
       {run.failed && (
         <p className="note note-error" role="alert">
           {run.failed}
@@ -461,7 +491,7 @@ export function EarnTab(p: DeskProps) {
             </div>
           </dl>
           {mode === "in" && note === 0n ? (
-            <p className="empty">You have no private {a.symbol} yet. Move some in from Balances to start earning.</p>
+            <NoPrivate asset={a} then="deposit it here to earn" toBalances={p.toBalances} />
           ) : (
             <button className="button button-primary main-action" type="submit">
               {mode === "in" ? "Deposit and earn" : "Withdraw"}
@@ -851,9 +881,15 @@ export function BorrowTab(p: DeskProps) {
                 </div>
               </dl>
             )}
-            <button className="button button-primary main-action" type="submit">
-              {BUTTON[act]}
-            </button>
+            {act === "add" && lim.max === 0n ? (
+              <NoPrivate asset={vault.collateral} then="add it here as collateral" toBalances={p.toBalances} />
+            ) : act === "repay" && lim.max === 0n ? (
+              <NoPrivate asset={vault.debt} then="repay from it here" toBalances={p.toBalances} />
+            ) : (
+              <button className="button button-primary main-action" type="submit">
+                {BUTTON[act]}
+              </button>
+            )}
             <p className="ticket-foot">{SAYS[act]}</p>
           </form>
           {position && d === 0n && c > 0n && (
@@ -892,6 +928,7 @@ export function LiquidatedNote({ position, vault, now }: { position: Position; v
         : l.collateralLeft === 0n
           ? "It left no collateral; the remaining debt stays on the position until you repay it."
           : `It brought the position back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest stayed yours.`}
+      <OrbLinks links={liquidationLinks(l.signature)} says={ON_CHAIN.liquidation} />
     </div>
   );
 }
@@ -904,6 +941,7 @@ export function EmptiedNote({ position, vault, now }: { position: Position; vaul
       <strong>Your position was liquidated in full {agoText(l.at, now)}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt
       was repaid with all of its collateral, <Amount value={l.collateralSold} asset={vault.collateral} />, at {priceText(l.price, vault)}{" "}
       {vault.debt.symbol}. Nothing is left in it: no collateral and no debt. You can open a new position.
+      <OrbLinks links={liquidationLinks(l.signature)} says={ON_CHAIN.liquidation} />
     </div>
   );
 }
@@ -1002,6 +1040,7 @@ export function LendActivity(p: LendProps) {
                 <span className="order-status">
                   <span className="badge">Liquidation</span>
                 </span>
+                <OrbLinks links={liquidationLinks(x.lastLiquidation!.signature)} />
               </li>
             ))}
           {ops.map((o) => {
@@ -1041,11 +1080,18 @@ export function LendActivity(p: LendProps) {
                     {busy === o.id ? "Taking funds back…" : "Take funds back"}
                   </button>
                 )}
+                <OrbLinks links={opLinks(o)} />
               </li>
             );
           })}
         </ul>
       )}
+      <OnChainNotes
+        rows={[
+          ...liquidations.map((x) => ({ links: liquidationLinks(x.lastLiquidation!.signature), says: ON_CHAIN.liquidation })),
+          ...ops.map((o) => ({ links: opLinks(o), says: opSays(o) })),
+        ]}
+      />
       <ErrorNote text={error} />
     </section>
   );
