@@ -1,7 +1,9 @@
 import { expect, test } from "vitest";
 import type { Balance, Pool, Vault } from "../keeler/index";
-import { canDraw, collateralValue } from "../keeler/lend-math";
-import { borrowLimits, drawPrice, earnLimits, grow, healthBps, lendingShown, liquidatable, liquidationPrice, maxBorrow, maxWithdraw, pct, priceFromWhole, priceText } from "./lend-view";
+import { readFileSync } from "node:fs";
+import { PRICE_SCALE, canDraw, collateralValue, isLiquidatable, liquidate } from "../keeler/lend-math";
+import { KEEPER_MARGIN_BPS, KEEPER_MIN_REPAY, keeperLiquidates, liquidationBound } from "../keeler/lend-keeper";
+import { borrowLimits, drawPrice, earnLimits, grow, healthBps, lendingShown, liquidationPrice, maxBorrow, maxWithdraw, pct, priceFromWhole, priceText } from "./lend-view";
 
 const tUSD = { mint: "u", symbol: "tUSD", decimals: 6 };
 const tSOL = { mint: "s", symbol: "tSOL", decimals: 9 };
@@ -19,16 +21,70 @@ test("health is debt × 10000 / collateral value rounded up, with the edges name
   expect(healthBps(4n * SOL, 400n * USD, P)).toBe(7024); // 400 / 569.48 = 70.239%
   expect(healthBps(4n * SOL, 0n, P)).toBe(0);
   expect(healthBps(0n, 1n, P)).toBe(Infinity);
-  expect(liquidatable(8500, vault)).toBe(false);
-  expect(liquidatable(8501, vault)).toBe(true);
 });
 
-test("the liquidation price is the highest price at which the position is liquidatable", () => {
-  const lp = liquidationPrice(4n * SOL, 400n * USD, 8500)!;
-  expect(priceText(lp, vault)).toBe("117.64");
-  expect(liquidatable(healthBps(4n * SOL, 400n * USD, lp), vault)).toBe(true);
-  expect(liquidatable(healthBps(4n * SOL, 400n * USD, lp + 1n), vault)).toBe(false);
-  expect(liquidationPrice(4n * SOL, 0n, 8500)).toBeNull();
+const at = (price: bigint, confidence: bigint): Vault => ({ ...vault, price, confidence });
+const DEVNET = at(132_000_000_000n, 132_000_000n);
+
+test("the keeper values a liquidation at price + confidence plus its margin, rounded up", () => {
+  expect(liquidationBound(DEVNET)).toBe(132_792_660_000n);
+  expect(liquidationBound(at(P, 0n))).toBe(143_081_850_000n);
+  expect(liquidationBound(at(1n, 0n))).toBe(2n);
+});
+
+test("the keeper's own test at its bound, on the recorded devnet position", () => {
+  expect(keeperLiquidates(500_000_000n, 59_000_002n, DEVNET)).toBe(true);
+  const [c, d] = [362_228_304n, 40_886_072n];
+  expect(healthBps(c, d, DEVNET.price)).toBe(8552);
+  expect(healthBps(c, d, liquidationBound(DEVNET))).toBe(8501);
+  expect(liquidate(d, PRICE_SCALE, c, liquidationBound(DEVNET), V).repay).toBe(6n);
+  expect(keeperLiquidates(c, d, DEVNET)).toBe(false);
+  const lp = liquidationPrice(c, d, DEVNET)!;
+  expect(lp).toBe(132_000_005_450n);
+  expect(priceText(lp, DEVNET)).toBe("132");
+});
+
+test("past the max limit a tiny repayment is still worth it; under it, it is not", () => {
+  expect(healthBps(40_000n, 5000n, liquidationBound(DEVNET))).toBeGreaterThan(9000);
+  expect(liquidate(5000n, PRICE_SCALE, 40_000n, liquidationBound(DEVNET), V).repay).toBeLessThan(KEEPER_MIN_REPAY);
+  expect(keeperLiquidates(40_000n, 5000n, DEVNET)).toBe(true);
+  expect(healthBps(43_000n, 5000n, liquidationBound(DEVNET))).toBeGreaterThan(8500);
+  expect(healthBps(43_000n, 5000n, liquidationBound(DEVNET))).toBeLessThanOrEqual(9000);
+  expect(keeperLiquidates(43_000n, 5000n, DEVNET)).toBe(false);
+});
+
+test("the keeper leaves no debt, no collateral to sell, and an unread price alone", () => {
+  expect(keeperLiquidates(4n * SOL, 0n, DEVNET)).toBe(false);
+  expect(keeperLiquidates(0n, 8_522118n, DEVNET)).toBe(false);
+  expect(keeperLiquidates(1n, 8_522118n, DEVNET)).toBe(false);
+  expect(keeperLiquidates(4n * SOL, 1n, at(0n, 0n))).toBe(false);
+  expect(liquidationPrice(4n * SOL, 0n, DEVNET)).toBeNull();
+  expect(liquidationPrice(0n, 1n, DEVNET)).toBeNull();
+});
+
+test("the liquidation price is where the bound reaches the threshold; the minimum repayment holds the keeper back about 0.0017 tUSD / collateral below it", () => {
+  const gap = (collateral: bigint) => (1_700_000n * SOL) / collateral;
+  for (const conf of [0n, 132_000_000n, 1_000_000_000n]) {
+    for (const c of [4n * SOL, SOL / 10n]) {
+      const d = (400n * USD * c) / (4n * SOL);
+      const lp = liquidationPrice(c, d, at(P, conf))!;
+      for (let price = lp - 3n; price <= lp + 3n; price++)
+        expect(isLiquidatable(d, collateralValue(c, liquidationBound(at(price, conf))), V)).toBe(price <= lp);
+      expect(keeperLiquidates(c, d, at(lp + 1n, conf))).toBe(false);
+      expect(keeperLiquidates(c, d, at(lp - gap(c) / 2n, conf))).toBe(false);
+      expect(keeperLiquidates(c, d, at(lp - gap(c), conf))).toBe(true);
+    }
+  }
+  expect(priceText(liquidationPrice(4n * SOL, 400n * USD, at(P, 0n))!, vault)).toBe("117.06");
+  expect(liquidationPrice(4n * SOL, 400n * USD, at(P, 200n * 1_000_000_000n))).toBe(0n);
+});
+
+test("the keeper's margin and minimum repayment are the tracked deployment's", () => {
+  for (const f of ["dealer.json", "standby.json"]) {
+    const limits = JSON.parse(readFileSync(new URL(`../../../deploy/devnet/${f}`, import.meta.url), "utf8")).lend.limits;
+    expect(BigInt(limits.bound_margin_bps)).toBe(KEEPER_MARGIN_BPS);
+    expect(BigInt(limits.min_repay)).toBe(KEEPER_MIN_REPAY);
+  }
 });
 
 test("borrow and withdraw limits are exactly where canDraw stops", () => {

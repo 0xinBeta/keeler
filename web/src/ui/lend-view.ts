@@ -1,7 +1,9 @@
-// What the lending screens show, on top of the shared maths (keeler/lend-math.ts, which matches the program): the
-// interface's units (bps as numbers, Infinity for debt against nothing) and price text. No formula of its own
-// beyond the limits the program's `canDraw` implies.
+// What the lending screens show, on top of the shared maths (keeler/lend-math.ts, which matches the program, and
+// keeler/lend-keeper.ts, the keeper's bounds and limits): the interface's units (bps as numbers, Infinity for debt
+// against nothing) and price text. No formula of its own beyond the limits the program's `canDraw` and the keeper's
+// bounds imply.
 import type { Asset, Balance, Pool, Receipt, Vault } from "../keeler/index";
+import { KEEPER_MARGIN_BPS } from "../keeler/lend-keeper";
 import * as L from "../keeler/lend-math";
 import { formatUnits } from "./format";
 
@@ -11,17 +13,22 @@ export function healthBps(collateral: bigint, debt: bigint, price: bigint): numb
   return h === null ? Infinity : Number(h);
 }
 
-/** Past the threshold: `isLiquidatable`, read from the rounded-up health (equivalent for whole basis points). */
 /** Whether the page presents lending: the client decides once the config is read; before that the build does, so the first paint does not change. */
 export const lendingShown = (configRead: boolean, lend: boolean, compiled: boolean) => (configRead ? lend : lend || compiled);
 
-export const liquidatable = (health: number, vault: Vault) => health > vault.liquidationThresholdBps;
-
-/** The highest price at which the position is liquidatable; null without debt or collateral. */
-export const liquidationPrice = (collateral: bigint, debt: bigint, thresholdBps: number) => L.liquidationPrice(debt, collateral, BigInt(thresholdBps));
-
-/** The keeper's default `bound_margin_bps`: it draws at (price - confidence) less this much. */
-const KEEPER_MARGIN_BPS = 50n;
+/**
+ * The oracle price at or below which the keeper's liquidation bound reaches the threshold, at the vault's current
+ * confidence; null without debt or collateral, never below 0. It leaves out the keeper's minimum repayment: just
+ * under this price a liquidation would repay less than that, so the keeper waits. The gap is about
+ * min_repay × (1 − lt × (1 + penalty)) / lt, divided by the collateral in whole tokens: at devnet's settings, a tSOL
+ * price gap of 0.0017 tUSD divided by the collateral in tSOL.
+ */
+export function liquidationPrice(collateral: bigint, debt: bigint, vault: Vault): bigint | null {
+  const at = L.liquidationPrice(debt, collateral, BigInt(vault.liquidationThresholdBps));
+  if (at === null) return null;
+  const high = (at * L.BPS) / (L.BPS + KEEPER_MARGIN_BPS);
+  return high > vault.confidence ? high - vault.confidence : 0n;
+}
 
 /** The price a draw is checked at: the low end of the oracle's band, less the keeper's margin. Never below 0. */
 export function drawPrice(vault: Vault): bigint {

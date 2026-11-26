@@ -6,7 +6,8 @@ import type { MockLendControls } from "../keeler/mock-lend";
 import { useReport } from "./app/ring";
 import type { Report } from "./app/ring";
 import { countdown, formatUnits, parseUnits } from "./format";
-import { borrowLimits, drawPrice, earnLimits, grow, healthBps, liquidatable, liquidationPrice, maxBorrow, pct, priceText } from "./lend-view";
+import { KEEPER_MIN_REPAY, keeperLiquidates } from "../keeler/lend-keeper";
+import { borrowLimits, drawPrice, earnLimits, grow, healthBps, liquidationPrice, maxBorrow, pct, priceText } from "./lend-view";
 import { borrowModel, earnModel } from "./orbit/model";
 import type { DeskModel } from "./orbit/model";
 import { Amount, amountText, ErrorNote, errorText, Funds, OnChainNotes, ON_CHAIN, OrbLinks, RefundNotice, useChainNow } from "./shared";
@@ -560,25 +561,30 @@ const ACTIONS: [Action, string][] = [
   ["withdraw", "Withdraw"],
 ];
 
-export function healthState(h: number, v: Vault): "healthy" | "close" | "liquidatable" {
-  return liquidatable(h, v) ? "liquidatable" : h > v.collateralFactorBps ? "close" : "healthy";
+type HealthState = "healthy" | "close" | "liquidatable" | "unsecured" | "unread";
+export function healthState(collateral: bigint, debt: bigint, v: Vault): HealthState {
+  if (debt === 0n) return "healthy";
+  if (v.price === 0n) return "unread";
+  if (keeperLiquidates(collateral, debt, v)) return "liquidatable";
+  const h = healthBps(collateral, debt, v.price);
+  return h === Infinity ? "unsecured" : h > v.collateralFactorBps ? "close" : "healthy";
 }
-const STATE_LABEL = { healthy: "Healthy", close: "Close to liquidation", liquidatable: "Liquidatable" } as const;
+const STATE_LABEL = { healthy: "Healthy", close: "Close to liquidation", liquidatable: "Liquidatable", unsecured: "No collateral to sell", unread: "—" } as const;
 
-export function HealthBar({ health, vault, after }: { health: number; vault: Vault; after?: number }) {
+type Reading = { health: number; state: HealthState };
+export function HealthBar({ health, state: st, vault, after }: Reading & { vault: Vault; after?: Reading }) {
   const w = (h: number) => `${Math.min(Number.isFinite(h) ? h : 10_000, 10_000) / 100}%`;
-  const st = healthState(health, vault);
   return (
     <div className="health">
       <div className="health-head">
         <span className="instrument-label">Loan-to-value</span>
         <span className="num">
           {pct(health)}
-          {after !== undefined && after !== health && (
+          {after && after.health !== health && (
             <>
               <span className="muted" aria-hidden="true"> → </span>
               <span className="sr-only"> after: </span>
-              <span className={healthState(after, vault) === "healthy" ? "" : "bad"}>{pct(after)}</span>
+              <span className={after.state === "healthy" ? "" : "bad"}>{pct(after.health)}</span>
             </>
           )}
         </span>
@@ -590,10 +596,10 @@ export function HealthBar({ health, vault, after }: { health: number; vault: Vau
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={Math.min(Number.isFinite(health) ? health : 10_000, 10_000) / 100}
-        aria-valuetext={`${pct(health)}, ${STATE_LABEL[st].toLowerCase()}`}
+        aria-valuetext={st === "unread" ? "—" : `${pct(health)}, ${STATE_LABEL[st].toLowerCase()}`}
       >
         <span className="health-fill" style={{ width: w(health) }} />
-        {after !== undefined && after !== health && <span className="health-after" style={{ left: w(after) }} />}
+        {after && after.health !== health && <span className="health-after" style={{ left: w(after.health) }} />}
         <span className="health-mark" style={{ left: w(vault.collateralFactorBps) }} />
         <span className="health-mark health-mark-lt" style={{ left: w(vault.liquidationThresholdBps) }} />
       </div>
@@ -644,7 +650,7 @@ function borrowForm(p: LendProps, vault: Vault, pool: Pool, action: Action, text
   const d2 = act === "borrow" ? d + amt : act === "repay" ? (amt > d ? 0n : d - amt) : d;
   const h = healthBps(c, d, vault.price);
   const h2 = healthBps(c2, d2, vault.price);
-  return { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2 };
+  return { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2, st: healthState(c, d, vault), st2: healthState(c2, d2, vault) };
 }
 
 export function BorrowTab(p: DeskProps) {
@@ -680,10 +686,9 @@ export function BorrowTab(p: DeskProps) {
       </DeskLayout>
     );
 
-  const { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2 } = form;
-  const lp = liquidationPrice(c, d, vault.liquidationThresholdBps);
-  const lp2 = liquidationPrice(c2, d2, vault.liquidationThresholdBps);
-  const st = healthState(h, vault);
+  const { position, emptied, c, d, act, asset, cf, lim, f, amt, c2, d2, h, h2, st, st2 } = form;
+  const lp = liquidationPrice(c, d, vault);
+  const lp2 = liquidationPrice(c2, d2, vault);
   // Repaying "all": the debt plus two minutes of interest; anything above the debt comes back as change.
   // Interest keeps accruing until the keeper's transaction lands; the overpayment comes back as change.
   const repayAll = grow(d, pool.borrowAprBps, 120) + d / 100n + 1n;
@@ -771,7 +776,7 @@ export function BorrowTab(p: DeskProps) {
               </dd>
             </div>
           </dl>
-          <HealthBar health={h} vault={vault} after={shown || amt > 0n ? h2 : undefined} />
+          <HealthBar health={h} state={st} vault={vault} after={shown || amt > 0n ? { health: h2, state: st2 } : undefined} />
         </section>
       ) : (
         <section className="rail-panel mine" aria-label="Your position">
@@ -788,10 +793,19 @@ export function BorrowTab(p: DeskProps) {
 
   return (
     <DeskLayout p={p} title={op.run ? kindLabel(op.run, vault.collateral) : "Manage position"} rail={rail} railLabel="Vault, position and balances">
-      {position && st === "close" && !position.lastLiquidation && (
+      {position && st === "close" && (!position.lastLiquidation || h > vault.liquidationThresholdBps) && (
         <p className="note note-warn" role="status">
-          Above {pct(cf, 0)} you can't borrow more. Liquidation starts above {pct(vault.liquidationThresholdBps, 0)}, at a{" "}
-          {vault.collateral.symbol} price of {lp === null ? "" : priceText(lp, vault)}. Repaying or adding collateral moves you back.
+          Above {pct(cf, 0)} you can't borrow more. For a liquidation, the keeper values your collateral a little above the quoted price: by the
+          price feed's stated uncertainty, plus 0.5%.{" "}
+          {lp !== null && vault.price <= lp
+            ? `At that value the position is past ${pct(vault.liquidationThresholdBps, 0)}, but a liquidation now would repay less than ${formatUnits(KEEPER_MIN_REPAY, vault.debt.decimals)} ${vault.debt.symbol}, the keeper's minimum. It is too small for the keeper to make yet.`
+            : `Past ${pct(vault.liquidationThresholdBps, 0)} at that value, it liquidates: at a ${vault.collateral.symbol} price of ${lp === null ? "" : priceText(lp, vault)} or less.`}{" "}
+          Repaying or adding collateral moves you back.
+        </p>
+      )}
+      {position && st === "unsecured" && !position.lastLiquidation && (
+        <p className="note note-error" role="status">
+          There is no collateral left to sell, so the keeper cannot liquidate. The debt stays on the position until you repay it.
         </p>
       )}
       {position && st === "liquidatable" && (
@@ -873,7 +887,7 @@ export function BorrowTab(p: DeskProps) {
               <dl className="form-summary kv-preview" aria-live="polite">
                 <div>
                   <dt>Loan-to-value after</dt>
-                  <dd className={`num${healthState(h2, vault) === "healthy" ? "" : " bad"}`}>{d2 === 0n ? "No debt" : pct(h2)}</dd>
+                  <dd className={`num${st2 === "healthy" ? "" : " bad"}`}>{d2 === 0n ? "No debt" : pct(h2)}</dd>
                 </div>
                 <div>
                   <dt>Liquidation price after</dt>
@@ -918,6 +932,7 @@ const agoText = (at: number, now: number | null) => {
 /** What the last liquidation did, from what it left: a repayment made since is not credited to it. */
 export function LiquidatedNote({ position, vault, now }: { position: Position; vault: Vault; now: number | null }) {
   const l = position.lastLiquidation!;
+  const left = healthBps(l.collateralLeft, l.debtLeft, l.price);
   return (
     <div className="note note-error liquidated" role="status">
       <strong>Liquidated {agoText(l.at, now)}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt was repaid with{" "}
@@ -925,9 +940,9 @@ export function LiquidatedNote({ position, vault, now }: { position: Position; v
       {priceText(l.price, vault)} {vault.debt.symbol}.{" "}
       {l.debtLeft === 0n
         ? "It repaid the whole loan; the rest of your collateral stayed yours."
-        : l.collateralLeft === 0n
-          ? "It left no collateral; the remaining debt stays on the position until you repay it."
-          : `It brought the position back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest stayed yours.`}
+        : left === Infinity
+          ? `It left ${l.collateralLeft === 0n ? "no" : "almost no"} collateral; the remaining debt stays on the position until you repay it.`
+          : `It brought the position back to ${pct(left)} at that price, and the rest stayed yours.`}
       <OrbLinks links={liquidationLinks(l.signature)} says={ON_CHAIN.liquidation} />
     </div>
   );

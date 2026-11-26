@@ -159,7 +159,6 @@ export function App({ keeler }: { keeler: Keeler }) {
   // A fill that just landed counts as pending for two minutes: the keeper and the indexer may not show its new note yet.
   const lendPending = account?.operations.some((o) => o.status === "pending" || (o.status === "landed" && account.asOf - o.createdAt < 120)) ?? false;
   const owing = account?.positions.some((x) => x.debt > 0n) ?? false;
-  // Never overlapping, backing off on errors (the swap poller's loop); the account only, the market has its own timer.
   useEffect(() => {
     if (!lendPending && !owing) return;
     const base = lendPending ? 3000 : 10_000;
@@ -167,6 +166,7 @@ export function App({ keeler }: { keeler: Keeler }) {
     let delay = base;
     let timer = 0;
     const tick = async () => {
+      if (owing) refreshMarket().catch(() => {});
       try {
         await refreshAccount();
         delay = base;
@@ -180,7 +180,7 @@ export function App({ keeler }: { keeler: Keeler }) {
       stopped = true;
       clearTimeout(timer);
     };
-  }, [lendPending, owing, refreshAccount]);
+  }, [lendPending, owing, refreshAccount, refreshMarket]);
 
   const route = useRoute();
   const view = route ? "app" : "landing";

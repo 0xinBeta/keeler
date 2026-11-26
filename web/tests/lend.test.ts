@@ -323,6 +323,20 @@ describe("pools", () => {
     expect((await createLend(W.deps).pools()).vaults[0]).toMatchObject({ price: 10_000_000_000n, confidence: 10_000_000n, priceTime: T0 - 3 });
   });
 
+  it("keeps the last test price read when a later read fails, and never falls back to the reference price", async () => {
+    const lend = createLend(W.deps);
+    W.deps.chain.testPrice = async () => {
+      throw new Error("rpc down");
+    };
+    expect((await lend.pools()).vaults[0]).toMatchObject({ price: 0n, confidence: 0n });
+    W.deps.chain.testPrice = async () => ({ price: 132_000_000_000n, confidence: 132_000_000n, publishTime: T0 - 3 });
+    await lend.pools();
+    W.deps.chain.testPrice = async () => {
+      throw new Error("rpc down");
+    };
+    expect((await lend.pools()).vaults[0]).toMatchObject({ price: 132_000_000_000n, confidence: 132_000_000n, priceTime: T0 - 3 });
+  });
+
   it("shows price 0 when neither the price account nor the reference prices answer", async () => {
     W.deps.http = async () => new Response("{}", { status: 502 });
     expect((await createLend(W.deps).pools()).vaults[0]).toMatchObject({ price: 0n, confidence: 0n });
