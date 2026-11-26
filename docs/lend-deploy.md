@@ -134,9 +134,9 @@ The files:
   with `scripts/build-keeper.sh deploy/devnet/build-params.json`, stages the proving keys checked
   against their checksums and the configs in `deploy/devnet/` (`dealer.json`, `standby.json`), and
   makes one lend proof and one swap proof inside the image with only its keys. A run started by hand
-  on `main` pushes the image and prints its digest. Run 45853108001 measured a lend supply proof at
-  4.4 s with 1,048 MiB peak memory and a swap take proof at 4.4 s with 1,153 MiB, which is why the
-  machine has 4 GB.
+  on `main` pushes the image and prints its digest. Run 45853108001 ran the lend supply proof test
+  in 5.2 s with 1,048 MiB peak memory and the swap take proof test in 5.1 s with 1,153 MiB (each
+  time is the whole test, not the proof alone), which is why the CVM has 4 GB.
 - `deploy/phala/docker-compose.yml`: the two services, the image pinned by digest, a volume each for
   `/data`, and the secrets as environment values.
 - `scripts/deploy-phala.sh`: creates or updates the CVM, passes the secrets from the Keychain as
@@ -149,9 +149,9 @@ and `LEND_PAUSED` set at 17:10 UTC; the open tickets and quotes left to expire; 
 keepers on the operator's machine stopped; the CVM deployed (17:21 UTC); the Worker secrets
 `DEALERS` and `LEND_KEEPERS` set to the CVM's two gateway URLs,
 `https://<app id>-47500.<gateway domain>` and `-47501`; the pause lifted at 17:27 UTC. Both keepers
-then served `/lend/pools` with the pool rebuilt from the chain (180 tUSD, 26% utilisation, as before
-the move), and `/api/lend/pools` answered the same figures from outside. A request without the
-shared key gets 401.
+then served `/lend/pools` with the pool rebuilt from the chain (180 tUSD, 26% utilisation, the
+figures the keepers on the operator's machine served before), and the live `/api/lend/pools`
+answered from outside with the same figures. A request without the shared key gets 401.
 
 The state files live in the volumes (`/data`). A new CVM, or a lost volume, starts empty: the
 tickets, builds in flight and the dealer's quote book are gone, and each keeper rebuilds its book
@@ -166,5 +166,8 @@ With the keepers remote:
 - `keeler lend-set-price`, `lend-fund`, `lend-balance` and `lend-sweep` run on another machine with
   a keeper config that names the same key and pool; they act on chain. `lend-balance` reads the
   largest position's debt from that machine's state file, not the CVM's.
+- `scripts/run-dealer.sh` must not run for this deployment while the CVM runs: it starts a second
+  process on each keeper key and writes `DEALERS` and `LEND_KEEPERS` away from the CVM; nothing
+  stops it.
 - A test price set from another machine stays: the CVM keepers have no control file and keep
   re-posting the price on chain until it is set back (`docs/lend-keeper.md`, "The test price").

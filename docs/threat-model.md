@@ -232,18 +232,24 @@ after it. References are at the end of the section.
   `deploy/phala/docker-compose.yml` and an image pinned by digest (`README.md`, "Where it runs";
   `docs/lend-deploy.md`, "On Phala Cloud"). Their keys are the existing devnet keys, made on the
   operator's machine, read from its Keychain by `scripts/deploy-phala.sh` and passed in as encrypted
-  environment values; the key manager is Phala's (`--kms phala`). Nothing checks an attestation of
-  this CVM: not the page, not the Worker, not a command in this repository. The operator still knows
-  every key, and none of the properties below hold for it. Phala, as the host, can stop the CVM, and
-  with it both devnet keepers.
+  environment values; the Helius API key passed in is `keeler-helius-api-key`, the item
+  `docs/mainnet-runbook.md` also names. The key manager is Phala's (`--kms phala`). Nothing checks
+  an attestation of this CVM: not the page, not the Worker, not a command in this repository. The
+  operator still knows every key, and none of the properties below hold for it. Phala can stop the
+  CVM, and with it both devnet keepers; its gateway ends TLS, so it sees the shared HTTP key and
+  every request and reply in clear, account views included; and its key manager decides who receives
+  the keys that open the encrypted environment values.
 - Phala's documentation describes a public Trust Center report for every app
-  (`https://trust.phala.com/app/<app id>`), and also an app attestation route that answers only for
-  CVMs that opted into public TCB information. This CVM was deployed with `--no-public-sysinfo`.
-  Whether a third party can fetch its quote or measurements without the operator's Phala API key has
-  not been established. What a third party can check today: the compose file in this repository, the
-  image by its digest (a public package), and the log of the workflow run that built and pushed it,
-  which prints that digest. The compose hash cannot be recomputed from this repository: Phala hashes
-  its own `app-compose.json`, which wraps the compose file and is not committed here.
+  (`https://trust.phala.com/app/<app id>`). This CVM's report, opened on 2026-11-26, answered HTTP
+  503 with "Phala Trust Center is temporarily unavailable for maintenance." The documentation also
+  describes an app attestation route that answers only for CVMs that opted into what it calls public
+  TCB info. This CVM was deployed with `--no-public-sysinfo`; whether that flag is the same setting
+  is not established. Whether a third party can fetch its quote or measurements without the
+  operator's Phala API key has not been established. What a third party can check today: the compose
+  file in this repository, the image by its digest (a public package), and the log of the workflow
+  run that built and pushed it, which prints that digest. The compose hash cannot be recomputed from
+  this repository: Phala hashes its own `app-compose.json`, which wraps the compose file and is not
+  committed here.
 - The only attestation this repository checks is Helius' prover's, through the Rings SDK ("The
   prover" above).
 

@@ -8,11 +8,12 @@ a second, smaller part.
 
 ![A supply, a borrow, a price drop and a liquidation on devnet](docs/demo.gif)
 
-Recorded on devnet on 26 November 2026 with a new wallet, shown at three times speed (100 seconds
-in real time): 100 tUSD supplied, a position opened with 0.5 tSOL, 58 tUSD borrowed, then the test
+Recorded on devnet on 26 November 2026 with a new wallet, shown at three times speed (100 seconds in
+real time): 100 tUSD supplied, a position opened with 0.5 tSOL, 58 tUSD borrowed, then the test
 price is set to 132 and the keeper repays 11.046788 tUSD of the debt with 0.084020125 tSOL at
 132.79. The keeper posts the test price of 150 again a few seconds later, which is why the vault
-header still reads 150.
+header still reads 150. Recorded before the move described under "Where it runs", with the keeper on
+the operator's machine.
 
 - Devnet lend program: [`CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL`](https://orbmarkets.io/address/CqfpHokrAewSvYhwN6sN8Uazt2UdBootqUj98hSi2ysL/history?cluster=devnet)
 - Live page (devnet): https://keeler.xterminbeta.workers.dev
@@ -56,11 +57,12 @@ in one Phala Cloud CVM (Intel TDX), deployed on 2026-11-26 by `scripts/deploy-ph
 - Compose hash, as the Phala API reports it:
   `7d6b96eaab71b28fc54b14f0b378abaaa5d31031a6d5aa282cd699c26687a45f`
 
-This shows only that the keepers run in a TDX CVM from a published compose file and image. The
-keys in it are the existing devnet keys, made outside it and known to the operator; the key
-manager is Phala's; nothing checks an attestation of the CVM: not the page, not the Worker, not a
-command in this repository. None of the properties of the enclave proposal in
-`docs/threat-model.md` hold for it.
+A reader cannot yet verify this from outside: these are the operator's statements. The keys in the
+CVM are the existing devnet keys, made outside it and known to the operator, and the Helius API key
+passed in is `keeler-helius-api-key`, the item `docs/mainnet-runbook.md` also names; the key manager
+is Phala's; nothing checks an attestation of the CVM: not the page, not the Worker, not a command in
+this repository. None of the properties of the enclave proposal in `docs/threat-model.md` hold for
+it.
 
 ## Architecture
 
@@ -257,8 +259,9 @@ scripts/run-lend-e2e.sh                                               # the keep
 scripts/run-swap-e2e.sh                                               # swaps end to end, port offset 2600
 ```
 
-The lend SDK's tests and example and the spike's test include `utxo.rs` or `wallet.rs` from
-`.tools/privacy-ring-examples/test-utils/`, so they build only after `scripts/setup.sh`.
+The lend program's Mollusk tests, the lend SDK's tests and example and the spike's test include
+`mollusk.rs`, `utxo.rs` or `wallet.rs` from `.tools/privacy-ring-examples/test-utils/`, so they
+build only after `scripts/setup.sh`. A second worktree needs `.tools` linked to the main checkout's.
 
 The page against a real local keeper: `scripts/lend-web-stack.sh start` (local network, keeper,
 Worker), then `cd web && pnpm exec playwright install chromium && pnpm e2e:lend`; the same page against
@@ -266,7 +269,7 @@ its mock client, with no network: `pnpm e2e:mock`. Local networks use a port off
 The scripts read the tool paths from the main checkout's `.tools/env`; each checkout builds its own
 `target/` (several GB).
 
-Continuous integration (`.github/workflows/ci.yml`, on every push and on pull requests to `main`) runs on Linux:
+Continuous integration (`.github/workflows/ci.yml`, on pushes and pull requests to `main`) runs on Linux:
 `cargo fmt --check`, `cargo clippy -D warnings`, `scripts/setup.sh` and `scripts/setup-lend.sh`
 (so the lend keys checksum is checked), the `keeler-core`, `keeler` (lib, fixtures, deploy refusals),
 circuit and lend SDK native tests, and the web and Worker type checks and unit tests. It does not
@@ -433,9 +436,8 @@ rescans the order history on every poll.
 
 Apache-2.0 (`LICENSE`), except as below. The swap side runs Helius'
 `helius-labs/privacy-ring-examples` swap program, fetched at a pinned commit and patched
-(`patches/swap.patch`), not copied. The lend tests include two of its test helpers from that
-checkout. Two files here are adapted from it: `lend/program/tests/mollusk.rs` and, in part,
-`lend/sdk/src/proof.rs`. That repository carries no licence at the pinned commit. Those two files,
-as far as they come from it, and the patch's context remain Helius Labs' and are not covered by
-this repository's Apache-2.0 licence (`NOTICE`). Built on Helius Privacy Rings (`spr-*`,
-`@heliuslabs/spr`), Blueshift's Xark, and Pinocchio.
+(`patches/swap.patch`), not copied. The lend tests include three of its test helpers from that
+checkout. Five files here contain code from it, the patch included; `NOTICE` lists them. That
+repository carries no licence at the pinned commit. Those files, as far as they come from it, remain
+Helius Labs' and are not covered by this repository's Apache-2.0 licence. Built on Helius Privacy
+Rings (`spr-*`, `@heliuslabs/spr`), Blueshift's Xark, and Pinocchio.

@@ -52,19 +52,21 @@ The keeper runs inside the dealer, on the dealer's HTTP server, when the dealer 
 }
 ```
 
-On devnet `scripts/run-dealer.sh <config>` runs it: for a config with `lend` it finds the
-deployment whose `target/devnet-<name>/program-id` is `lend.program_id`, builds the binary in
+On devnet the keepers run either in the Phala Cloud CVM (`docs/lend-deploy.md`, "On Phala Cloud"),
+which is how they run today, or through `scripts/run-dealer.sh <config>`, never both at once. For a
+config with `lend`, `scripts/run-dealer.sh` finds the deployment whose
+`target/devnet-<name>/program-id` is `lend.program_id`, builds the binary in
 `target/devnet-<name>/dealer-cargo` with the build parameters `scripts/deploy-lend-devnet.sh`
 recorded in `build-params.json` (`keepers`, `pool_viewing` and the rest; it refuses to run if the
 dealer is not one of `keepers`, or if `lend.pool_key` is not the Keychain item
-`keeler-devnet-<name>-pool`), and points the keeper at the deployment's own copy of the proving
-keys (`KEELER_LEND_KEYS_DIR=target/devnet-<name>/keys`), so a rebuild of `lend/target` cannot
-change them under a running keeper. The keeper key is `lend.key` when set (the script checks its
-address is one of `keepers`), else the dealer key. The script writes `DEALERS` as soon as the
-dealer's tunnel has a URL, and `LEND_KEEPERS` (the dealer's keeper) whenever its URL changes. With
-`--standby` it also runs the other keeper of `keepers` as a standby (`keeler keeper`, key in
-`keeler-devnet-<name>-standby`, the same lend section with `role: standby` and no `key`, on the
-next port behind its own tunnel) and adds it to `LEND_KEEPERS`, after the dealer's keeper, once its
+`keeler-devnet-<name>-pool`), and points the keeper at the deployment's own copy of the proving keys
+(`KEELER_LEND_KEYS_DIR=target/devnet-<name>/keys`), so a rebuild of `lend/target` cannot change them
+under a running keeper. The keeper key is `lend.key` when set (the script checks its address is one
+of `keepers`), else the dealer key. The script writes `DEALERS` as soon as the dealer's tunnel has a
+URL, and `LEND_KEEPERS` (the dealer's keeper) whenever its URL changes. With `--standby` it also
+runs the other keeper of `keepers` as a standby (`keeler keeper`, key in
+`keeler-devnet-<name>-standby`, the same lend section with `role: standby` and no `key`, on the next
+port behind its own tunnel) and adds it to `LEND_KEEPERS`, after the dealer's keeper, once its
 tunnel has a URL.
 
 Inside the dealer the keeper starts on its own thread: the swap routes serve at once, and the lend
