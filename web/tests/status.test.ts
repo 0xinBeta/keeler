@@ -21,13 +21,13 @@ const record = (over: Partial<OrderRecord> = {}): OrderRecord => ({
 });
 
 /** A chain that answers from these values; a thrown value models an RPC or indexer failure. */
-function chain(o: { sig?: SignatureState | Error; height?: bigint | Error; spend?: ChainStatus | Error }): ChainReads {
+function chain(o: { sig?: SignatureState | Error; height?: bigint | Error; spend?: ChainStatus | Error; spentBy?: string }): ChainReads {
   const answer = <T>(v: T | Error | undefined, name: string): Promise<T> =>
     v instanceof Error ? Promise.reject(v) : v === undefined ? Promise.reject(new Error(`unexpected ${name} read`)) : Promise.resolve(v);
   return {
     signatureStatus: () => answer(o.sig, "signature"),
     blockHeight: () => answer(o.height, "height"),
-    spend: () => answer(o.spend, "spend"),
+    spend: () => answer(o.spend, "spend").then((status) => ({ status, ...(o.spentBy ? { spentBy: o.spentBy } : {}) })),
   };
 }
 
@@ -99,6 +99,12 @@ describe("a locked order", () => {
   });
   it("spent by something other than its maker's cancel, with no matching payout, is settled with a plain warning, never refunded", async () => {
     expect(await nextRecord(record({ status: "locked" }), EXPIRY + 1, chain({ spend: "taken-unmatched" }))).toMatchObject({ status: "settled", error: TAKEN_UNMATCHED });
+  });
+  it("keeps the transaction that spent it: the dealer's settle or the maker's cancel", async () => {
+    const locked = record({ status: "locked" });
+    expect(await nextRecord(locked, 10, chain({ spend: "settled", spentBy: "settle" }))).toMatchObject({ status: "settled", spentBy: "settle" });
+    expect(await nextRecord(locked, EXPIRY + 1, chain({ spend: "cancelled", spentBy: "cancel" }))).toMatchObject({ status: "refunded", spentBy: "cancel" });
+    expect((await nextRecord(locked, 10, chain({ spend: "open" }))).spentBy).toBeUndefined();
   });
   it("returns the same record when nothing changed", async () => {
     const locked = record({ status: "locked" });

@@ -350,28 +350,32 @@ export function mintOf(ctx: SwapContext, asset: unknown): Address {
 /** `taken-unmatched`: spent by a transaction that is not this maker's cancel, with no payout that matched. */
 export type ChainStatus = "open" | "settled" | "cancelled" | "taken-unmatched";
 
+/** An order's status on chain and, once spent, the transaction that spent it. */
+export type Spend = { status: ChainStatus; spentBy?: string };
+
 /**
  * Spent or not, and if spent whether by a take (the maker's derived payout is
  * a tree-0 leaf the spending transaction appended) or by this maker's cancel.
  * A read error propagates, so a caller never takes a failed read for a status.
  */
-export async function orderStatus(ctx: SwapContext, o: OrderOpening, buy: { mint: Address; amount: bigint }): Promise<ChainStatus> {
+export async function orderStatus(ctx: SwapContext, o: OrderOpening, buy: { mint: Address; amount: bigint }): Promise<Spend> {
   const nullifier = orderNullifier(o);
   const slot = await ctx.client.getSlot();
   const page = await ctx.client.getShieldedTransactionsByNullifiers({ nullifiers: [nullifier as never] }, atSlot(slot));
   const spends = (e: (typeof page.data)[number]["events"][number]) => e.nullifiers.some((n) => equal(n, nullifier));
   const group = page.data.find((g) => g.events.some(spends));
   const spend = group?.events.find(spends);
-  if (!group || !spend) return "open";
+  if (!group || !spend) return { status: "open" };
+  const spentBy = group.signature;
   const payout = derivedPayoutHash(ctx, o, nullifier, buy);
-  if (spend.outputSlots.some((s) => equal(s.outputContext.hash, payout))) return "settled";
+  if (spend.outputSlots.some((s) => equal(s.outputContext.hash, payout))) return { status: "settled", spentBy };
   // No matching payout: only a cancel this maker signed counts as a refund.
   const tx = await ctx.client.solanaRpc
     .getTransaction(group.signature, { encoding: "base64", maxSupportedTransactionVersion: 1, commitment: "confirmed" })
     .send();
   if (!tx) throw new Error("the RPC has no copy of the transaction that spent this order yet");
   const wire = new Uint8Array(getBase64Encoder().encode(tx.transaction[0]));
-  return isMakersCancel(wire, ctx.programId, ctx.payer) ? "cancelled" : "taken-unmatched";
+  return { status: isMakersCancel(wire, ctx.programId, ctx.payer) ? "cancelled" : "taken-unmatched", spentBy };
 }
 
 /** Whether a wire transaction holds a swap-program cancel whose maker account is `maker`, signed by it. */

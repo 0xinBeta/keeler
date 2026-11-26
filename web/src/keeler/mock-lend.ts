@@ -26,6 +26,9 @@ type Shared = {
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** A fixed fake transaction signature per kind of transaction, so the explorer links can be tested. */
+export const mockSignature = (kind: string) => `Mock${kind}`.padEnd(88, "1");
 const now = () => Math.floor(Date.now() / 1000);
 
 const START_PRICE = 142_370_000_000n; // 142.37 tUSD per tSOL
@@ -145,6 +148,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
   };
   const landed = (o: MockOp, on: (s: LendStep) => void) => {
     o.status = "landed";
+    o.signature = mockSignature(o.kind);
     step(o, "landed", on);
   };
 
@@ -155,6 +159,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
     step(o, "signing", on);
     await sleep(900);
     s.spend(asset, amount);
+    o.signature = mockSignature("Intent");
     step(o, "keeper", on);
     o.fill = () => {
       if (o.status !== "pending") return;
@@ -163,6 +168,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
       setRate();
       o.status = "landed";
       o.step = "landed";
+      o.spentBy = mockSignature("Fill");
     };
     if (s.scenario !== "keeper-stalls") setTimeout(() => o.fill?.(), 3000);
     return strip(o);
@@ -185,7 +191,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
           continue; // not liquidatable, or nothing to take
         }
         r = { ...r, debtShares: r.debtShares - (p.debtShares - l.debtShares) };
-        p.lastLiquidation = { at: now(), debtRepaid: l.repay, collateralSold: l.payout, price: vault.price, collateralLeft: l.collateral, debtLeft: L.debtOf(l.debtShares, r.borrowPrice) };
+        p.lastLiquidation = { at: now(), debtRepaid: l.repay, collateralSold: l.payout, price: vault.price, collateralLeft: l.collateral, debtLeft: L.debtOf(l.debtShares, r.borrowPrice), signature: mockSignature("Liquidate") };
         p.debtShares = l.debtShares;
         p.collateral = l.collateral;
       }
@@ -376,6 +382,7 @@ export function createMockLend(tUSD: Asset, tSOL: Asset, s: Shared): KeelerLend 
         throw new KeelerError("quote-expired", "This request has not expired yet. You can take the funds back once the countdown ends.");
       await sleep(2500);
       o.status = "refunded";
+      o.spentBy = mockSignature("Refund");
       o.fill = null;
       s.addNote(o.amounts[0]!.asset, o.amounts[0]!.amount);
     },

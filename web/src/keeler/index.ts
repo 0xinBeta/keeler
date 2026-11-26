@@ -39,6 +39,10 @@ export type Order = {
   expiry: number;
   status: OrderStatus;
   error?: string;
+  /** The make transaction, once it has landed. */
+  signature?: string;
+  /** The transaction that spent the order: the dealer's settle, or the maker's refund. */
+  spentBy?: string;
 };
 
 export type SwapStep = "checking" | "proving" | "signing" | "locked";
@@ -53,10 +57,12 @@ export interface Keeler {
   /** One wallet signature that derives the private keys. Kept in memory only. */
   unlock(): Promise<void>;
   isRegistered(): Promise<boolean>;
-  register(): Promise<void>;
+  /** Resolves with the registration's signature once it landed; undefined when the wallet was registered already. */
+  register(): Promise<string | undefined>;
   balances(): Promise<Balance[]>;
-  deposit(asset: Asset, amount: bigint): Promise<void>;
-  withdraw(asset: Asset, amount: bigint): Promise<void>;
+  /** Each resolves with the landed transaction's signature. */
+  deposit(asset: Asset, amount: bigint): Promise<string>;
+  withdraw(asset: Asset, amount: bigint): Promise<string>;
   /** `quotes` is best first; out-of-band quotes are included with `inBand: false`. */
   quotes(sell: Asset, buy: Asset, sellAmount: bigint): Promise<{ fair: bigint; priceTime: number; quotes: Quote[] }>;
   swap(quote: Quote, on: (step: SwapStep) => void): Promise<Order>;
@@ -143,6 +149,8 @@ export type Liquidation = {
   /** What the liquidation itself left, before anything the owner did after it. */
   collateralLeft: bigint;
   debtLeft: bigint;
+  /** The liquidation's transaction; absent in records saved before it was kept. */
+  signature?: string;
 };
 
 /** A borrowing position. Health and liquidation price are not here: the page computes them from the vault's price. */
@@ -184,6 +192,10 @@ export type LendOperation = {
   expiry: number | null;
   createdAt: number;
   error?: string;
+  /** The transaction this page sent, once it has landed: the intent, or the keeper-built transaction or close. */
+  signature?: string;
+  /** The transaction that spent an intent: the keeper's fill, or the owner's refund. */
+  spentBy?: string;
 };
 
 export type LendAccount = {

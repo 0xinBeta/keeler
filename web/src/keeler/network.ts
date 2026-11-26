@@ -9,3 +9,7 @@ export const testWalletAllowed = (network = BUILD_NETWORK) => network === "local
 
 /** The Wallet Standard chain id of a Keeler network name. */
 export const walletChain = (network: string): `solana:${string}` => (network === "local" ? "solana:localnet" : `solana:${network}`);
+
+/** The transaction's page on Orb, Helius' explorer (https://www.helius.dev/docs/orb/explore-devnet.md); devnet only, undefined elsewhere. */
+export const orbTx = (signature: string, network = BUILD_NETWORK): string | undefined =>
+  network === "devnet" ? `https://orbmarkets.io/tx/${signature}?cluster=devnet` : undefined;

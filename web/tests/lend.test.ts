@@ -444,6 +444,9 @@ describe("intents: supply, deposit, repay", () => {
     await createLend(W.deps).refundIntent(op.id);
     expect(W.log.cancels).toBe(1);
     expect(W.store.get("op", op.id)?.status).toBe("refunded");
+    const [refunded] = (await W.lend.lendAccount()).operations;
+    expect(refunded).toMatchObject({ status: "refunded", signature: getSignatureFromTransaction(W.log.sent[0]!) });
+    expect(refunded!.spentBy).toBe(W.notes.get(op.id)?.spentBy);
   });
 
   it("reads a fill as landed and then adopts the keeper's receipt, verified on chain", async () => {
@@ -453,8 +456,28 @@ describe("intents: supply, deposit, repay", () => {
     W.txs.set(fill, wire(W.KEEPER, [{ programAddress: PROGRAM, accounts: [ws(W.KEEPER)], data: Uint8Array.of(TAG.supply) }]));
     await giveReceipt(W, 227_272727n);
     const a = await W.lend.lendAccount();
-    expect(a.operations[0]?.status).toBe("landed");
+    expect(a.operations[0]).toMatchObject({ status: "landed", spentBy: fill, signature: getSignatureFromTransaction(W.log.sent[0]!) });
     expect(a.receipts).toEqual([{ pool: TUSD, shares: 227_272727n, value: 227_272727n }]);
+  });
+
+  it("gives an operation its signature only once its transaction has landed", async () => {
+    W.deps.send = async () => {
+      throw new Error("timed out");
+    };
+    expect((await refusal(createLend(W.deps).supply(TUSD, 250_000000n, () => {}))).code).toBe("network");
+    const [r] = W.store.all("op");
+    expect(r?.tx?.signature).toBeTypeOf("string");
+    expect((await W.lend.lendAccount()).operations[0]?.signature).toBeUndefined();
+    W.sigs.set(r!.tx!.signature, { err: null, confirmationStatus: "confirmed" });
+    expect((await W.lend.lendAccount()).operations[0]?.signature).toBe(r!.tx!.signature);
+  });
+
+  it("loads a landed record saved before the keeper's fill was kept: its own signature, no fill", async () => {
+    const op = await W.lend.supply(TUSD, 250_000000n, () => {});
+    W.store.put("op", op.id, { ...W.store.get("op", op.id)!, status: "landed", step: "landed" });
+    const [shown] = (await W.lend.lendAccount()).operations;
+    expect(shown).toMatchObject({ id: op.id, status: "landed", signature: getSignatureFromTransaction(W.log.sent[0]!) });
+    expect(shown!.spentBy).toBeUndefined();
   });
 });
 
@@ -473,13 +496,14 @@ describe("the keeper account view", () => {
    * then lists `next` (its latest note, which may come after later operations), or nothing, as the real keeper does
    * for a position left empty.
    */
+  const LIQUIDATION = "7".repeat(88);
   async function liquidated(bound: bigint, next?: [bigint, bigint], at = T0 - 20, nextWrittenByIt = false) {
     await W.lend.supply(TUSD, 1_000000n, () => {}); // opens the session
     const held = await givePosition(W, 42n, 4_000000000n, 100_000000n);
     await W.lend.lendAccount();
     W.keeper.account.positions = [];
     const after = next ? await givePosition(W, 42n, next[0], next[1]) : undefined;
-    const sig = "7".repeat(88);
+    const sig = LIQUIDATION;
     const args = new Uint8Array(ARGS.liquidate.length);
     args.set(u64Bytes(BigInt(at)), ARGS.liquidate.now);
     args.set(u64Bytes(bound), ARGS.liquidate.bound);
@@ -503,7 +527,7 @@ describe("the keeper account view", () => {
       treeContexts: [{ utxoTreeRootIndex: 0, nullifierTreeRootIndex: 0 }],
     } as never);
   // At $28.50 a tSOL, as lend-math's `liquidate` (the program's) computes it.
-  const PARTIAL = { at: T0 - 20, price: 28_500_000_000n, collateralSold: 776_393192n, debtRepaid: 21_908125n, collateralLeft: 3_223_606808n, debtLeft: 78_091875n };
+  const PARTIAL = { at: T0 - 20, price: 28_500_000_000n, collateralSold: 776_393192n, debtRepaid: 21_908125n, collateralLeft: 3_223_606808n, debtLeft: 78_091875n, signature: LIQUIDATION };
 
   it("records what a liquidation left, and keeps that after a later repayment", async () => {
     const after = (await liquidated(PARTIAL.price, [PARTIAL.collateralLeft, PARTIAL.debtLeft]))!;
@@ -519,7 +543,7 @@ describe("the keeper account view", () => {
   it("shows a liquidation smaller than the largest with its own figures, read from the position it wrote", async () => {
     await liquidated(PARTIAL.price, [3_500000000n, 90_000000n], T0 - 20, true);
     const [p] = (await W.lend.lendAccount()).positions;
-    expect(p!.lastLiquidation).toEqual({ at: T0 - 20, price: PARTIAL.price, collateralSold: 500_000000n, debtRepaid: 10_000000n, collateralLeft: 3_500000000n, debtLeft: 90_000000n });
+    expect(p!.lastLiquidation).toEqual({ at: T0 - 20, price: PARTIAL.price, collateralSold: 500_000000n, debtRepaid: 10_000000n, collateralLeft: 3_500000000n, debtLeft: 90_000000n, signature: LIQUIDATION });
   });
 
   it("says what the liquidation did even when a top-up landed before the page read", async () => {
@@ -540,7 +564,7 @@ describe("the keeper account view", () => {
     expect(W.keeper.account.positions).toEqual([]);
     const a = await W.lend.lendAccount();
     expect(a.positions).toEqual([]);
-    expect(a.emptied).toEqual([{ vault: 1, id: "42", collateral: 0n, debt: 0n, lastLiquidation: { at: T0 - 20, price: 25_250_000_000n, collateralSold: 4_000000000n, debtRepaid: 100_000000n, collateralLeft: 0n, debtLeft: 0n } }]);
+    expect(a.emptied).toEqual([{ vault: 1, id: "42", collateral: 0n, debt: 0n, lastLiquidation: { at: T0 - 20, price: 25_250_000_000n, collateralSold: 4_000000000n, debtRepaid: 100_000000n, collateralLeft: 0n, debtLeft: 0n, signature: LIQUIDATION } }]);
     expect((await W.lend.lendAccount()).emptied).toHaveLength(1);
   });
 

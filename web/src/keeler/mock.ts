@@ -4,7 +4,7 @@ import type { Wallet } from "@wallet-standard/base";
 // Lend scenarios are listed in mock-lend.ts.
 import { KeelerError } from "./index";
 import type { Asset, Balance, Config, Keeler, Order, Quote, SwapStep } from "./index";
-import { createMockLend } from "./mock-lend";
+import { createMockLend, mockSignature } from "./mock-lend";
 
 type Scenario = "dealer-offline" | "no-quotes" | "wallet-rejected" | "storage" | "rate-limited" | "paused" | null;
 
@@ -93,6 +93,7 @@ export function createMockKeeler(): Keeler {
     if (o.status !== "locked") return;
     if (o.settlesAt !== null && Date.now() >= o.settlesAt) {
       o.status = "settled";
+      o.spentBy = mockSignature("Settle");
       addNote(o.buy, o.buyAmount);
     } else if (now() > o.expiry) o.status = "refundable";
   };
@@ -138,6 +139,7 @@ export function createMockKeeler(): Keeler {
       need("unlock");
       await sleep(1800);
       registered = true;
+      return mockSignature("Register");
     },
     async balances(): Promise<Balance[]> {
       need("unlock");
@@ -159,12 +161,14 @@ export function createMockKeeler(): Keeler {
       await sleep(2200);
       pub.set(asset.mint, pub.get(asset.mint)! - amount);
       addNote(asset, amount);
+      return mockSignature("Deposit");
     },
     async withdraw(asset, amount) {
       need("unlock");
       await sleep(2400);
       spend(asset, amount);
       pub.set(asset.mint, pub.get(asset.mint)! + amount);
+      return mockSignature("Withdraw");
     },
     async quotes(sell, buy, sellAmount) {
       need("unlock");
@@ -222,6 +226,7 @@ export function createMockKeeler(): Keeler {
           buyAmount: quote.buyAmount,
           expiry: quote.expiry,
           status: "locked" as const,
+          signature: mockSignature("Make"),
           settlesAt: dealer?.settles ? Date.now() + 5000 : null,
         };
         orders.unshift(order);
@@ -249,6 +254,7 @@ export function createMockKeeler(): Keeler {
         throw new KeelerError("quote-expired", "The quote has not expired yet. You can take your funds back once the countdown ends.");
       await sleep(3000);
       o.status = "refunded";
+      o.spentBy = mockSignature("Refund");
       addNote(o.sell, o.sellAmount);
     },
     async faucet() {
