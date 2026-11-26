@@ -1,6 +1,8 @@
-# gitleaks false positives, by fingerprint (commit:file:rule:line).
+# gitleaks false positives, by fingerprint: commit:file:rule:line for git scans,
+# file:rule:line for directory scans.
 # lend/{program,spike}/src/verifier/*.vk.rs: generated Groth16 verifying keys (public by design).
 # web/tests/fixtures/lend-requests.json: signed requests made from fixed, public test seeds.
+# README.md: the Phala compose hash of the devnet CVM (public by design).
 3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_accrue.vk.rs:generic-api-key:12
 3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_fund.vk.rs:generic-api-key:12
 3121a32f4c8cedb9e14174ccd710a894ff09f8c6:lend/spike/src/verifier/spike_init.vk.rs:generic-api-key:12
@@ -43,3 +45,33 @@ d7c9a485390635488b26583e10bb2f0339ec5918:web/tests/fixtures/lend-requests.json:g
 fac9e9aaff3a2c8194b67da0d2abcc87128e3072:lend/program/src/verifier/cancel_intent.vk.rs:generic-api-key:12
 fac9e9aaff3a2c8194b67da0d2abcc87128e3072:lend/program/src/verifier/init_reserve.vk.rs:generic-api-key:12
 fac9e9aaff3a2c8194b67da0d2abcc87128e3072:lend/program/src/verifier/intent.vk.rs:generic-api-key:12
+e2db43d47429d77e00cf29bd6598f45b8ddcda0b:README.md:generic-api-key:56
+README.md:generic-api-key:57
+lend/program/src/verifier/cancel_intent.vk.rs:generic-api-key:12
+lend/program/src/verifier/close.vk.rs:generic-api-key:12
+lend/program/src/verifier/deposit_add.vk.rs:generic-api-key:12
+lend/program/src/verifier/deposit_open.vk.rs:generic-api-key:12
+lend/program/src/verifier/draw.vk.rs:generic-api-key:12
+lend/program/src/verifier/init_reserve.vk.rs:generic-api-key:12
+lend/program/src/verifier/intent.vk.rs:generic-api-key:12
+lend/program/src/verifier/liquidate.vk.rs:generic-api-key:12
+lend/program/src/verifier/redeem.vk.rs:generic-api-key:12
+lend/program/src/verifier/repay.vk.rs:generic-api-key:12
+lend/program/src/verifier/supply.vk.rs:generic-api-key:12
+lend/spike/src/verifier/spike_accrue.vk.rs:generic-api-key:12
+lend/spike/src/verifier/spike_fund.vk.rs:generic-api-key:12
+lend/spike/src/verifier/spike_init.vk.rs:generic-api-key:12
+lend/spike/src/verifier/spike_move.vk.rs:generic-api-key:12
+lend/spike/src/verifier/spike_touch.vk.rs:generic-api-key:12
+web/tests/fixtures/lend-requests.json:generic-api-key:14
+web/tests/fixtures/lend-requests.json:generic-api-key:16
+web/tests/fixtures/lend-requests.json:generic-api-key:17
+web/tests/fixtures/lend-requests.json:generic-api-key:26
+web/tests/fixtures/lend-requests.json:generic-api-key:28
+web/tests/fixtures/lend-requests.json:generic-api-key:44
+web/tests/fixtures/lend-requests.json:generic-api-key:56
+web/tests/fixtures/lend-requests.json:generic-api-key:58
+web/tests/fixtures/lend-requests.json:generic-api-key:63
+web/tests/fixtures/lend-requests.json:generic-api-key:77
+web/tests/fixtures/lend-requests.json:generic-api-key:79
+web/tests/fixtures/lend-requests.json:generic-api-key:84
