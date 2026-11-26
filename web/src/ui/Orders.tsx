@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { Keeler, Order } from "../keeler/index";
 import { countdown } from "./format";
-import { Amount, ErrorNote, errorText, useChainNow } from "./shared";
+import { Amount, ErrorNote, errorText, ON_CHAIN, OrbLinks, useChainNow } from "./shared";
 
 const LABEL: Record<Order["status"], string> = {
   pending: "Sending",
@@ -11,6 +11,12 @@ const LABEL: Record<Order["status"], string> = {
   refunded: "Funds taken back",
   failed: "Failed",
 };
+
+/** The order's make and, once spent, its settle or refund, each linked on Orb. */
+export function OrderLinks({ order }: { order: Order }) {
+  const spent = order.status === "refunded" ? "View refund on Orb" : "View settlement on Orb";
+  return <OrbLinks links={[{ signature: order.signature, label: "View order on Orb" }, { signature: order.spentBy, label: spent }]} says={ON_CHAIN.swap} />;
+}
 
 type Props = {
   keeler: Keeler;
@@ -96,6 +102,7 @@ export function Orders({ keeler, orders, chainOffset, refresh, refreshBalances, 
                     expires.
                   </span>
                 )}
+                <OrderLinks order={o} />
                 {o.status === "refundable" && (
                   <button className="button button-primary button-small" onClick={() => refund(o.id)} disabled={!!busy} aria-busy={busy === o.id}>
                     {busy === o.id ? "Taking funds back…" : "Take funds back"}

@@ -1,10 +1,12 @@
 // Earn, Borrow, Swap, Balances and Activity on the mock client, driven only through the page's visible controls.
 // LEND_SCREENS=<dir> also saves screenshots there, named lend-<project>-<n>-<what>.jpg.
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 
 const panel = (page: Page) => page.getByRole("region", { name: "Keeler app" });
 const activity = (page: Page) => page.locator("section[aria-labelledby=lending-title]");
 const caption = (page: Page) => page.locator(".observatory figcaption");
+const orb = (kind: string) => `https://orbmarkets.io/tx/${`Mock${kind}`.padEnd(88, "1")}?cluster=devnet`;
+const orbLink = (scope: Locator, label: string) => scope.getByRole("link", { name: `${label} (opens in a new tab)` });
 const navLink = (page: Page, name: string) => page.getByRole("navigation", { name: "Application" }).getByRole("link", { name: new RegExp(`^${name}`) });
 async function open(page: Page, name: "Earn" | "Borrow" | "Swap" | "Balances" | "Activity") {
   await navLink(page, name).click();
@@ -152,6 +154,7 @@ test("borrow: open, borrow, repay, withdraw, liquidation, repay all and close", 
   await shot(page, info, "06-liquidatable");
   await expect(p.getByText(/^Liquidated /)).toBeVisible({ timeout: 15_000 });
   await expect(p.getByText(/It brought the position back to 85% or less, and the rest stayed yours\./)).toBeVisible();
+  await expect(orbLink(p.locator(".liquidated"), "View liquidation on Orb")).toHaveAttribute("href", orb("Liquidate"));
   await expect(meter).toHaveAttribute("aria-valuetext", /^8[45]\.\d%/);
   const collateral = units(await p.locator(".position dd").first().innerText(), 9);
   expect(collateral).toBeLessThan(3_500_000_000n);
@@ -191,6 +194,76 @@ test("an intent the keeper does not fill is taken back after it expires", async 
   await p.getByRole("button", { name: "Take funds back" }).click();
   await expect(p.getByText("Done. The funds are back in your private balance.")).toBeVisible({ timeout: 10_000 });
   await expect(activity(page).locator("li.order-refunded .badge")).toHaveText("Funds taken back");
+  await open(page, "Activity");
+  const refunded = activity(page).locator("li.order-refunded");
+  await expect(orbLink(refunded, "View request on Orb")).toHaveAttribute("href", orb("Intent"));
+  await expect(orbLink(refunded, "View refund on Orb")).toHaveAttribute("href", orb("Refund"));
+  await expect(refunded.getByText(/fill/)).toHaveCount(0);
+  expect(problems).toEqual([]);
+});
+
+test("a desk with nothing private sends the wallet to Balances, and each landed transaction links to Orb", async ({ page }) => {
+  const problems: string[] = [];
+  page.on("pageerror", (e) => problems.push(e.message));
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/#earn");
+  const p = panel(page);
+  await p.getByRole("button", { name: /Browser test wallet/ }).click();
+  await p.getByRole("button", { name: "Sign to unlock" }).click();
+  await p.getByRole("button", { name: "Get test tokens" }).click();
+  await expect(p.getByText("Test tokens sent to your public balance.")).toBeVisible();
+  await p.getByRole("button", { name: "Register" }).click();
+
+  await expect(p.getByText("Your wallet's private balance has no tUSD. Move some in from your public balance, then deposit it here to earn.")).toBeVisible();
+  await expect(p.getByRole("button", { name: "Deposit and earn" })).toHaveCount(0);
+  await p.locator(".desk:not([hidden])").getByRole("button", { name: "Go to balances" }).click();
+  await expect(page).toHaveURL(/#balances$/);
+  await expect(p.getByText("Wallet registered.")).toBeVisible();
+  const registration = orbLink(p, "View registration on Orb");
+  await expect(registration).toHaveAttribute("href", orb("Register"));
+  await expect(registration).toHaveAttribute("target", "_blank");
+  await expect(registration).toHaveAttribute("rel", "noopener noreferrer");
+  await expect(p.getByText("Public on chain: your wallet and the private-note keys it registered.")).toBeVisible();
+
+  await open(page, "Borrow");
+  await expect(p.getByText("Your wallet's private balance has no tSOL. Move some in from your public balance, then add it here as collateral.")).toBeVisible();
+  await expect(p.getByRole("button", { name: "Open a position" })).toHaveCount(0);
+  const go = p.locator(".desk:not([hidden])").getByRole("button", { name: "Go to balances" });
+  await go.focus();
+  await expect(go).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#balances$/);
+
+  await p.getByRole("combobox", { name: "Asset", exact: true }).selectOption({ label: "tUSD" });
+  await p.locator("#move-amt").fill("600");
+  await p.locator("form.move button[type=submit]").click();
+  await expect(p.getByText("Deposited 600 tUSD.")).toBeVisible({ timeout: 10_000 });
+  const move = orbLink(p, "View transaction on Orb");
+  await expect(move).toHaveAttribute("href", orb("Deposit"));
+  await expect(p.getByText("Public on chain: your wallet and the amount moved.")).toBeVisible();
+  await p.locator("#move-amt").focus();
+  for (let i = 0; i < 10 && !(await move.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab");
+  await expect(move).toBeFocused();
+  expect(await move.evaluate((el) => el.matches(":focus-visible") && getComputedStyle(el).outlineStyle)).toBe("solid");
+
+  await open(page, "Earn");
+  await p.locator("#earn-amt").fill("50");
+  await p.getByRole("button", { name: "Deposit and earn" }).click();
+  await expect(orbLink(p, "View request on Orb")).toHaveCount(0);
+  await expect(p.locator(".step-now", { hasText: "Waiting for the keeper" })).toBeVisible({ timeout: 10_000 });
+  await expect(orbLink(p.locator(".desk:not([hidden])"), "View request on Orb")).toHaveAttribute("href", orb("Intent"));
+  await expect(p.getByText("Done. Your deposit is in the pool and earning.")).toBeVisible({ timeout: 15_000 });
+  await expect(orbLink(p.locator(".desk:not([hidden])"), "View keeper's fill on Orb")).toHaveAttribute("href", orb("Fill"));
+  await expect(p.locator(".desk:not([hidden])").getByText("Public on chain: the wallets, the instruction and which pool or vault. The amounts are not.")).toBeVisible();
+
+  await open(page, "Activity");
+  const row = activity(page).locator("li.order-settled");
+  await expect(orbLink(row, "View keeper's fill on Orb")).toBeVisible();
+  for (const desk of ["Activity", "Balances"] as const) {
+    await open(page, desk);
+    await page.setViewportSize({ width: 320, height: 800 });
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(320);
+  }
   expect(problems).toEqual([]);
 });
 
@@ -289,6 +362,9 @@ test("a refundable order shows its count on Activity and a notice on every desk"
   await shot(page, info, "15-activity");
   await page.locator("section[aria-labelledby=orders-title]").getByRole("button", { name: "Take funds back" }).click();
   await expect(navLink(page, "Activity")).toHaveAccessibleName("Activity", { timeout: 15_000 });
+  const refunded = page.locator("section[aria-labelledby=orders-title] li.order-refunded");
+  await expect(orbLink(refunded, "View order on Orb")).toHaveAttribute("href", orb("Make"));
+  await expect(orbLink(refunded, "View refund on Orb")).toHaveAttribute("href", orb("Refund"));
   await expect(p.locator(".note-refund")).toHaveCount(0);
   expect(problems).toEqual([]);
 });
@@ -385,5 +461,9 @@ test("a swap in flight survives a visit to the landing", async ({ page }) => {
   await page.goBack();
   await expect(p.getByText(/^Settled\. You received [\d.,]+ tSOL privately\.$/)).toBeVisible({ timeout: 60_000 });
   await expect(caption(page)).toHaveText(/^Received\s*[\d.,]+ tSOL$/);
+  const swapDesk = p.locator(".desk:not([hidden])");
+  await expect(orbLink(swapDesk, "View order on Orb")).toHaveAttribute("href", orb("Make"));
+  await expect(orbLink(swapDesk, "View settlement on Orb")).toHaveAttribute("href", orb("Settle"));
+  await expect(swapDesk.getByText("Public on chain: who traded, which tokens")).toBeVisible();
   expect(problems).toEqual([]);
 });

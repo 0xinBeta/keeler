@@ -8,10 +8,11 @@ import { DeskRing, useReport } from "./app/ring";
 import type { Report, Scene } from "./app/ring";
 import { bps, countdown, formatUnits, parseUnits, short } from "./format";
 import { BorrowTab, EarnTab } from "./Lend";
+import { OrderLinks } from "./Orders";
 import type { Market } from "./Lend";
 import { borrowModel, earnModel, swapModel } from "./orbit/model";
 import type { DeskTab } from "./orbit/model";
-import { Amount, amountText, ErrorNote, errorText, Funds, RefundNotice, useChainNow } from "./shared";
+import { Amount, amountText, ErrorNote, errorText, Funds, ON_CHAIN, OrbLinks, RefundNotice, useChainNow } from "./shared";
 
 type Props = {
   keeler: Keeler;
@@ -114,9 +115,10 @@ export function Panel(p: Props) {
         p.onReady();
       } else setPhase("register");
     });
+  const [registration, setRegistration] = useState<string | undefined>();
   const register = () =>
     act.run("register", async () => {
-      await keeler.register();
+      setRegistration(await keeler.register());
       setPhase("ready");
       p.onReady();
     });
@@ -207,6 +209,7 @@ export function Panel(p: Props) {
     refreshBalances: p.refreshBalances,
     refundable: p.refundable,
     report,
+    toBalances: () => setTab("balances"),
   };
 
   return (
@@ -245,7 +248,7 @@ export function Panel(p: Props) {
             </>
           )}
           <div className="desk" hidden={shown !== "balances"}>
-            <BalancesTab {...p} />
+            <BalancesTab {...p} registration={registration} />
           </div>
           <div className="desk desk-activity" hidden={shown !== "activity"}>
             {p.activity}
@@ -715,6 +718,7 @@ function Progress(
       <p className={`status${view.failed || status === "failed" ? " bad" : ""}`} aria-live="polite">
         {line}
       </p>
+      {order && <OrderLinks order={order} />}
       {view.failed && <p className="note note-error" role="alert">{view.failed}</p>}
       {status === "refundable" && (
         <button
@@ -747,13 +751,17 @@ function Progress(
   );
 }
 
-function BalancesTab(p: Props) {
+type Done = { text: string; link?: { signature: string; label: string; says: string } };
+
+function BalancesTab(p: Props & { registration: string | undefined }) {
   const { keeler, config, balances } = p;
   const [mode, setMode] = useState<"deposit" | "withdraw">("deposit");
   const [mint, setMint] = useState(config.assets[0]!.mint);
   const [text, setText] = useState("");
   const [shown, setShown] = useState(false);
-  const [done, setDone] = useState<string | null>(null);
+  const [done, setDone] = useState<Done | null>(
+    p.registration ? { text: "Wallet registered.", link: { signature: p.registration, label: "View registration on Orb", says: ON_CHAIN.register } } : null,
+  );
   const act = useAction();
 
   const asset = config.assets.find((a) => a.mint === mint)!;
@@ -773,9 +781,12 @@ function BalancesTab(p: Props) {
     setDone(null);
     if (invalid || typeof parsed !== "bigint") return;
     return act.run(mode, async () => {
-      await (mode === "deposit" ? keeler.deposit(asset, parsed) : keeler.withdraw(asset, parsed));
+      const signature = await (mode === "deposit" ? keeler.deposit(asset, parsed) : keeler.withdraw(asset, parsed));
       await p.refreshBalances();
-      setDone(`${mode === "deposit" ? "Deposited" : "Withdrew"} ${formatUnits(parsed, asset.decimals)} ${asset.symbol}.`);
+      setDone({
+        text: `${mode === "deposit" ? "Deposited" : "Withdrew"} ${formatUnits(parsed, asset.decimals)} ${asset.symbol}.`,
+        link: { signature, label: "View transaction on Orb", says: ON_CHAIN.move },
+      });
       setText("");
       setShown(false);
     });
@@ -786,7 +797,7 @@ function BalancesTab(p: Props) {
       setDone(null);
       await keeler.faucet();
       await p.refreshBalances();
-      setDone("Test tokens sent to your public balance.");
+      setDone({ text: "Test tokens sent to your public balance." });
     });
 
   return (
@@ -883,8 +894,9 @@ function BalancesTab(p: Props) {
             </p>
           </form>
           <p className="status" aria-live="polite">
-            {done}
+            {done?.text}
           </p>
+          {done?.link && <OrbLinks links={[done.link]} says={done.link.says} />}
           <ErrorNote text={act.error} />
         </div>
       </section>

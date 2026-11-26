@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { KeelerError } from "../keeler/index";
 import type { Asset, Balance, Config } from "../keeler/index";
+import { orbTx } from "../keeler/network";
 import { formatUnits } from "./format";
 
 const PILL = { local: "Local", devnet: "Devnet beta", mainnet: "Mainnet" } as const;
@@ -102,6 +103,37 @@ export function Funds({ balances }: { balances: Balance[] | null }) {
         </tbody>
       </table>
     </section>
+  );
+}
+
+/** What is public on chain for each kind of operation, from the README's public and hidden table. */
+export const ON_CHAIN = {
+  swap: "Public on chain: who traded, which tokens, and that the order was made and then settled or refunded. The amounts and the price are not.",
+  lend: "Public on chain: the wallets, the instruction and which pool or vault. The amounts are not.",
+  liquidation: "Public on chain: the wallets, that the position was liquidated, the vault and the price bound. The amounts are not.",
+  move: "Public on chain: your wallet and the amount moved.",
+  register: "Public on chain: your wallet and the private-note keys it registered.",
+} as const;
+
+/** Each landed transaction's page on Orb, then what of it is public; nothing when no link can be built. */
+export function OrbLinks({ links, says }: { links: { signature?: string; label: string }[]; says: string }) {
+  const shown = links.flatMap((l) => {
+    const href = l.signature ? orbTx(l.signature) : undefined;
+    return href ? [{ href, label: l.label }] : [];
+  });
+  if (shown.length === 0) return null;
+  return (
+    <span className="order-note">
+      {shown.map((l) => (
+        <span key={l.href}>
+          <a className="rail-link" href={l.href} target="_blank" rel="noopener noreferrer">
+            {l.label}
+            <span className="sr-only"> (opens in a new tab)</span>
+          </a>{" "}
+        </span>
+      ))}
+      {says}
+    </span>
   );
 }
 

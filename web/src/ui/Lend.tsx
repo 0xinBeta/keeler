@@ -9,7 +9,7 @@ import { countdown, formatUnits, parseUnits } from "./format";
 import { borrowLimits, drawPrice, earnLimits, grow, healthBps, liquidatable, liquidationPrice, maxBorrow, pct, priceText } from "./lend-view";
 import { borrowModel, earnModel } from "./orbit/model";
 import type { DeskModel } from "./orbit/model";
-import { Amount, amountText, ErrorNote, errorText, Funds, RefundNotice, useChainNow } from "./shared";
+import { Amount, amountText, ErrorNote, errorText, Funds, ON_CHAIN, OrbLinks, RefundNotice, useChainNow } from "./shared";
 
 export type Market = { pools: Pool[]; vaults: Vault[] };
 
@@ -24,7 +24,7 @@ export type LendProps = {
   refreshBalances: () => Promise<unknown>;
 };
 
-type DeskProps = LendProps & { lend: KeelerLend; refundable: number; report: Report };
+type DeskProps = LendProps & { lend: KeelerLend; refundable: number; report: Report; toBalances: () => void };
 
 const FLOW: Record<LendKind, LendStep[]> = {
   supply: ["proving", "signing", "keeper", "landed"],
@@ -49,6 +49,37 @@ const LANDED: Record<LendKind, string> = {
   close: "Done. The position is closed and the collateral is in your private balance.",
 };
 const STEP_SHORT: Record<LendStep, string> = { proving: "Proving", signing: "Signing", keeper: "Keeper", landed: "Landed" };
+
+/** The transaction this page sent and, for an intent, the keeper's fill or the owner's refund, each linked on Orb. */
+export function OpLinks({ op }: { op: LendOperation }) {
+  const intent = op.kind === "supply" || op.kind === "deposit" || op.kind === "repay";
+  return (
+    <OrbLinks
+      links={[
+        { signature: op.signature, label: intent ? "View request on Orb" : "View transaction on Orb" },
+        { signature: op.spentBy, label: op.status === "refunded" ? "View refund on Orb" : "View keeper's fill on Orb" },
+      ]}
+      says={ON_CHAIN.lend}
+    />
+  );
+}
+
+const LiquidationLink = ({ signature }: { signature?: string }) => (
+  <OrbLinks links={[{ signature, label: "View liquidation on Orb" }]} says={ON_CHAIN.liquidation} />
+);
+
+function NoPrivate({ asset, then, toBalances }: { asset: Asset; then: string; toBalances: () => void }) {
+  return (
+    <div className="empty">
+      <p>
+        Your wallet's private balance has no {asset.symbol}. Move some in from your public balance, then {then}.
+      </p>
+      <button type="button" className="button button-primary main-action" onClick={toBalances}>
+        Go to balances
+      </button>
+    </div>
+  );
+}
 
 export function kindLabel(o: Pick<LendOperation, "kind" | "amounts">, collateral?: Asset): string {
   switch (o.kind) {
@@ -180,6 +211,7 @@ function Progress({ p, op, onDone }: { p: LendProps; op: ReturnType<typeof useOp
       <p className={`status${run.failed || status === "failed" ? " bad" : ""}`} aria-live="polite">
         {line}
       </p>
+      {live && <OpLinks op={live} />}
       {run.failed && (
         <p className="note note-error" role="alert">
           {run.failed}
@@ -461,7 +493,7 @@ export function EarnTab(p: DeskProps) {
             </div>
           </dl>
           {mode === "in" && note === 0n ? (
-            <p className="empty">You have no private {a.symbol} yet. Move some in from Balances to start earning.</p>
+            <NoPrivate asset={a} then="deposit it here to earn" toBalances={p.toBalances} />
           ) : (
             <button className="button button-primary main-action" type="submit">
               {mode === "in" ? "Deposit and earn" : "Withdraw"}
@@ -851,9 +883,13 @@ export function BorrowTab(p: DeskProps) {
                 </div>
               </dl>
             )}
-            <button className="button button-primary main-action" type="submit">
-              {BUTTON[act]}
-            </button>
+            {act === "add" && lim.max === 0n ? (
+              <NoPrivate asset={vault.collateral} then="add it here as collateral" toBalances={p.toBalances} />
+            ) : (
+              <button className="button button-primary main-action" type="submit">
+                {BUTTON[act]}
+              </button>
+            )}
             <p className="ticket-foot">{SAYS[act]}</p>
           </form>
           {position && d === 0n && c > 0n && (
@@ -891,7 +927,8 @@ export function LiquidatedNote({ position, vault, now }: { position: Position; v
         ? "It repaid the whole loan; the rest of your collateral stayed yours."
         : l.collateralLeft === 0n
           ? "It left no collateral; the remaining debt stays on the position until you repay it."
-          : `It brought the position back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest stayed yours.`}
+          : `It brought the position back to ${pct(vault.liquidationThresholdBps, 0)} or less, and the rest stayed yours.`}{" "}
+      <LiquidationLink signature={l.signature} />
     </div>
   );
 }
@@ -903,7 +940,8 @@ export function EmptiedNote({ position, vault, now }: { position: Position; vaul
     <div className="note note-error liquidated" role="status">
       <strong>Your position was liquidated in full {agoText(l.at, now)}.</strong> <Amount value={l.debtRepaid} asset={vault.debt} /> of debt
       was repaid with all of its collateral, <Amount value={l.collateralSold} asset={vault.collateral} />, at {priceText(l.price, vault)}{" "}
-      {vault.debt.symbol}. Nothing is left in it: no collateral and no debt. You can open a new position.
+      {vault.debt.symbol}. Nothing is left in it: no collateral and no debt. You can open a new position.{" "}
+      <LiquidationLink signature={l.signature} />
     </div>
   );
 }
@@ -1002,6 +1040,7 @@ export function LendActivity(p: LendProps) {
                 <span className="order-status">
                   <span className="badge">Liquidation</span>
                 </span>
+                <LiquidationLink signature={x.lastLiquidation!.signature} />
               </li>
             ))}
           {ops.map((o) => {
@@ -1041,6 +1080,7 @@ export function LendActivity(p: LendProps) {
                     {busy === o.id ? "Taking funds back…" : "Take funds back"}
                   </button>
                 )}
+                <OpLinks op={o} />
               </li>
             );
           })}
