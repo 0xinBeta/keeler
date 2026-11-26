@@ -27,8 +27,8 @@ type Shared = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** A fixed fake transaction signature per kind of transaction, so the explorer links can be tested. */
-export const mockSignature = (kind: string) => `Mock${kind}`.padEnd(88, "1");
+/** A fixed fake base58 transaction signature per kind of transaction, so the explorer links can be tested. */
+export const mockSignature = (kind: string) => `Mock${kind}`.replace(/[0OIl]/g, "x").padEnd(88, "1");
 const now = () => Math.floor(Date.now() / 1000);
 
 const START_PRICE = 142_370_000_000n; // 142.37 tUSD per tSOL

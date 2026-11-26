@@ -55,7 +55,7 @@ const lendFaq = ({ collateral: c, debt: d }: Pair): [string, string, string?][] 
 ];
 
 const FAQ: [string, string, string?][] = [
-  ["What stays private?", "The amounts and the price. The two wallet addresses, the assets, the time, and the fact that a swap happened are public. The dealers you ask see your request so they can quote it."],
+  ["What stays private?", "The amounts, the price and the two assets. The two wallet addresses, the time, and the fact that a swap happened are public. The dealers you ask see your request so they can quote it."],
   ["Do I need a special wallet?", "No. Your Solana wallet signs a message to create your private keys in the browser. It asks twice, to check your wallet signs consistently. Signing moves no funds."],
   ["Who holds my funds?", "On-chain programs on Solana: the Privacy Rings pool for your private balance, and Keeler's swap program while an order is locked. They are never in a Keeler account."],
   ["Where are proofs made?", "Your order's proof is made in your browser. The pool's own proof is made inside Helius' attested secure enclave; what your browser sends it is encrypted so only the enclave can read it."],

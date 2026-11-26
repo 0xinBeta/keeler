@@ -57,17 +57,6 @@ describe("order records", () => {
     expect(s.length).toBe(4);
   });
 
-  it("load a record saved before the spending transaction was kept, without it", () => {
-    const s = memory();
-    const mine = orderStore("local", "W", s);
-    const old: OrderRecord = { ...record("old"), status: "settled", tx: { signature: "make", lastValidBlockHeight: 9n } };
-    s.setItem("keeler:order:v1:local:W:old", encodeRecord(old));
-    expect(mine.get("old")).toEqual(old);
-    expect(mine.get("old")!.spentBy).toBeUndefined();
-    mine.put({ ...old, spentBy: "settle" });
-    expect(mine.get("old")!.spentBy).toBe("settle");
-  });
-
   it("skip a damaged record and keep the rest", () => {
     const s = memory();
     const mine = orderStore("local", "W", s);

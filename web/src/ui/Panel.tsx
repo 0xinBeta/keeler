@@ -8,7 +8,7 @@ import { DeskRing, useReport } from "./app/ring";
 import type { Report, Scene } from "./app/ring";
 import { bps, countdown, formatUnits, parseUnits, short } from "./format";
 import { BorrowTab, EarnTab } from "./Lend";
-import { OrderLinks } from "./Orders";
+import { orderLinks } from "./Orders";
 import type { Market } from "./Lend";
 import { borrowModel, earnModel, swapModel } from "./orbit/model";
 import type { DeskTab } from "./orbit/model";
@@ -639,7 +639,7 @@ function SwapTab(p: Props & { toBalances: () => void; report: Report }) {
         </section>
         <details className="privacy-note">
           <summary>What stays private?</summary>
-          <p>Who traded and which assets are public. How much and at what price are not. Dealers see the requests sent to them.</p>
+          <p>Who traded is public. Which tokens, how much and at what price are not on chain. Dealers see the requests sent to them.</p>
         </details>
       </div>
       <aside className="context-rail" aria-label="Dealers and balances">
@@ -718,7 +718,7 @@ function Progress(
       <p className={`status${view.failed || status === "failed" ? " bad" : ""}`} aria-live="polite">
         {line}
       </p>
-      {order && <OrderLinks order={order} />}
+      {order && <OrbLinks links={orderLinks(order)} says={ON_CHAIN.swap} />}
       {view.failed && <p className="note note-error" role="alert">{view.failed}</p>}
       {status === "refundable" && (
         <button

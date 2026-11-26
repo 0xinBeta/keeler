@@ -41,7 +41,7 @@ import {
 import { BUILD_NETWORK, testWalletAllowed, walletChain } from "./network";
 import { fairBuyAmount, ttlOk, vsFairBps, withinBand, type Price } from "./price";
 import { verifyQuote } from "./quote-sig";
-import { nextRecord, refreshAll, refundRefusal, rose, type ChainReads } from "./status";
+import { nextRecord, refreshAll, refundRefusal, rose, toOrder, type ChainReads } from "./status";
 import { orderStore, type OrderRecord } from "./storage";
 import { buildCancel, buildMake, orderStatus, scanMaker, toHex, type SwapContext } from "./swap";
 import { createLend, type LendServerConfig } from "./lend";
@@ -431,19 +431,6 @@ export function createKeeler(): Keeler {
       },
     };
   };
-
-  const toOrder = (r: OrderRecord): Order => ({
-    id: r.id,
-    sell: r.sell,
-    buy: r.buy,
-    sellAmount: r.sellAmount,
-    buyAmount: r.buyAmount,
-    expiry: r.expiry,
-    status: r.status,
-    ...(r.error ? { error: r.error } : {}),
-    ...(r.tx && r.status !== "pending" && r.status !== "failed" ? { signature: r.tx.signature } : {}),
-    ...(r.spentBy ? { spentBy: r.spentBy } : {}),
-  });
 
   /** The make this page is signing or sending right now: its record is not refreshed meanwhile. */
   let inFlight: string | undefined;

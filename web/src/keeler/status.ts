@@ -1,5 +1,6 @@
 // An order record's next status, from chain evidence only. A read that fails throws, so a
 // failed RPC or indexer call never turns an order terminal; the record stays as it was.
+import type { Order } from "./index";
 import type { Spend } from "./swap";
 import type { OrderRecord } from "./storage";
 
@@ -42,6 +43,20 @@ export async function nextRecord(r: OrderRecord, now: number, chain: ChainReads)
   const { error: _old, spentBy: _was, ...rest } = r;
   return { ...rest, status, ...(error ? { error } : {}), ...(spentBy ? { spentBy } : {}) };
 }
+
+/** The order as the page shows it; the make's signature only once the make has landed. */
+export const toOrder = (r: OrderRecord): Order => ({
+  id: r.id,
+  sell: r.sell,
+  buy: r.buy,
+  sellAmount: r.sellAmount,
+  buyAmount: r.buyAmount,
+  expiry: r.expiry,
+  status: r.status,
+  ...(r.error ? { error: r.error } : {}),
+  ...(r.tx && r.status !== "pending" && r.status !== "failed" ? { makeSignature: r.tx.signature } : {}),
+  ...(r.spentBy ? { spentBy: r.spentBy } : {}),
+});
 
 /**
  * Every record refreshed at chain time; never rejects. If chain time cannot be read the stored

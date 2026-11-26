@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refreshAll, refundRefusal, rose, type ChainReads, type SignatureState } from "../src/keeler/status";
+import { NEVER_LANDED, NEVER_SENT, FAILED_ON_CHAIN, TAKEN_UNMATCHED, nextRecord, refreshAll, refundRefusal, rose, toOrder, type ChainReads, type SignatureState } from "../src/keeler/status";
 import type { OrderRecord } from "../src/keeler/storage";
 import type { ChainStatus } from "../src/keeler/swap";
 
@@ -158,5 +158,19 @@ describe("rose", () => {
     let n = 0;
     expect(await rose(async () => (n++, 5n), 5n, 3, 0)).toBe(false);
     expect(n).toBe(3);
+  });
+});
+
+describe("the order the page shows", () => {
+  it("names its make transaction only once the make has landed", () => {
+    expect(toOrder(record({ status: "pending" })).makeSignature).toBeUndefined();
+    expect(toOrder(record({ status: "failed", error: NEVER_LANDED })).makeSignature).toBeUndefined();
+    expect(toOrder(record({ status: "locked" })).makeSignature).toBe("sig");
+    expect(toOrder(record({ status: "locked", tx: undefined })).makeSignature).toBeUndefined();
+  });
+  it("names what spent it, and never the dealer's quote signature", () => {
+    const shown = toOrder(record({ status: "settled", signature: "ab".repeat(64), spentBy: "settle" }));
+    expect(shown).toMatchObject({ makeSignature: "sig", spentBy: "settle" });
+    expect(Object.values(shown)).not.toContain("ab".repeat(64));
   });
 });

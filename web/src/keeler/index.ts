@@ -40,7 +40,7 @@ export type Order = {
   status: OrderStatus;
   error?: string;
   /** The make transaction, once it has landed. */
-  signature?: string;
+  makeSignature?: string;
   /** The transaction that spent the order: the dealer's settle, or the maker's refund. */
   spentBy?: string;
 };

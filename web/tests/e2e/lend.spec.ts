@@ -5,7 +5,7 @@ import { expect, test, type Locator, type Page, type TestInfo } from "@playwrigh
 const panel = (page: Page) => page.getByRole("region", { name: "Keeler app" });
 const activity = (page: Page) => page.locator("section[aria-labelledby=lending-title]");
 const caption = (page: Page) => page.locator(".observatory figcaption");
-const orb = (kind: string) => `https://orbmarkets.io/tx/${`Mock${kind}`.padEnd(88, "1")}?cluster=devnet`;
+const orb = (kind: string) => `https://orbmarkets.io/tx/${`Mock${kind}`.replace(/[0OIl]/g, "x").padEnd(88, "1")}?cluster=devnet`;
 const orbLink = (scope: Locator, label: string) => scope.getByRole("link", { name: `${label} (opens in a new tab)` });
 const navLink = (page: Page, name: string) => page.getByRole("navigation", { name: "Application" }).getByRole("link", { name: new RegExp(`^${name}`) });
 async function open(page: Page, name: "Earn" | "Borrow" | "Swap" | "Balances" | "Activity") {
@@ -223,7 +223,7 @@ test("a desk with nothing private sends the wallet to Balances, and each landed 
   await expect(registration).toHaveAttribute("href", orb("Register"));
   await expect(registration).toHaveAttribute("target", "_blank");
   await expect(registration).toHaveAttribute("rel", "noopener noreferrer");
-  await expect(p.getByText("Public on chain: your wallet and the private-note keys it registered.")).toBeVisible();
+  await expect(p.getByText("Public on chain: your wallet and the public keys of your private balance.")).toBeVisible();
 
   await open(page, "Borrow");
   await expect(p.getByText("Your wallet's private balance has no tSOL. Move some in from your public balance, then add it here as collateral.")).toBeVisible();
@@ -249,6 +249,7 @@ test("a desk with nothing private sends the wallet to Balances, and each landed 
   await open(page, "Earn");
   await p.locator("#earn-amt").fill("50");
   await p.getByRole("button", { name: "Deposit and earn" }).click();
+  await expect(p.locator(".step-now", { hasText: "Sign in your wallet" })).toBeVisible({ timeout: 10_000 });
   await expect(orbLink(p, "View request on Orb")).toHaveCount(0);
   await expect(p.locator(".step-now", { hasText: "Waiting for the keeper" })).toBeVisible({ timeout: 10_000 });
   await expect(orbLink(p.locator(".desk:not([hidden])"), "View request on Orb")).toHaveAttribute("href", orb("Intent"));
@@ -464,6 +465,6 @@ test("a swap in flight survives a visit to the landing", async ({ page }) => {
   const swapDesk = p.locator(".desk:not([hidden])");
   await expect(orbLink(swapDesk, "View order on Orb")).toHaveAttribute("href", orb("Make"));
   await expect(orbLink(swapDesk, "View settlement on Orb")).toHaveAttribute("href", orb("Settle"));
-  await expect(swapDesk.getByText("Public on chain: who traded, which tokens")).toBeVisible();
+  await expect(swapDesk.getByText("Public on chain: who traded, and that the order was made")).toBeVisible();
   expect(problems).toEqual([]);
 });

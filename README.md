@@ -300,10 +300,10 @@ dirty tree and a single-key upgrade authority).
 The second part: a private quote router. A trader asks several dealers for a quote, drops quotes
 far from a reference price, and settles the best one through the Helius Privacy Rings swap example
 program (`helius-labs/privacy-ring-examples`, `swap/xark`), built from `.tools/` by
-`scripts/setup.sh` with its own test keys. Amounts and the price stay inside shielded notes and
-order terms encrypted to the trader and the chosen dealer; both wallets, both asset ids, and that
-a swap was made and later taken or cancelled are public; every dealer asked learns the pair, the
-size and the trader's public key.
+`scripts/setup.sh` with its own test keys. Amounts, the price and the two asset ids stay inside
+shielded notes and order terms encrypted to the trader and the chosen dealer; both wallets, and that
+a swap was made and later taken or cancelled, are public; every dealer asked still learns the pair,
+the size and the trader's public key.
 
 <details>
 <summary>Swap commands and configuration</summary>

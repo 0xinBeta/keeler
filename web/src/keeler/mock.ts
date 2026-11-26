@@ -226,7 +226,7 @@ export function createMockKeeler(): Keeler {
           buyAmount: quote.buyAmount,
           expiry: quote.expiry,
           status: "locked" as const,
-          signature: mockSignature("Make"),
+          makeSignature: mockSignature("Make"),
           settlesAt: dealer?.settles ? Date.now() + 5000 : null,
         };
         orders.unshift(order);
