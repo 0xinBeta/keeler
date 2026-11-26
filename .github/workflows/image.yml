@@ -1,0 +1,183 @@
+# Builds the keeper image for the devnet deployment in deploy/devnet, checks the
+# compiled build parameters and every key file against its committed checksum,
+# starts the binary inside the image and makes one lend proof and one swap proof
+# there with only the image's keys, printing their peak memory.
+# Pull requests that touch the image build and prove it; a manual run also pushes
+# ghcr.io/0xinbeta/keeler-keeper tagged with the commit and prints its digest.
+
+name: Keeper image
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - deploy/**
+      - .github/workflows/image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  AGAVE_VERSION: v4.1.2
+  AGAVE_SHA256: 5991d027a686eb419a709a479178b33eb83501e8a2bfbf599a81a286bfcbf770
+  WASM_PACK_VERSION: v0.15.1
+  WASM_PACK_SHA256: 410101009739b9d01c7d5affaaad6e9c9a24b4cba6791a4805db8e89b9bf7af2
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  IMAGE: ghcr.io/0xinbeta/keeler-keeper
+
+jobs:
+  image:
+    name: Build, check and prove the keeper image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Restore Agave, wasm-pack and Zolana downloads, and the swap example's build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.cache/solana
+            ~/.config/zolana/cache
+            ~/.cache/.wasm-pack
+            .tools
+          key: tools-${{ runner.os }}-${{ env.AGAVE_VERSION }}-${{ env.AGAVE_SHA256 }}-${{ env.WASM_PACK_VERSION }}-${{ hashFiles('scripts/setup.sh', 'patches/swap.patch') }}
+      - name: Install Agave
+        run: |
+          release=$HOME/.local/share/solana/install/active_release
+          if [[ ! -x $release/bin/cargo-build-sbf ]]; then
+            curl -sSfL -o /tmp/agave.tar.bz2 "https://github.com/anza-xyz/agave/releases/download/$AGAVE_VERSION/solana-release-x86_64-unknown-linux-gnu.tar.bz2"
+            echo "$AGAVE_SHA256  /tmp/agave.tar.bz2" | sha256sum -c -
+            mkdir -p "$release"
+            tar -xjf /tmp/agave.tar.bz2 -C "$release" --strip-components=1
+          fi
+          echo "$release/bin" >>"$GITHUB_PATH"
+          "$release/bin/cargo-build-sbf" --version
+      - name: Install wasm-pack
+        run: |
+          mkdir -p /tmp/wasm-pack
+          curl -sSfL -o /tmp/wasm-pack.tar.gz "https://github.com/wasm-bindgen/wasm-pack/releases/download/$WASM_PACK_VERSION/wasm-pack-$WASM_PACK_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$WASM_PACK_SHA256  /tmp/wasm-pack.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/wasm-pack.tar.gz -C /tmp/wasm-pack --strip-components=1
+          install -m 755 /tmp/wasm-pack/wasm-pack "$HOME/.cargo/bin/wasm-pack"
+          wasm-pack --version
+      - name: Install the pinned Rust toolchains
+        run: |
+          rustup toolchain install
+          (cd lend && rustup toolchain install)
+      - name: Restore cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: rust
+          save-if: false
+          workspaces: |
+            . -> target
+            lend -> target
+          cache-workspace-crates: true
+      - name: Set up the swap example for the deployed swap program
+        run: KEELER_SWAP_PROGRAM_ID=$(jq -er .swap_program_id deploy/devnet/build-params.json) scripts/setup.sh
+      - name: Build the lend circuits and keys
+        run: scripts/setup-lend.sh
+      - name: Build keeler with the deployment's build parameters
+        run: scripts/build-keeper.sh deploy/devnet/build-params.json target
+      - name: Check the compiled build parameters
+        run: |
+          python3 - deploy/devnet/build-params.json target/release/build <<'EOF'
+          import glob, json, sys
+          p = json.load(open(sys.argv[1]))
+          address = lambda name, value: f'pub const {name}: solana_address::Address =\n    solana_address::Address::from_str_const("{value}");\n'
+          as_bytes = lambda h: ", ".join(f"0x{h[i:i + 2]}" for i in range(0, len(h), 2))
+          want = [
+              f'pinocchio::address::declare_id!("{p["program_id"]}");\n',
+              address("ADMIN", p["admin"]),
+              "".join(f'    solana_address::Address::from_str_const("{k}"),\n' for k in p["keepers"]),
+              f"pub const POOL_VIEWING: [u8; 33] = [{as_bytes(p['pool_viewing'])}];\n",
+              address("VAULT1_COLLATERAL_MINT", p["collateral_mint"]),
+              address("VAULT1_DEBT_MINT", p["debt_mint"]),
+              address("VAULT1_PRICE_ACCOUNT", p["price_account"]),
+              f"pub const VAULT1_FEED_ID: [u8; 32] = [{as_bytes(p['feed_id'])}];\n",
+          ]
+          found = glob.glob(f"{sys.argv[2]}/keeler-lend-*/out/ids.rs")
+          if not found:
+              sys.exit("no keeler-lend ids.rs in the release build")
+          for path in found:
+              text = open(path).read()
+              missing = [w.split("\n")[0] for w in want if w not in text]
+              if missing:
+                  sys.exit(f"{path} lacks: {missing}")
+          print(f"build parameters match deploy/devnet/build-params.json in {len(found)} ids.rs")
+          EOF
+      - name: Stage the image's files and check every key file against its checksum
+        run: |
+          source .tools/env
+          swap_sums=$(cd .tools/privacy-ring-examples/swap/xark && pwd)/swap-keys.CHECKSUM
+          stage=dist/image
+          rm -rf "$stage"
+          mkdir -p "$stage/keys/lend" "$stage/keys/swap" "$stage/config"
+          install -m 755 target/release/keeler "$stage/keeler"
+          (cd lend/target/zk/keeler-lend && awk '{print $2}' "$GITHUB_WORKSPACE/lend/lend-keys.CHECKSUM" | xargs cp --parents -t "$GITHUB_WORKSPACE/$stage/keys/lend")
+          (cd "$SWAP_KEYS_DIR" && awk '{print $2}' "$swap_sums" | xargs cp --parents -t "$GITHUB_WORKSPACE/$stage/keys/swap")
+          (cd "$stage/keys/lend" && sha256sum --check --strict --quiet "$GITHUB_WORKSPACE/lend/lend-keys.CHECKSUM")
+          (cd "$stage/keys/swap" && sha256sum --check --strict --quiet "$swap_sums")
+          echo "lend keys: $(wc -l <lend/lend-keys.CHECKSUM) files match lend/lend-keys.CHECKSUM"
+          echo "swap keys: $(wc -l <"$swap_sums") files match swap-keys.CHECKSUM"
+          cp deploy/devnet/dealer.json deploy/devnet/standby.json "$stage/config/"
+          find "$stage" -type f | sort
+      - name: Build the image
+        run: docker build --platform linux/amd64 -t keeler-keeper:ci -f Dockerfile dist/image
+      - name: Start the binary in the image
+        run: |
+          libs=$(docker run --rm --entrypoint ldd keeler-keeper:ci /usr/local/bin/keeler)
+          echo "$libs"
+          if grep -q 'not found' <<<"$libs"; then exit 1; fi
+          placeholders=(-e KEELER_HTTP_KEY=placeholder-http-key -e KEELER_HELIUS_KEY=placeholder
+            -e KEELER_DEALER_KEY='[]' -e KEELER_STANDBY_KEY='[]' -e KEELER_POOL_KEY='[]' -e KEELER_FAUCET_KEY='[]')
+          for role in "dealer /config/dealer.json" "keeper /config/standby.json"; do
+            read -r cmd cfg <<<"$role"
+            out=$(docker run --rm --network none "${placeholders[@]}" keeler-keeper:ci "$cmd" "$cfg" 2>&1 || true)
+            echo "$cmd: $out"
+            grep -q 'key is not a valid keypair' <<<"$out"
+          done
+      - name: Build the proof test binaries
+        run: |
+          (cd lend && cargo test --release --locked -p keeler-lend-sdk --test earn --no-run --message-format=json) \
+            | jq -er 'select(.reason == "compiler-artifact" and .target.name == "earn" and .executable != null) | .executable' >/tmp/lend-test
+          xark=.tools/privacy-ring-examples/swap/xark
+          (cd "$xark" && rustup toolchain install && cargo test --release --locked -p swap-sdk --test circuits --no-run --message-format=json) \
+            | jq -er 'select(.reason == "compiler-artifact" and .target.name == "circuits" and .executable != null) | .executable' >/tmp/swap-test
+          cat /tmp/lend-test /tmp/swap-test
+      - name: Prove in the image with only its keys
+        run: |
+          prove() {
+            docker run --rm --network none -v "$1:/proof/test:ro" --entrypoint /bin/sh keeler-keeper:ci \
+              -c '/proof/test --exact "$1" && echo "peak memory: $(($(cat /sys/fs/cgroup/memory.peak) / 1048576)) MiB"' sh "$2"
+          }
+          prove "$(cat /tmp/lend-test)" supply_proves_with_the_checked_keys
+          prove "$(cat /tmp/swap-test)" take_circuit::designated_take_proves_and_binds_public_inputs
+      - name: Push the image
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag keeler-keeper:ci "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:$GITHUB_SHA"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA")
+          echo "pushed $digest"
+          echo "image: \`$digest\`" >>"$GITHUB_STEP_SUMMARY"

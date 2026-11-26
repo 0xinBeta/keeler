@@ -129,13 +129,17 @@ The `max_*` caps are off at 0. Open tickets of other wallets count toward the po
 (`max_pool_size`, `max_total_collateral`) only once their intent has been seen on chain, so
 unfunded tickets cannot fill a cap for everyone; a wallet's own open tickets always count against
 it. On mainnet the keeper refuses to start with any cap at 0, `min_position_debt` at 0, an
-`http://` origin, the keeper, pool, admin or (standalone) HTTP key read from a file, or with
-`price: "test"`; the dealer refuses a `faucet` section or a key read from a file.
+`http://` origin, the keeper, pool, admin, Helius or (standalone) HTTP key read from a file or the
+environment, `http.allow_remote`, or `price: "test"`; the dealer refuses a `faucet` section, a key
+read from a file or the environment, or `http.allow_remote`.
 
-Lend requests run on their own threads (up to 8 at once) with a 30 s deadline and a 16 KiB body
-cap; the swap routes keep their 4 KiB cap and one-at-a-time server. Every route is loopback only and
-needs the `x-keeler-key` header, as the swap routes do. Wallets must be in the user registry: an
-unregistered wallet gets a 400 saying so.
+Each connection is read on a thread of its own (up to 16 at once), so a client that never sends
+its request holds up no other. Lend requests (up to 8 at once) have a 30 s deadline and a 16 KiB
+body cap; the swap routes keep their 4 KiB cap and are answered one at a time. Every route,
+`/health` included, needs the `x-keeler-key` header and is loopback only unless `http.allow_remote`
+is set (refused on mainnet; for a host whose gateway is the only way in, such as the Phala Cloud
+CVM of `deploy/phala`); the dealer's quote port (`listen`) stays loopback only. Wallets must be in
+the user registry: an unregistered wallet gets a 400 saying so.
 
 `/lend/pools` gives coarse figures: the reserve accrued to the start of the current bucket
 (`bucket_secs`, default 10 minutes), with size, utilisation and both rates rounded to two
@@ -312,9 +316,11 @@ that position id does not open a new position for 2 minutes.
 - Delete or edit the state file while the keeper runs, or restore an old copy. It is the only
   record of tickets and of builds in flight. (An empty file is recoverable from the chain; a wrong
   one is not.)
-- Put the keeper, pool or admin key in a file or the config. Use the Keychain (`{"keychain": "..."}`).
-- Run with `price: "test"` on mainnet (the keeper refuses to), or expose the HTTP port beyond loopback; the Worker is the
-  only client.
+- Put the keeper, pool or admin key in a file or the config. Use the Keychain (`{"keychain": "..."}`);
+  `{"env": "NAME"}` (the trimmed value of that environment variable) is for a devnet container that
+  has no Keychain.
+- Run with `price: "test"` on mainnet (the keeper refuses to), or set `http.allow_remote` on a host
+  where anything but its own gateway reaches the port; the Worker is the only client.
 - Let the keeper's debt-token balance run out: liquidations need it. Keep at least the largest
   position's debt at each keeper's lend address (its key under the pool viewing key, not the
   dealer's swap wallet): `keeler lend-fund`, checked with `keeler lend-balance`.
