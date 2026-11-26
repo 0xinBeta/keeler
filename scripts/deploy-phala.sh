@@ -39,7 +39,7 @@ phala=$phala_dir/node_modules/.bin/phala
 name=keeler-devnet
 instance_type=tdx.medium
 disk_size=20G
-os_image=dstack-0.6.6
+os_image=dstack-0.6.5
 publish=false
 registry_user=""
 while [[ $# -gt 0 ]]; do
